@@ -31,14 +31,17 @@ python3 -m nearproof
 
 - `Challenge(round_index, nonce)` — 验证者发出的挑战
 - `ChallengeStateError(ValueError)` — 挑战未由本验证者签发、已成功验证、已撤销或已过期
+- `Evidence(version, round_index, nonce, response, start, end, speed, elapsed, distance, result, mac)` — 一轮已接受往返的防篡改证据记录（冻结数据类）
 - `Measurement(round_index, nonce, response, elapsed_seconds, distance_meters)`
 - `Prover(shared_key)` — `respond(challenge) -> bytes`，HMAC-SHA256 应答
 - `Verifier(shared_key, *, speed_mps=SPEED_OF_LIGHT_MPS, clock=time.perf_counter, replay_protection=False, challenge_ttl_seconds=None)`
   - `new_challenge()` — 生成 16 字节随机 nonce；配置有效期时按 `clock()` 记录签发时刻
   - `verify(challenge, response, started_at)` — 校验应答并把往返时间折半换算为距离
+  - `verify_evidence(challenge, response, started_at)` — 同 `verify`，但返回带密钥 MAC 的 `Evidence`
   - `measure(prover)` — 一次完整往返
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
   - `clock` — 只读属性，暴露计时函数
+- `audit(evidence, key)` — 复核 `Evidence`（或其字节编码）并返回对应的 `Measurement`
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -70,6 +73,23 @@ verifier = Verifier(key, replay_protection=True, challenge_ttl_seconds=0.05)
 challenge = verifier.new_challenge()          # 签发时刻 t，截止时刻 t + 0.05
 verifier.verify(challenge, prover.respond(challenge), verifier.clock())  # 截止前成功
 # 另一个挑战在 t + 0.05 或之后验证 -> ChallengeStateError("challenge has expired")
+```
+
+### 证据记录与审计
+
+`verify_evidence(challenge, response, started_at)` 的参数、状态规则、有效期判定、校验顺序和原子消费与 `verify` 完全一致，区别只在返回值和新的一类校验：
+
+- 成功时返回 `Evidence`：`version` 恒为 1，`result` 恒为 `"accepted"`，`start=float(started_at)`，`end` 为本次调用唯一的时钟读数，`speed`/`elapsed`/`distance` 与 `verify` 的同轮结果一致；`mac` 是用共享密钥对除 `mac` 外全部字段的规范编码计算的 HMAC-SHA256，密钥本身不进入记录。
+- 遇到非有限数（`nan`/`inf` 的 `started_at`、时钟读数、耗时或距离）时抛出 `ValueError` 且**不消费**挑战；`verify` 的行为不变，不做这一检查。
+
+`Evidence.to_bytes()` 给出规范编码：无空白 UTF-8 JSON，键按字段顺序，字节字段用小写十六进制（`json.dumps(obj, separators=(",", ":"), allow_nan=False).encode()`）。`Evidence.from_bytes(data)` 是严格逆运算：非 `bytes`、非法 JSON、缺键/多键/键序不符、`version` 非 1、`result` 非 `"accepted"`、布尔或非有限数值、非小写十六进制、`mac` 非 32 字节等一律抛出 `ValueError`。
+
+`audit(evidence, key)` 接受 `Evidence` 或其字节编码，拒绝空密钥；用 `key` 以恒时比较复核 MAC 和应答 HMAC，并按 `start`/`end`/`speed` 复算耗时与折半距离，任何不符都抛出 `ValueError`，全部通过则返回对应的 `Measurement`。审计只是对记录的纯复核：不触碰任何验证者状态，也不替代签发时的重放与有效期检查。
+
+```python
+evidence = verifier.verify_evidence(challenge, prover.respond(challenge), verifier.clock())
+blob = evidence.to_bytes()                     # 可持久化或传输
+measurement = audit(Evidence.from_bytes(blob), key)  # 复核通过 -> Measurement
 ```
 
 ## 限制
