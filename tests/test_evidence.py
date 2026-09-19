@@ -295,10 +295,37 @@ class SerializationTest(unittest.TestCase):
         obj = dict(good)
         obj["distance"] = float("inf")
         cases.append(json.dumps(obj).encode())
+        # mac that does not decode to exactly 32 bytes
+        obj = dict(good)
+        obj["mac"] = good["mac"][:-2]
+        cases.append(json.dumps(obj).encode())
+        obj = dict(good)
+        obj["mac"] = "ab" + good["mac"]
+        cases.append(json.dumps(obj).encode())
 
         for blob in cases:
             with self.assertRaises(ValueError, msg=blob):
                 Evidence.from_bytes(blob)
+
+    def test_from_bytes_rejects_reordered_keys(self):
+        evidence = make_evidence()
+        obj = json.loads(evidence.to_bytes())
+        keys = list(obj)
+        swapped = dict(obj)
+        reordered = {keys[1]: swapped.pop(keys[1]), **swapped}
+        blob = json.dumps(reordered).encode()
+        with self.assertRaises(ValueError):
+            Evidence.from_bytes(blob)
+
+    def test_from_bytes_rejects_duplicate_keys(self):
+        blob = make_evidence().to_bytes()
+        duplicated = blob.replace(b'"version":1,', b'"version":1,"version":1,', 1)
+        with self.assertRaises(ValueError):
+            Evidence.from_bytes(duplicated)
+        # duplicate mac: last value wins under plain json.loads but must fail
+        duplicated = blob.replace(b'"mac":"', b'"mac":"00","mac":"', 1)
+        with self.assertRaises(ValueError):
+            Evidence.from_bytes(duplicated)
 
 
 class AuditTest(unittest.TestCase):
