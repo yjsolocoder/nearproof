@@ -1,12 +1,14 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: Challenge / ChallengeStateError / Measurement / Prover / Verifier.
+Public API: Challenge / ChallengeStateError / Evidence / Measurement /
+Prover / Verifier / audit.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import math
 import os
 import threading
@@ -17,10 +19,12 @@ from typing import Callable, Optional
 __all__ = [
     "Challenge",
     "ChallengeStateError",
+    "Evidence",
     "Measurement",
     "Prover",
     "SPEED_OF_LIGHT_MPS",
     "Verifier",
+    "audit",
 ]
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
@@ -57,6 +61,172 @@ class Measurement:
     response: bytes
     elapsed_seconds: float
     distance_meters: float
+
+
+_EVIDENCE_FIELDS = (
+    "version",
+    "round_index",
+    "nonce",
+    "response",
+    "start",
+    "end",
+    "speed",
+    "elapsed",
+    "distance",
+    "result",
+    "mac",
+)
+
+
+def _evidence_payload(evidence: "Evidence") -> dict:
+    """The JSON-ready evidence fields except ``mac``, in field order."""
+    return {
+        "version": evidence.version,
+        "round_index": evidence.round_index,
+        "nonce": evidence.nonce.hex(),
+        "response": evidence.response.hex(),
+        "start": evidence.start,
+        "end": evidence.end,
+        "speed": evidence.speed,
+        "elapsed": evidence.elapsed,
+        "distance": evidence.distance,
+        "result": evidence.result,
+    }
+
+
+def _encode_payload(payload: dict) -> bytes:
+    """The canonical evidence encoding: compact UTF-8 JSON, no NaN/Infinity."""
+    return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _evidence_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over the canonical encoding of the fields without ``mac``."""
+    return hmac.new(key, _encode_payload(payload), hashlib.sha256).digest()
+
+
+def _parse_int_field(value: object, name: str) -> int:
+    # bool is an int subclass but is not a number for the evidence contract.
+    if type(value) is not int:
+        raise ValueError(f"evidence {name} must be an integer")
+    return value
+
+
+def _parse_float_field(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"evidence {name} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"evidence {name} must be a finite number")
+    return number
+
+
+def _parse_hex_field(value: object, name: str) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"evidence {name} must be a lowercase hex string")
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(f"evidence {name} must be a lowercase hex string") from error
+    if raw.hex() != value:
+        # Rejects uppercase digits, separators and odd-length input that
+        # bytes.fromhex would otherwise tolerate.
+        raise ValueError(f"evidence {name} must be a lowercase hex string")
+    return raw
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """A tamper-evident record of one accepted verification round.
+
+    Produced by :meth:`Verifier.verify_evidence`. ``version`` is always ``1``
+    and ``result`` always ``"accepted"``; no key material is stored. ``mac``
+    is HMAC-SHA256 over the canonical encoding of every field except ``mac``
+    itself, so a holder of the shared key can re-check the record later with
+    :func:`audit` without access to the verifier.
+    """
+
+    version: int
+    round_index: int
+    nonce: bytes
+    response: bytes
+    start: float
+    end: float
+    speed: float
+    elapsed: float
+    distance: float
+    result: str
+    mac: bytes
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, byte fields as
+        lowercase hex, no whitespace, no NaN/Infinity."""
+        payload = _evidence_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "Evidence":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: exactly the evidence fields, ``version ==
+        1``, ``result == "accepted"``, non-bool integers, finite non-bool
+        numbers, and lowercase hex strings for the byte fields. The MAC is
+        not verified here — use :func:`audit` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("evidence data must be bytes")
+        try:
+            obj = json.loads(data)
+        except ValueError as error:
+            raise ValueError(f"evidence is not valid JSON: {error}") from error
+        if not isinstance(obj, dict) or set(obj) != set(_EVIDENCE_FIELDS):
+            raise ValueError(
+                "evidence must be a JSON object with exactly the evidence fields"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("evidence version must be 1")
+        result = obj["result"]
+        if result != "accepted":
+            raise ValueError('evidence result must be "accepted"')
+        return cls(
+            version=version,
+            round_index=_parse_int_field(obj["round_index"], "round_index"),
+            nonce=_parse_hex_field(obj["nonce"], "nonce"),
+            response=_parse_hex_field(obj["response"], "response"),
+            start=_parse_float_field(obj["start"], "start"),
+            end=_parse_float_field(obj["end"], "end"),
+            speed=_parse_float_field(obj["speed"], "speed"),
+            elapsed=_parse_float_field(obj["elapsed"], "elapsed"),
+            distance=_parse_float_field(obj["distance"], "distance"),
+            result=result,
+            mac=_parse_hex_field(obj["mac"], "mac"),
+        )
+
+
+def _require_finite(*values: float) -> None:
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("evidence values must be finite numbers")
+
+
+def _validate_evidence(evidence: Evidence) -> None:
+    """Enforce the field contract on an in-memory :class:`Evidence`."""
+    if type(evidence.version) is not int or evidence.version != 1:
+        raise ValueError("evidence version must be 1")
+    if type(evidence.round_index) is not int:
+        raise ValueError("evidence round_index must be an integer")
+    for name in ("nonce", "response", "mac"):
+        if not isinstance(getattr(evidence, name), bytes):
+            raise ValueError(f"evidence {name} must be bytes")
+    for name in ("start", "end", "speed", "elapsed", "distance"):
+        value = getattr(evidence, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"evidence {name} must be a finite number")
+        if not math.isfinite(value):
+            raise ValueError(f"evidence {name} must be a finite number")
+    if evidence.result != "accepted":
+        raise ValueError('evidence result must be "accepted"')
 
 
 def keyed_response(key: bytes, nonce: bytes) -> bytes:
@@ -209,10 +379,75 @@ class Verifier:
         :class:`ChallengeStateError` and can never be verified, even if the
         rest of the response is valid.
         """
+        measurement, _end, _start = self._verify_round(
+            challenge, response, started_at, require_finite=False
+        )
+        return measurement
+
+    def verify_evidence(
+        self, challenge: Challenge, response: bytes, started_at: float
+    ) -> Evidence:
+        """Like :meth:`verify`, but return a MAC'd :class:`Evidence` record.
+
+        Takes the same arguments and applies the same state, TTL and
+        validation order; the challenge is consumed atomically on success
+        exactly as in :meth:`verify`. In the record, ``start`` is
+        ``float(started_at)`` and ``end`` is the single clock reading of the
+        call.
+
+        Unlike :meth:`verify`, any non-finite number that would be recorded
+        (``started_at``, the clock reading, or the derived elapsed time,
+        speed or distance) raises :class:`ValueError` and leaves the
+        challenge pending.
+        """
+        measurement, end, start = self._verify_round(
+            challenge, response, started_at, require_finite=True
+        )
+        payload = {
+            "version": 1,
+            "round_index": measurement.round_index,
+            "nonce": measurement.nonce.hex(),
+            "response": measurement.response.hex(),
+            "start": start,
+            "end": end,
+            "speed": self._speed,
+            "elapsed": measurement.elapsed_seconds,
+            "distance": measurement.distance_meters,
+            "result": "accepted",
+        }
+        return Evidence(
+            version=1,
+            round_index=measurement.round_index,
+            nonce=measurement.nonce,
+            response=measurement.response,
+            start=start,
+            end=end,
+            speed=self._speed,
+            elapsed=measurement.elapsed_seconds,
+            distance=measurement.distance_meters,
+            result="accepted",
+            mac=_evidence_mac(self._key, payload),
+        )
+
+    def _verify_round(
+        self,
+        challenge: Challenge,
+        response: bytes,
+        started_at: float,
+        *,
+        require_finite: bool,
+    ) -> tuple[Measurement, float, float]:
+        """Shared core of :meth:`verify` and :meth:`verify_evidence`.
+
+        Returns ``(measurement, end, start)`` where ``end`` is the single
+        clock reading of the call and ``start`` is ``float(started_at)``.
+        With ``require_finite`` every recorded number is checked for
+        finiteness before anything is consumed.
+        """
         if not isinstance(challenge, Challenge):
             raise TypeError("challenge must be a Challenge")
         if not self._replay_protection:
-            return self._verify_legacy(challenge, response, started_at)
+            return self._verify_legacy(challenge, response, started_at, require_finite)
 
         with self._lock:
             entry = self._entry_for(challenge)
@@ -238,7 +473,11 @@ class Verifier:
             # All validations run while holding the lock so a failure leaves
             # the challenge pending and the pending -> consumed transition is
             # atomic across concurrent calls.
-            elapsed = now - float(started_at)
+            start = float(started_at)
+            elapsed = now - start
+            distance = elapsed * self._speed / 2.0
+            if require_finite:
+                _require_finite(start, now, elapsed, self._speed, distance)
             if elapsed < 0:
                 raise ValueError("elapsed time must not be negative")
             response_bytes = bytes(response)
@@ -246,31 +485,43 @@ class Verifier:
                 raise ValueError("response does not match the challenge")
             entry[1] = _CONSUMED
 
-        return Measurement(
+        measurement = Measurement(
             round_index=challenge.round_index,
             nonce=challenge.nonce,
             response=response_bytes,
             elapsed_seconds=elapsed,
-            distance_meters=elapsed * self._speed / 2.0,
+            distance_meters=distance,
         )
+        return measurement, now, start
 
     def _verify_legacy(
-        self, challenge: Challenge, response: bytes, started_at: float
-    ) -> Measurement:
+        self,
+        challenge: Challenge,
+        response: bytes,
+        started_at: float,
+        require_finite: bool = False,
+    ) -> tuple[Measurement, float, float]:
         """Original single-round behaviour, unchanged when protection is off."""
-        elapsed = self._clock() - float(started_at)
+        end = self._clock()
+        start = float(started_at)
+        elapsed = end - start
+        distance = elapsed * self._speed / 2.0
+        if require_finite:
+            _require_finite(start, end, elapsed, self._speed, distance)
         if elapsed < 0:
             raise ValueError("elapsed time must not be negative")
-        if not hmac.compare_digest(keyed_response(self._key, challenge.nonce), bytes(response)):
+        response_bytes = bytes(response)
+        if not hmac.compare_digest(keyed_response(self._key, challenge.nonce), response_bytes):
             raise ValueError("response does not match the challenge")
         # The signal travels to the prover and back, so halve the round trip.
-        return Measurement(
+        measurement = Measurement(
             round_index=challenge.round_index,
             nonce=challenge.nonce,
-            response=bytes(response),
+            response=response_bytes,
             elapsed_seconds=elapsed,
-            distance_meters=elapsed * self._speed / 2.0,
+            distance_meters=distance,
         )
+        return measurement, end, start
 
     def measure(self, prover: Prover) -> Measurement:
         """Run one complete round against ``prover``."""
@@ -278,3 +529,43 @@ class Verifier:
         started_at = self._clock()
         response = prover.respond(challenge)
         return self.verify(challenge, response, started_at)
+
+
+def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
+    """Re-verify an :class:`Evidence` record against the shared ``key``.
+
+    Accepts the record itself or its ``to_bytes()`` encoding and rejects an
+    empty ``key``. The MAC and the response HMAC are recomputed with ``key``
+    and compared in constant time, and the elapsed time and halved distance
+    are recomputed from ``start``/``end``/``speed``; any mismatch raises
+    :class:`ValueError`. On success the audited values are returned as a
+    :class:`Measurement`.
+
+    Auditing is a pure check: it touches no verifier state and is no
+    substitute for replay protection or challenge TTLs at verification time.
+    """
+    if not key:
+        raise ValueError("key must not be empty")
+    key = bytes(key)
+    if isinstance(evidence, bytes):
+        evidence = Evidence.from_bytes(evidence)
+    elif not isinstance(evidence, Evidence):
+        raise ValueError("evidence must be an Evidence instance or bytes")
+    _validate_evidence(evidence)
+    if not hmac.compare_digest(_evidence_mac(key, _evidence_payload(evidence)), evidence.mac):
+        raise ValueError("evidence mac does not match")
+    if not hmac.compare_digest(keyed_response(key, evidence.nonce), evidence.response):
+        raise ValueError("evidence response does not match the key and nonce")
+    elapsed = evidence.end - evidence.start
+    if elapsed != evidence.elapsed:
+        raise ValueError("evidence elapsed does not match start and end")
+    distance = elapsed * evidence.speed / 2.0
+    if distance != evidence.distance:
+        raise ValueError("evidence distance does not match elapsed and speed")
+    return Measurement(
+        round_index=evidence.round_index,
+        nonce=evidence.nonce,
+        response=evidence.response,
+        elapsed_seconds=evidence.elapsed,
+        distance_meters=evidence.distance,
+    )
