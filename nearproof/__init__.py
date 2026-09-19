@@ -1,8 +1,9 @@
 """nearproof - verifiable distance measurement and location proofs.
 
 Public API: AttestedObservation / Challenge / ChallengeStateError / Consensus /
-Evidence / Measurement / Observation / Prover / RangeDecision / Verifier /
-assess / attest_observation / audit / locate / locate_attested.
+Evidence / Measurement / Observation / ObservationRevocation / Prover /
+RangeDecision / Verifier / assess / attest_observation / audit / locate /
+locate_attested / revoke_observation.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ __all__ = [
     "Evidence",
     "Measurement",
     "Observation",
+    "ObservationRevocation",
     "Prover",
     "RangeDecision",
     "SPEED_OF_LIGHT_MPS",
@@ -36,6 +38,7 @@ __all__ = [
     "audit",
     "locate",
     "locate_attested",
+    "revoke_observation",
 ]
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
@@ -1002,8 +1005,12 @@ class AttestedObservation:
         out-of-order keys are rejected, likewise inside the nested decision
         object), ``version == 1``, and the same per-field rules as the
         constructor, with ``mac`` a lowercase hex string decoding to exactly
-        32 bytes. The MAC is not verified here — use :func:`locate_attested`
-        with the shared keys for that.
+        32 bytes. The encoding must be canonical: the parsed and validated
+        record is re-encoded with :meth:`to_bytes` and any byte-level
+        difference from ``data`` (insignificant whitespace, non-canonical
+        number or string formatting, ...) raises :class:`ValueError`. The
+        MAC is not verified here — use :func:`locate_attested` with the
+        shared keys for that.
         """
         if not isinstance(data, bytes):
             raise ValueError("attested observation data must be bytes")
@@ -1035,7 +1042,7 @@ class AttestedObservation:
             # Rejects uppercase digits, separators and odd-length input that
             # bytes.fromhex would otherwise tolerate.
             raise ValueError("attested observation mac must be a lowercase hex string")
-        return cls(
+        record = cls(
             version=obj["version"],
             id=obj["id"],
             x=obj["x"],
@@ -1048,6 +1055,12 @@ class AttestedObservation:
             issued_at=obj["issued_at"],
             mac=mac,
         )
+        if record.to_bytes() != data:
+            # Only the canonical encoding is accepted: any formatting the
+            # parser tolerated (whitespace, non-canonical numbers or string
+            # escapes) shows up as a byte-level difference on re-encoding.
+            raise ValueError("attested observation encoding is not canonical")
+        return record
 
 
 def attest_observation(
@@ -1080,6 +1093,171 @@ def attest_observation(
     return replace(record, mac=_attested_mac(key, _attested_payload(record)))
 
 
+_REVOCATION_FIELDS = (
+    "version",
+    "id",
+    "revoked_at",
+    "mac",
+)
+
+
+class _OrderedRevocationObject(json.JSONDecoder):
+    """JSON decoder that rejects duplicate and out-of-field-order object keys.
+
+    Same discipline as :class:`_OrderedAttestedObject`, for the flat
+    revocation object: exactly the revocation fields, once each, in field
+    order.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys != list(_REVOCATION_FIELDS):
+            raise ValueError(
+                "observation revocation JSON keys must be exactly the fields"
+                " in field order"
+            )
+        return dict(pairs)
+
+
+def _revocation_payload(revocation: "ObservationRevocation") -> dict:
+    """The JSON-ready revocation fields except ``mac``, in field order."""
+    return {
+        "version": revocation.version,
+        "id": revocation.id,
+        "revoked_at": revocation.revoked_at,
+    }
+
+
+def _revocation_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over the canonical encoding of the fields without ``mac``."""
+    return hmac.new(key, _encode_payload(payload), hashlib.sha256).digest()
+
+
+@dataclass(frozen=True)
+class ObservationRevocation:
+    """A MAC'd record revoking every observation of one verifier id.
+
+    ``version`` is always ``1``; ``id`` a non-empty string; ``revoked_at`` a
+    finite non-bool non-negative number (the moment from which the verifier's
+    observations stop counting); ``mac`` exactly 32 bytes — HMAC-SHA256 over
+    the canonical encoding of every field except ``mac`` itself. Any contract
+    violation raises :class:`ValueError` at construction time. No key
+    material is stored.
+    """
+
+    version: int
+    id: str
+    revoked_at: float
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("observation revocation version must be 1")
+        if not isinstance(self.id, str) or not self.id:
+            raise ValueError("observation revocation id must be a non-empty string")
+        value = self.revoked_at
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                "observation revocation revoked_at must be a finite non-negative"
+                " number"
+            )
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                "observation revocation revoked_at must be a finite non-negative"
+                " number"
+            )
+        if not isinstance(self.mac, bytes) or len(self.mac) != 32:
+            raise ValueError("observation revocation mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``mac`` as
+        lowercase hex, no whitespace, no NaN/Infinity."""
+        payload = _revocation_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ObservationRevocation":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: exactly the revocation fields appearing
+        once each in field order (missing, extra, duplicated or out-of-order
+        keys are rejected), ``version == 1``, and the same per-field rules as
+        the constructor, with ``mac`` a lowercase hex string decoding to
+        exactly 32 bytes. The encoding must be canonical: the parsed and
+        validated record is re-encoded with :meth:`to_bytes` and any
+        byte-level difference from ``data`` raises :class:`ValueError`. The
+        MAC is not verified here — use :func:`locate_attested` with the
+        shared keys for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("observation revocation data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedRevocationObject)
+        except ValueError as error:
+            raise ValueError(
+                f"observation revocation is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(_REVOCATION_FIELDS):
+            raise ValueError(
+                "observation revocation must be a JSON object with exactly the"
+                " revocation fields"
+            )
+        raw_mac = obj["mac"]
+        if not isinstance(raw_mac, str):
+            raise ValueError("observation revocation mac must be a lowercase hex string")
+        try:
+            mac = bytes.fromhex(raw_mac)
+        except ValueError as error:
+            raise ValueError(
+                "observation revocation mac must be a lowercase hex string"
+            ) from error
+        if mac.hex() != raw_mac:
+            # Rejects uppercase digits, separators and odd-length input that
+            # bytes.fromhex would otherwise tolerate.
+            raise ValueError("observation revocation mac must be a lowercase hex string")
+        record = cls(
+            version=obj["version"],
+            id=obj["id"],
+            revoked_at=obj["revoked_at"],
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            # Only the canonical encoding is accepted, exactly as for
+            # AttestedObservation.from_bytes.
+            raise ValueError("observation revocation encoding is not canonical")
+        return record
+
+
+def revoke_observation(
+    id: object,
+    revoked_at: object,
+    key: object,
+) -> ObservationRevocation:
+    """Sign a revocation of one verifier id, returning an :class:`ObservationRevocation`.
+
+    ``key`` must be non-empty; every other argument must satisfy the
+    :class:`ObservationRevocation` field contract (``version`` is set to
+    ``1``), and any violation raises :class:`ValueError`. The record is pure
+    data: signing reads and mutates no verifier state.
+    """
+    if not key:
+        raise ValueError("key must not be empty")
+    key = bytes(key)
+    record = ObservationRevocation(
+        version=1,
+        id=id,  # type: ignore[arg-type]
+        revoked_at=revoked_at,  # type: ignore[arg-type]
+        mac=b"\x00" * 32,
+    )
+    return replace(record, mac=_revocation_mac(key, _revocation_payload(record)))
+
+
 def locate_attested(
     observations: object,
     point: object,
@@ -1089,6 +1267,7 @@ def locate_attested(
     tolerance: object = 0.0,
     now: object = None,
     max_age: object = None,
+    revocations: object = None,
 ) -> "Consensus":
     """Like :func:`locate`, but over MAC'd :class:`AttestedObservation` records.
 
@@ -1106,6 +1285,21 @@ def locate_attested(
     ``now`` defaults to ``time.time()`` and, when given, must be a finite
     non-bool number; stale or future-dated records raise :class:`ValueError`.
 
+    With ``revocations=None`` (the default) no revocation check is
+    performed. Otherwise ``revocations`` must be an iterable of
+    :class:`ObservationRevocation` instances and/or their
+    :meth:`ObservationRevocation.to_bytes` encodings (mixing is allowed).
+    Each revocation's MAC is recomputed with ``keys[id]`` and compared in
+    constant time; an id missing from ``keys``, a duplicated id, a wrong key,
+    any tampering, any item that is neither a revocation nor its canonical
+    bytes, or a ``revoked_at`` later than ``now`` raises :class:`ValueError`.
+    An observation whose ``issued_at`` is at or before the matching
+    revocation's ``revoked_at`` raises :class:`ValueError`; observations
+    strictly later than the revocation follow the usual freshness and
+    geometry rules. When a revocation check or freshness check applies,
+    ``now`` defaults to a single ``time.time()`` reading and, when given,
+    must be a finite non-bool number.
+
     Verified records are then fed to :func:`locate` under its exact rules
     (``quorum`` and ``tolerance`` included) and its :class:`Consensus` is
     returned. The function is pure: it reads no verifier state and, aside
@@ -1122,6 +1316,7 @@ def locate_attested(
         key_map[ident] = bytes(key)
 
     check_age = max_age is not None
+    check_revocations = revocations is not None
     current = 0.0
     age_limit = 0.0
     if check_age:
@@ -1130,6 +1325,9 @@ def locate_attested(
         age_limit = float(max_age)
         if not math.isfinite(age_limit) or age_limit < 0:
             raise ValueError("max_age must be a finite non-negative number")
+    if check_age or check_revocations:
+        # The clock is read at most once per call, and only when a check
+        # needs it.
         if now is None:
             current = time.time()
         elif isinstance(now, bool) or not isinstance(now, (int, float)):
@@ -1138,6 +1336,39 @@ def locate_attested(
             current = float(now)
             if not math.isfinite(current):
                 raise ValueError("now must be a finite number")
+
+    revoked_at_by_id: dict[str, float] = {}
+    if check_revocations:
+        try:
+            raw_revocations = list(revocations)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise ValueError(
+                "revocations must be an iterable of ObservationRevocation or bytes"
+            ) from error
+        for item in raw_revocations:
+            if isinstance(item, bytes):
+                item = ObservationRevocation.from_bytes(item)
+            if not isinstance(item, ObservationRevocation):
+                raise ValueError(
+                    "revocations must contain only ObservationRevocation instances"
+                    " or bytes"
+                )
+            ident = item.id
+            if ident in revoked_at_by_id:
+                raise ValueError(f"duplicate revocation id: {ident!r}")
+            key = key_map.get(ident)
+            if key is None:
+                raise ValueError(f"unknown revocation id: {ident!r}")
+            if not hmac.compare_digest(
+                _revocation_mac(key, _revocation_payload(item)), item.mac
+            ):
+                raise ValueError(f"observation revocation mac does not match: {ident!r}")
+            revoked_at = float(item.revoked_at)
+            if revoked_at > current:
+                raise ValueError(
+                    f"observation revocation is later than now: {ident!r}"
+                )
+            revoked_at_by_id[ident] = revoked_at
 
     try:
         raw_observations = list(observations)  # type: ignore[arg-type]
@@ -1172,6 +1403,9 @@ def locate_attested(
                 raise ValueError(
                     f"attested observation outside the allowed age: {ident!r}"
                 )
+        revoked_at = revoked_at_by_id.get(ident)
+        if revoked_at is not None and float(item.issued_at) <= revoked_at:
+            raise ValueError(f"attested observation has been revoked: {ident!r}")
         verified.append(
             Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
         )

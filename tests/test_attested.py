@@ -258,6 +258,21 @@ class AttestedSerializationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             AttestedObservation.from_bytes(self._blob(decision=[1, 5.0, True]))
 
+    def test_from_bytes_rejects_non_canonical_encoding(self):
+        blob = self._blob()
+        # Default json.dumps separators insert whitespace.
+        spaced = json.dumps(json.loads(blob)).encode()
+        with self.assertRaises(ValueError):
+            AttestedObservation.from_bytes(spaced)
+        # Leading/trailing whitespace is not part of the canonical form.
+        with self.assertRaises(ValueError):
+            AttestedObservation.from_bytes(b" " + blob)
+        with self.assertRaises(ValueError):
+            AttestedObservation.from_bytes(blob + b"\n")
+        # Non-canonical number formatting parses fine but re-encodes differently.
+        with self.assertRaises(ValueError):
+            AttestedObservation.from_bytes(blob.replace(b'"x":1.0', b'"x":1.00'))
+
     def test_from_bytes_does_not_verify_mac(self):
         blob = self._blob()  # all-zero mac, not a real signature
         record = AttestedObservation.from_bytes(blob)
