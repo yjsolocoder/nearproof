@@ -1,7 +1,7 @@
 """nearproof - verifiable distance measurement and location proofs.
 
 Public API: Challenge / ChallengeStateError / Evidence / Measurement /
-Prover / Verifier / audit.
+Prover / RangeDecision / Verifier / assess / audit.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import hmac
 import json
 import math
 import os
+import statistics
 import threading
 import time
 from dataclasses import dataclass
@@ -22,8 +23,10 @@ __all__ = [
     "Evidence",
     "Measurement",
     "Prover",
+    "RangeDecision",
     "SPEED_OF_LIGHT_MPS",
     "Verifier",
+    "assess",
     "audit",
 ]
 
@@ -169,10 +172,11 @@ class Evidence:
         """Decode :meth:`to_bytes` output, enforcing the field contract.
 
         Raises :class:`ValueError` for anything that is not ``bytes`` or does
-        not satisfy the contract: exactly the evidence fields, ``version ==
-        1``, ``result == "accepted"``, non-bool integers, finite non-bool
-        numbers, and lowercase hex strings for the byte fields. The MAC is
-        not verified here — use :func:`audit` with the shared key for that.
+        not satisfy the contract: exactly the evidence fields in field order,
+        ``version == 1``, ``result == "accepted"``, non-bool integers, finite
+        non-bool numbers, lowercase hex strings for the byte fields, and a
+        32-byte ``mac``. The MAC is not verified here — use :func:`audit`
+        with the shared key for that.
         """
         if not isinstance(data, bytes):
             raise ValueError("evidence data must be bytes")
@@ -180,9 +184,10 @@ class Evidence:
             obj = json.loads(data)
         except ValueError as error:
             raise ValueError(f"evidence is not valid JSON: {error}") from error
-        if not isinstance(obj, dict) or set(obj) != set(_EVIDENCE_FIELDS):
+        if not isinstance(obj, dict) or tuple(obj) != _EVIDENCE_FIELDS:
             raise ValueError(
-                "evidence must be a JSON object with exactly the evidence fields"
+                "evidence must be a JSON object with exactly the evidence "
+                "fields in field order"
             )
         version = _parse_int_field(obj["version"], "version")
         if version != 1:
@@ -201,8 +206,15 @@ class Evidence:
             elapsed=_parse_float_field(obj["elapsed"], "elapsed"),
             distance=_parse_float_field(obj["distance"], "distance"),
             result=result,
-            mac=_parse_hex_field(obj["mac"], "mac"),
+            mac=_parse_mac_field(obj["mac"]),
         )
+
+
+def _parse_mac_field(value: object) -> bytes:
+    mac = _parse_hex_field(value, "mac")
+    if len(mac) != 32:
+        raise ValueError("evidence mac must decode to 32 bytes")
+    return mac
 
 
 def _require_finite(*values: float) -> None:
@@ -568,4 +580,126 @@ def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
         response=evidence.response,
         elapsed_seconds=evidence.elapsed,
         distance_meters=evidence.distance,
+    )
+
+
+@dataclass(frozen=True)
+class RangeDecision:
+    """The outcome of :func:`assess` over a batch of samples.
+
+    ``sample_count`` counts every input sample (including outliers),
+    ``upper_bound`` is the largest distance among the inlier samples, and
+    ``accepted`` is true exactly when ``upper_bound`` does not exceed the
+    assessed limit.
+    """
+
+    sample_count: int
+    upper_bound: float
+    accepted: bool
+
+
+def _require_sample_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"sample {name} must be a finite non-negative number")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"sample {name} must be a finite non-negative number")
+    return number
+
+
+def assess(
+    samples,
+    limit,
+    *,
+    key: Optional[bytes] = None,
+    min_samples: int = 5,
+) -> RangeDecision:
+    """Decide an upper distance bound from a batch of measurement samples.
+
+    ``samples`` must be all :class:`Measurement` instances, or all
+    :class:`Evidence` records / their ``to_bytes()`` encodings (the two may
+    be mixed with each other). Evidence samples are verified item by item
+    with the audit semantics of :func:`audit`, which requires a non-empty
+    ``key``. Mixing measurements with evidence, repeating a
+    ``(round_index, nonce)`` pair, a negative or non-finite elapsed time or
+    distance, or fewer than ``min_samples`` samples all raise
+    :class:`ValueError`. ``limit`` must be a non-bool finite non-negative
+    number and ``min_samples`` a non-bool positive integer.
+
+    Let ``m`` be the median distance (for an even count, the mean of the two
+    middle values) and MAD the median absolute deviation from ``m``. With
+    ``MAD > 0`` the inliers are the samples in the closed interval
+    ``[m - 3*MAD, m + 3*MAD]``; with ``MAD == 0`` only samples equal to ``m``
+    are inliers. Fewer than ``min_samples`` inliers raises
+    :class:`ValueError`. The decision's ``upper_bound`` is the largest
+    inlier distance and ``accepted`` holds exactly when it does not exceed
+    ``limit``; ``sample_count`` records every input sample.
+
+    The result does not depend on the input order, and assessing is a pure
+    function: it touches no verifier state.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+        raise ValueError("limit must be a finite non-negative number")
+    limit = float(limit)
+    if not math.isfinite(limit) or limit < 0:
+        raise ValueError("limit must be a finite non-negative number")
+    if isinstance(min_samples, bool) or not isinstance(min_samples, int):
+        raise ValueError("min_samples must be a positive integer")
+    if min_samples < 1:
+        raise ValueError("min_samples must be a positive integer")
+
+    items = list(samples)
+    if len(items) < min_samples:
+        raise ValueError("not enough samples")
+
+    first = items[0]
+    if isinstance(first, Measurement):
+        measurements = []
+        for item in items:
+            if not isinstance(item, Measurement):
+                raise ValueError(
+                    "samples must be all Measurement or all Evidence/bytes"
+                )
+            measurements.append(item)
+    elif isinstance(first, (Evidence, bytes)):
+        if not key:
+            raise ValueError("key must not be empty when assessing evidence")
+        measurements = []
+        for item in items:
+            if not isinstance(item, (Evidence, bytes)):
+                raise ValueError(
+                    "samples must be all Measurement or all Evidence/bytes"
+                )
+            measurements.append(audit(item, key))
+    else:
+        raise ValueError("samples must be all Measurement or all Evidence/bytes")
+
+    seen: set = set()
+    distances = []
+    for measurement in measurements:
+        pair = (measurement.round_index, measurement.nonce)
+        if pair in seen:
+            raise ValueError("duplicate (round_index, nonce) sample")
+        seen.add(pair)
+        _require_sample_number(measurement.elapsed_seconds, "elapsed_seconds")
+        distance = _require_sample_number(
+            measurement.distance_meters, "distance_meters"
+        )
+        distances.append(distance)
+
+    median = float(statistics.median(distances))
+    mad = float(statistics.median([abs(d - median) for d in distances]))
+    if mad > 0:
+        low, high = median - 3.0 * mad, median + 3.0 * mad
+        inliers = [d for d in distances if low <= d <= high]
+    else:
+        inliers = [d for d in distances if d == median]
+    if len(inliers) < min_samples:
+        raise ValueError("not enough inlier samples")
+
+    upper_bound = max(inliers)
+    return RangeDecision(
+        sample_count=len(items),
+        upper_bound=upper_bound,
+        accepted=upper_bound <= limit,
     )
