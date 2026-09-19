@@ -54,6 +54,11 @@ python3 -m nearproof
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：外层与嵌套 `decision` 对象的键都必须恰好是各自字段、各出现一次且依字段顺序（缺、多、重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
 - `attest_observation(id, x, y, decision, issued_at, key) -> AttestedObservation` — 用非空 key 对观察签名（见下）
 - `locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, revocations=None) -> Consensus` — 先验签/验时效/验撤销再按 `locate` 规则聚合（见下）
+- `BoundAttestedObservation(version, id, x, y, decision, point, context, issued_at, mac)` — 签名额外绑定候选点与用途的冻结观察（`version=1`，不含密钥；见下）
+  - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 嵌套对象键依字段顺序，`point` 为裸二元 JSON 数组（无类型标签、无长度前缀），`mac` 为小写十六进制；整份即单个 JSON 文档，域标签为空、无任何长度前缀或额外定界
+  - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
+- `attest_observation_for_point(id, x, y, decision, point, context, issued_at, key) -> BoundAttestedObservation` — 用非空 key 签名一条绑定点与用途的观察（见下）
+- `locate_bound_attested(observations, point, context, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, revocations=None) -> Consensus` — 恒时验签后还要求点逐项相等、用途精确相等，其余同 `locate_attested`（见下）
 - `ObservationRevocation(version, id, revoked_at, mac)` — 带 HMAC 签名的冻结撤销记录（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -188,6 +193,31 @@ consensus = locate_attested(observations, (0.0, 0.0), keys, max_age=60.0)
 consensus.accepted                     # True
 ```
 
+### 绑定点与用途的观察 `BoundAttestedObservation` 与 `locate_bound_attested`
+
+`BoundAttestedObservation(version, id, x, y, decision, point, context, issued_at, mac)` 在 `AttestedObservation` 的字段之外，让签名额外覆盖两个字段：`point` 为**恰含两个非布尔有限数的 tuple**（允许负数，与 `locate` 的查询点同契约，但不允许 list、布尔、`inf`/`nan` 或长度不为 2）；`context` 为**非空字符串**，标明该观察绑定的用途。其余字段契约与 `AttestedObservation` 完全一致：`version==1`、非空 `id`、非布尔有限非负的 `x`/`y`/`issued_at`、同一 `RangeDecision` 规则、`mac` 恰好 32 字节；构造时违约一律抛 `ValueError`。`mac` 仍是共享密钥对“规范编码的无 mac 对象”的 HMAC-SHA256。
+
+`to_bytes()` 沿用无空白 UTF-8 JSON 与小写十六进制 `mac` 的规范编码：键依字段顺序（`version, id, x, y, decision, point, context, issued_at, mac`），`decision` 仍为键序固定的嵌套对象；区别是 `point` 编码为**裸的二元 JSON 数组**（如 `[0.0,1.5]`），既无类型标签也无长度前缀。整份输出就是单个 JSON 文档：域标签为空、没有长度前缀、没有额外定界。`from_bytes(data)` 的规则与 `AttestedObservation.from_bytes` 相同（键集合与顺序、嵌套 decision、十六进制 mac、解析后重编码逐字节比对），并额外要求 `point` 是恰含两个有限非布尔数的 JSON 数组（tuple 解码后重建）、`context` 是非空字符串；它不校验 MAC。
+
+`attest_observation_for_point(id, x, y, decision, point, context, issued_at, key)` 用非空 `key` 签名一条绑定点与用途的观察（`version` 固定为 1），字段违约或空 key 均抛 `ValueError`；纯计算，不触碰任何验证者状态。
+
+`locate_bound_attested(observations, point, context, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, revocations=None) -> Consensus` 的对象/字节混输、`keys` 映射、恒时验签、重复 id、时效（`now`/`max_age`）、撤销、几何与 quorum 规则与 `locate_attested` **完全一致**（未达 quorum 同样不抛异常），在此之上增加绑定校验：每条记录 MAC 验证通过后，其 `point` 必须与查询 `point` **逐项相等**、其 `context` 必须与查询 `context` **精确相等**，否则抛 `ValueError`——绑定其他点或其他用途的签名不能拿到本次查询重放。查询参数本身也受契约约束：`point` 必须是恰含两个非布尔有限数的 tuple，`context` 必须是非空字符串。契约违约抛 `ValueError`；调用形状错误（缺参数、关键字选项按位置传入等）抛 `TypeError`。
+
+```python
+from nearproof import RangeDecision, attest_observation_for_point, locate_bound_attested
+
+context = "room-7"
+records = [
+    attest_observation_for_point("alpha", 0.0, 0.0, RangeDecision(5, 5.0, True), (0.0, 0.0), context, now, keys["alpha"]),
+    attest_observation_for_point("bravo", 3.0, 0.0, RangeDecision(5, 5.0, False), (0.0, 0.0), context, now, keys["bravo"]),
+    attest_observation_for_point("charlie", 0.0, 4.0, RangeDecision(5, 5.0, True), (0.0, 0.0), context, now, keys["charlie"]),
+]
+consensus = locate_bound_attested(records, (0.0, 0.0), context, keys, max_age=60.0)
+consensus.accepted                     # True
+# locate_bound_attested(records, (1.0, 0.0), context, keys) -> ValueError（点不逐项相等）
+# locate_bound_attested(records, (0.0, 0.0), "room-8", keys) -> ValueError（用途不符）
+```
+
 ### 观察撤销 `ObservationRevocation` 与 `revoke_observation`
 
 `ObservationRevocation(version, id, revoked_at, mac)` 是冻结的带签名撤销记录，构造时即校验全部字段契约，任何违约抛 `ValueError`：`version` 必须为 `1`；`id` 为非空字符串；`revoked_at` 为非布尔、有限、非负的数；`mac` 为恰好 32 字节的 `bytes`。`mac` 是共享密钥对“规范编码的无 mac 对象”（`version, id, revoked_at`）的 HMAC-SHA256，记录本身不含密钥。
@@ -208,7 +238,7 @@ blob = revocation.to_bytes()           # 可持久化或传输
 
 ## 限制
 
-当前是单验证者的朴素往返测距：挑战先发出、应答后到达，两者之间没有任何延迟承诺，应答正确性也不绑定到挑战发出时刻（配置 `challenge_ttl_seconds` 后仅按验证者时钟限制挑战本身的有效期，并不约束证明者的应答时刻）。单轮距离直接由一次往返时间换算；跨轮的稳健判定由 `assess` 在事后基于中位数 / MAD 离群点剔除完成，它不改变单轮验证语义，也不提供多轮间的密码学一致性。默认模式下 nonce 只保证随机，不记录已用集合；开启 `replay_protection` 后则按签发实例登记并追踪每个挑战的待验证 / 已消费 / 已撤销 / 已过期状态，但注册表（含截止时刻）仅保存在内存中、随实例生命周期结束，过期判定也完全信任注入的 `clock`。二维共识 `locate` 只把各验证者 `assess` 出的距离上界按圆盘覆盖做纯几何聚合：它不交叉验证观察来源、不绑定验证者身份与坐标的真实性，圆盘矛盾只表现为拒绝计数而非异常。`locate_attested` 在此之上为每条观察加了 HMAC 签名复核与可选的时效检查，但它完全信任调用方给出的 `keys` 映射（id 与密钥、坐标的绑定由调用方保证），时效判定也完全信任注入的 `now` 或系统时钟；签名不绑定候选点，同一条记录可被拿到任意点上重放聚合。
+当前是单验证者的朴素往返测距：挑战先发出、应答后到达，两者之间没有任何延迟承诺，应答正确性也不绑定到挑战发出时刻（配置 `challenge_ttl_seconds` 后仅按验证者时钟限制挑战本身的有效期，并不约束证明者的应答时刻）。单轮距离直接由一次往返时间换算；跨轮的稳健判定由 `assess` 在事后基于中位数 / MAD 离群点剔除完成，它不改变单轮验证语义，也不提供多轮间的密码学一致性。默认模式下 nonce 只保证随机，不记录已用集合；开启 `replay_protection` 后则按签发实例登记并追踪每个挑战的待验证 / 已消费 / 已撤销 / 已过期状态，但注册表（含截止时刻）仅保存在内存中、随实例生命周期结束，过期判定也完全信任注入的 `clock`。二维共识 `locate` 只把各验证者 `assess` 出的距离上界按圆盘覆盖做纯几何聚合：它不交叉验证观察来源、不绑定验证者身份与坐标的真实性，圆盘矛盾只表现为拒绝计数而非异常。`locate_attested` 在此之上为每条观察加了 HMAC 签名复核与可选的时效检查，但它完全信任调用方给出的 `keys` 映射（id 与密钥、坐标的绑定由调用方保证），时效判定也完全信任注入的 `now` 或系统时钟；签名不绑定候选点，同一条记录可被拿到任意点上重放聚合。`locate_bound_attested` 用的 `BoundAttestedObservation` 把候选点与用途串也纳入 MAC，并要求与查询值逐项/精确相等，因此不能跨点或跨用途重放，但仍完全信任调用方提供的 `keys`、`now` 与点/用途串本身的真实性。
 
 ## 测试
 
