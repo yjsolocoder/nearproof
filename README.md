@@ -29,6 +29,9 @@ python3 -m nearproof
 
 ## 公开接口
 
+- `AttestedObservation(version, id, x, y, decision, issued_at, mac)` — 一个带 HMAC 签名与签发时刻的冻结观察（详见“认证观察 `attest_observation` / `locate_attested`”）
+  - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序（含嵌套 `decision` 的三键顺序），`mac` 为小写十六进制
+  - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
 - `Challenge(round_index, nonce)` — 验证者发出的挑战
 - `ChallengeStateError(ValueError)` — 挑战未由本验证者签发、已成功验证、已撤销或已过期
 - `Consensus(total, support, rejected, accepted)` — `locate` 的冻结共识结果：`rejected` 为不支持的验证者 id 按字典序排列的字符串元组
@@ -47,8 +50,10 @@ python3 -m nearproof
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
   - `clock` — 只读属性，暴露计时函数
 - `assess(samples, limit, *, key=None, min_samples=5) -> RangeDecision` — 基于一批轮次的稳健距离判定（见下）
+- `attest_observation(id, x, y, decision, issued_at, key) -> AttestedObservation` — 用非空 key 对单个观察签名（见下）
 - `audit(evidence, key)` — 用共享密钥复核 `Evidence`（或其字节编码），返回对应的 `Measurement`
 - `locate(observations, point, *, quorum=3, tolerance=0.0) -> Consensus` — 二维多验证者位置共识（见下）
+- `locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None) -> Consensus` — 先验签、再按 `locate` 规则聚合的认证版共识（见下）
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -147,9 +152,45 @@ consensus.rejected                     # ()
 consensus.accepted                     # True
 ```
 
+### 认证观察 `attest_observation` / `locate_attested`
+
+`AttestedObservation(version, id, x, y, decision, issued_at, mac)` 是冻结的防篡改观察。字段契约：
+
+- `version` 必须恰为整数 `1`（拒绝 `True`、`1.0`）；
+- `id` 必须是非空 `str`；
+- `x`、`y`、`issued_at` 必须是**非布尔有限数且 `>= 0`**（构造时统一规范为 `float`，故传 `int` 与 `float` 等价）；
+- `decision` 必须是 `RangeDecision`：`sample_count` 为非布尔正整数，`upper_bound` 为非布尔有限非负数（同样规范为 `float`），`accepted` 必须是严格 `bool`；
+- `mac` 必须恰为 32 字节；
+- 任何字段违约，构造即抛 `ValueError`。
+
+`to_bytes()` 输出**无空白 UTF-8 JSON**：顶层键严格按 `version, id, x, y, decision, issued_at, mac` 排列，嵌套 `decision` 的键严格按 `sample_count, upper_bound, accepted` 排列，`mac` 用小写十六进制；即对“无 `mac` 的字段对象”做 `json.dumps(obj, separators=(",", ":"), allow_nan=False)` 后以 `mac = HMAC-SHA256(key, 该规范编码)` 签名。`from_bytes(data)` 非 bytes 或不合契约一律抛 `ValueError`：JSON 必须是恰好含这七个字段（decision 恰含三字段）的对象，**缺键、多键、重复键、乱序键均拒绝**（decision 内部同理），数值/类型/取值范围违约、`mac` 不能解码为恰好 32 字节也拒绝；它不校验 MAC 本身。
+
+`attest_observation(id, x, y, decision, issued_at, key)` 用**非空 key** 校验全部字段并返回签好名的 `AttestedObservation`；空 key 抛 `ValueError`。
+
+`locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None)` 在 `locate` 的几何规则之上先做认证：
+
+- `observations` 的每个元素必须是 `AttestedObservation` **或其 `to_bytes()` 字节**，二者可混用；其他类型或非法字节抛 `ValueError`；
+- `keys` 必须是 id → 非空 key 的映射；观察的 id 未登记（未知 id）、登记了空 key、或同一 id 重复出现，均抛 `ValueError`；
+- 每条观察用 `keys[id]` 恒时复核 HMAC：**错 key 或任何字段被篡改**都抛 `ValueError`；
+- `max_age=None`（默认）不校验时效；否则 `max_age` 必须是非布尔有限非负数，并要求 `0 <= now - issued_at <= max_age`（两端闭区间；来自未来的观察也拒绝）；`now` 缺省取 `time.time()`，显式传入时必须是非布尔有限数；
+- 全部通过后，把验签后的观察交给 `locate`，因此 `point` / `quorum` / `tolerance` 的契约与圆盘覆盖、边界计数、`rejected` 排序等语义与直接调用 `locate` 完全一致。
+
+```python
+from nearproof import RangeDecision, attest_observation, locate_attested
+
+keys = {"alpha": b"key-alpha", "bravo": b"key-bravo", "charlie": b"key-charlie"}
+observations = [
+    attest_observation("alpha", 0.0, 0.0, RangeDecision(5, 5.0, True), 100.0, keys["alpha"]),
+    attest_observation("bravo", 3.0, 0.0, RangeDecision(5, 5.0, False), 100.0, keys["bravo"]),
+    attest_observation("charlie", 0.0, 4.0, RangeDecision(5, 5.0, True), 100.0, keys["charlie"]),
+]
+blob = observations[0].to_bytes()                 # 可持久化或传输
+consensus = locate_attested([blob] + observations[1:], (0.0, 0.0), keys, max_age=10.0, now=105.0)
+```
+
 ## 限制
 
-当前是单验证者的朴素往返测距：挑战先发出、应答后到达，两者之间没有任何延迟承诺，应答正确性也不绑定到挑战发出时刻（配置 `challenge_ttl_seconds` 后仅按验证者时钟限制挑战本身的有效期，并不约束证明者的应答时刻）。单轮距离直接由一次往返时间换算；跨轮的稳健判定由 `assess` 在事后基于中位数 / MAD 离群点剔除完成，它不改变单轮验证语义，也不提供多轮间的密码学一致性。默认模式下 nonce 只保证随机，不记录已用集合；开启 `replay_protection` 后则按签发实例登记并追踪每个挑战的待验证 / 已消费 / 已撤销 / 已过期状态，但注册表（含截止时刻）仅保存在内存中、随实例生命周期结束，过期判定也完全信任注入的 `clock`。二维共识 `locate` 只把各验证者 `assess` 出的距离上界按圆盘覆盖做纯几何聚合：它不交叉验证观察来源、不绑定验证者身份与坐标的真实性，圆盘矛盾只表现为拒绝计数而非异常。
+当前是单验证者的朴素往返测距：挑战先发出、应答后到达，两者之间没有任何延迟承诺，应答正确性也不绑定到挑战发出时刻（配置 `challenge_ttl_seconds` 后仅按验证者时钟限制挑战本身的有效期，并不约束证明者的应答时刻）。单轮距离直接由一次往返时间换算；跨轮的稳健判定由 `assess` 在事后基于中位数 / MAD 离群点剔除完成，它不改变单轮验证语义，也不提供多轮间的密码学一致性。默认模式下 nonce 只保证随机，不记录已用集合；开启 `replay_protection` 后则按签发实例登记并追踪每个挑战的待验证 / 已消费 / 已撤销 / 已过期状态，但注册表（含截止时刻）仅保存在内存中、随实例生命周期结束，过期判定也完全信任注入的 `clock`。二维共识 `locate` 只把各验证者 `assess` 出的距离上界按圆盘覆盖做纯几何聚合：它不交叉验证观察来源、不绑定验证者身份与坐标的真实性，圆盘矛盾只表现为拒绝计数而非异常；`locate_attested` 用 id 对应的共享密钥做 HMAC 验签，从而绑定观察来源并拒绝篡改、错 key 与未知/重复 id（可选时效窗口），但它同样不验证 id 与坐标声明本身的真实性，密钥注册表也完全由调用方提供。
 
 ## 测试
 

@@ -1,8 +1,8 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: Challenge / ChallengeStateError / Consensus / Evidence /
-Measurement / Observation / Prover / RangeDecision / Verifier / assess /
-audit / locate.
+Public API: AttestedObservation / Challenge / ChallengeStateError /
+Consensus / Evidence / Measurement / Observation / Prover / RangeDecision /
+Verifier / assess / attest_observation / audit / locate / locate_attested.
 """
 
 from __future__ import annotations
@@ -14,11 +14,13 @@ import math
 import os
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from statistics import median
 from typing import Callable, Optional
 
 __all__ = [
+    "AttestedObservation",
     "Challenge",
     "ChallengeStateError",
     "Consensus",
@@ -30,8 +32,10 @@ __all__ = [
     "SPEED_OF_LIGHT_MPS",
     "Verifier",
     "assess",
+    "attest_observation",
     "audit",
     "locate",
+    "locate_attested",
 ]
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
@@ -177,33 +181,35 @@ def _evidence_mac(key: bytes, payload: dict) -> bytes:
     return hmac.new(key, _encode_payload(payload), hashlib.sha256).digest()
 
 
-def _parse_int_field(value: object, name: str) -> int:
-    # bool is an int subclass but is not a number for the evidence contract.
+def _parse_int_field(value: object, name: str, label: str = "evidence") -> int:
+    # bool is an int subclass but is not a number for the record contract.
     if type(value) is not int:
-        raise ValueError(f"evidence {name} must be an integer")
+        raise ValueError(f"{label} {name} must be an integer")
     return value
 
 
-def _parse_float_field(value: object, name: str) -> float:
+def _parse_float_field(
+    value: object, name: str, label: str = "evidence"
+) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"evidence {name} must be a finite number")
+        raise ValueError(f"{label} {name} must be a finite number")
     number = float(value)
     if not math.isfinite(number):
-        raise ValueError(f"evidence {name} must be a finite number")
+        raise ValueError(f"{label} {name} must be a finite number")
     return number
 
 
-def _parse_hex_field(value: object, name: str) -> bytes:
+def _parse_hex_field(value: object, name: str, label: str = "evidence") -> bytes:
     if not isinstance(value, str):
-        raise ValueError(f"evidence {name} must be a lowercase hex string")
+        raise ValueError(f"{label} {name} must be a lowercase hex string")
     try:
         raw = bytes.fromhex(value)
     except ValueError as error:
-        raise ValueError(f"evidence {name} must be a lowercase hex string") from error
+        raise ValueError(f"{label} {name} must be a lowercase hex string") from error
     if raw.hex() != value:
         # Rejects uppercase digits, separators and odd-length input that
         # bytes.fromhex would otherwise tolerate.
-        raise ValueError(f"evidence {name} must be a lowercase hex string")
+        raise ValueError(f"{label} {name} must be a lowercase hex string")
     return raw
 
 
@@ -867,4 +873,361 @@ def locate(
         support=support,
         rejected=tuple(rejected),
         accepted=support >= quorum,
+    )
+
+
+_ATTESTED_FIELDS = (
+    "version",
+    "id",
+    "x",
+    "y",
+    "decision",
+    "issued_at",
+    "mac",
+)
+
+_ATTESTED_DECISION_FIELDS = (
+    "sample_count",
+    "upper_bound",
+    "accepted",
+)
+
+
+class _AttestedObject(json.JSONDecoder):
+    """JSON decoder for attested observations.
+
+    Rejects duplicate, missing, extra, or out-of-order keys at both the
+    top level and inside the nested ``decision`` object. Bottom-up parsing
+    means the two objects are told apart by their exact key tuples.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = tuple(key for key, _value in pairs)
+        if keys not in (_ATTESTED_FIELDS, _ATTESTED_DECISION_FIELDS):
+            raise ValueError(
+                "attested observation JSON keys must be exactly the fields "
+                "in field order"
+            )
+        return dict(pairs)
+
+
+def _attested_payload(observation: "AttestedObservation") -> dict:
+    """The JSON-ready attested fields except ``mac``, in field order."""
+    return {
+        "version": observation.version,
+        "id": observation.id,
+        "x": observation.x,
+        "y": observation.y,
+        "decision": {
+            "sample_count": observation.decision.sample_count,
+            "upper_bound": observation.decision.upper_bound,
+            "accepted": observation.decision.accepted,
+        },
+        "issued_at": observation.issued_at,
+    }
+
+
+def _attested_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over the canonical encoding of the fields without ``mac``."""
+    return hmac.new(key, _encode_payload(payload), hashlib.sha256).digest()
+
+
+def _non_negative_number(value: object, name: str) -> float:
+    """Return ``float(value)`` for a non-bool finite number ``>= 0``."""
+    number = _finite_non_bool(value)
+    if number < 0:
+        raise ValueError(f"attested observation {name} must be non-negative")
+    return number
+
+
+@dataclass(frozen=True)
+class AttestedObservation:
+    """A MAC-signed :class:`Observation` with an issue timestamp.
+
+    ``version`` is always ``1``; ``id`` is the verifier's non-empty string
+    identifier; ``x``/``y``/``issued_at`` are non-bool finite numbers not
+    below zero; ``decision`` is a :class:`RangeDecision` with a non-bool
+    positive integer ``sample_count``, a finite non-bool non-negative
+    ``upper_bound`` and a strict-bool ``accepted``; ``mac`` is exactly 32
+    bytes. Numeric fields are normalized to ``float`` on construction so the
+    canonical encoding is independent of whether an ``int`` or ``float`` was
+    passed. ``mac`` is HMAC-SHA256(key) over the canonical compact-JSON
+    encoding of every field except ``mac`` itself.
+    """
+
+    version: int
+    id: str
+    x: float
+    y: float
+    decision: "RangeDecision"
+    issued_at: float
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("attested observation version must be 1")
+        if not isinstance(self.id, str) or not self.id:
+            raise ValueError("attested observation id must be a non-empty string")
+        x = _non_negative_number(self.x, "x")
+        y = _non_negative_number(self.y, "y")
+        issued_at = _non_negative_number(self.issued_at, "issued_at")
+        decision = self.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError(
+                "attested observation decision must be a RangeDecision"
+            )
+        if type(decision.sample_count) is not int or decision.sample_count < 1:
+            raise ValueError("decision sample_count must be a positive integer")
+        upper_bound = _non_negative_number(decision.upper_bound, "upper_bound")
+        if type(decision.accepted) is not bool:
+            raise ValueError("decision accepted must be a bool")
+        if not isinstance(self.mac, bytes) or len(self.mac) != 32:
+            raise ValueError("attested observation mac must be exactly 32 bytes")
+        object.__setattr__(self, "x", x)
+        object.__setattr__(self, "y", y)
+        object.__setattr__(self, "issued_at", issued_at)
+        object.__setattr__(
+            self,
+            "decision",
+            RangeDecision(
+                sample_count=decision.sample_count,
+                upper_bound=upper_bound,
+                accepted=decision.accepted,
+            ),
+        )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order (including the
+        nested ``decision`` keys), ``mac`` as lowercase hex, no whitespace."""
+        payload = _attested_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "AttestedObservation":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: a JSON object whose keys are exactly the
+        fields, once each, in field order (missing, extra, duplicate and
+        reordered keys are rejected, also inside ``decision``), plus all the
+        numeric/type/range rules of the constructor and a ``mac`` that
+        decodes to exactly 32 bytes. The MAC is not verified here — use
+        :func:`locate_attested` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("attested observation data must be bytes")
+        try:
+            obj = json.loads(data, cls=_AttestedObject)
+        except ValueError as error:
+            raise ValueError(
+                f"attested observation is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or tuple(obj) != _ATTESTED_FIELDS:
+            raise ValueError(
+                "attested observation must be a JSON object with exactly "
+                "the attested fields in field order"
+            )
+        version = _parse_int_field(obj["version"], "version", "attested observation")
+        if version != 1:
+            raise ValueError("attested observation version must be 1")
+        ident = obj["id"]
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("attested observation id must be a non-empty string")
+        x = _parse_float_field(obj["x"], "x", "attested observation")
+        y = _parse_float_field(obj["y"], "y", "attested observation")
+        issued_at = _parse_float_field(
+            obj["issued_at"], "issued_at", "attested observation"
+        )
+        for name, value in (("x", x), ("y", y), ("issued_at", issued_at)):
+            if value < 0:
+                raise ValueError(
+                    f"attested observation {name} must be non-negative"
+                )
+        decision_obj = obj["decision"]
+        if (
+            not isinstance(decision_obj, dict)
+            or tuple(decision_obj) != _ATTESTED_DECISION_FIELDS
+        ):
+            raise ValueError(
+                "attested observation decision must be a JSON object with "
+                "exactly the decision fields in field order"
+            )
+        sample_count = _parse_int_field(
+            decision_obj["sample_count"],
+            "decision sample_count",
+            "attested observation",
+        )
+        if sample_count < 1:
+            raise ValueError("decision sample_count must be a positive integer")
+        upper_bound = _parse_float_field(
+            decision_obj["upper_bound"],
+            "decision upper_bound",
+            "attested observation",
+        )
+        if upper_bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        accepted = decision_obj["accepted"]
+        if type(accepted) is not bool:
+            raise ValueError("decision accepted must be a bool")
+        mac = _parse_hex_field(obj["mac"], "mac", "attested observation")
+        if len(mac) != 32:
+            raise ValueError("attested observation mac must be exactly 32 bytes")
+        return cls(
+            version=version,
+            id=ident,
+            x=x,
+            y=y,
+            decision=RangeDecision(
+                sample_count=sample_count,
+                upper_bound=upper_bound,
+                accepted=accepted,
+            ),
+            issued_at=issued_at,
+            mac=mac,
+        )
+
+
+def attest_observation(
+    id: object,
+    x: object,
+    y: object,
+    decision: object,
+    issued_at: object,
+    key: object,
+) -> "AttestedObservation":
+    """Sign one observation with a non-empty ``key``.
+
+    Validates every field under the :class:`AttestedObservation` contract
+    (raising :class:`ValueError`) and returns the resulting record whose
+    ``mac`` is HMAC-SHA256 over the canonical encoding of the fields without
+    ``mac``. An empty ``key`` is rejected.
+    """
+    if not key:
+        raise ValueError("key must not be empty")
+    key = bytes(key)
+    # A placeholder MAC exercises the full field contract; the constructor
+    # normalizes ints to floats so the signed payload is canonical.
+    signed = AttestedObservation(
+        version=1,
+        id=id,
+        x=x,
+        y=y,
+        decision=decision,
+        issued_at=issued_at,
+        mac=b"\x00" * 32,
+    )
+    payload = _attested_payload(signed)
+    return replace(signed, mac=_attested_mac(key, payload))
+
+
+def _resolve_freshness_window(now: object, max_age: object) -> Optional[tuple[float, float]]:
+    """Validate ``max_age``/``now`` and return ``(current, age_limit)``.
+
+    Returns ``None`` when freshness is not checked (``max_age is None``).
+    The clock is read at most once per :func:`locate_attested` call so the
+    whole batch is judged against the same instant.
+    """
+    if max_age is None:
+        return None
+    age_limit = _non_negative_number(max_age, "max_age")
+    if now is None:
+        current = time.time()
+    else:
+        current = _finite_non_bool(now)
+    return current, age_limit
+
+
+def locate_attested(
+    observations: object,
+    point: object,
+    keys: object,
+    *,
+    quorum: object = 3,
+    tolerance: object = 0.0,
+    now: object = None,
+    max_age: object = None,
+) -> "Consensus":
+    """Authenticated version of :func:`locate`.
+
+    Each item must be an :class:`AttestedObservation` or its
+    :meth:`~AttestedObservation.to_bytes` encoding (the two may be mixed);
+    any other type raises :class:`ValueError`, as does malformed bytes.
+    Every observation's ``id`` must appear in the ``keys`` mapping with a
+    non-empty key: unknown ids, duplicate ids, a MAC that does not verify
+    under ``keys[id]`` (wrong key or any tampered field) all raise
+    :class:`ValueError`, compared in constant time.
+
+    With ``max_age=None`` (the default) issue time is not checked.
+    Otherwise ``max_age`` must be a non-bool finite non-negative number and
+    every observation must satisfy ``0 <= now - issued_at <= max_age``;
+    ``now`` defaults to :func:`time.time` and must itself be a non-bool
+    finite number when given.
+
+    Verified observations are then passed through :func:`locate` unchanged,
+    so the point/quorum/tolerance contract and the disk-cover consensus
+    semantics are identical to a plain :func:`locate` call.
+    """
+    if not isinstance(keys, Mapping):
+        raise ValueError("keys must be a mapping of observation id to key bytes")
+
+    window = _resolve_freshness_window(now, max_age)
+
+    try:
+        raw_observations = list(observations)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "observations must be an iterable of "
+            "AttestedObservation instances or bytes"
+        ) from error
+
+    verified: list[Observation] = []
+    seen_ids: set[str] = set()
+    for item in raw_observations:
+        if isinstance(item, AttestedObservation):
+            observation = item
+        elif isinstance(item, bytes):
+            observation = AttestedObservation.from_bytes(item)
+        else:
+            raise ValueError(
+                "observations must contain only AttestedObservation "
+                "instances or bytes"
+            )
+        ident = observation.id
+        if ident not in keys:
+            raise ValueError(f"no key registered for observation id: {ident!r}")
+        raw_key = keys[ident]
+        if not raw_key:
+            raise ValueError(f"key for observation id must not be empty: {ident!r}")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        expected = _attested_mac(bytes(raw_key), _attested_payload(observation))
+        if not hmac.compare_digest(expected, observation.mac):
+            raise ValueError(f"attested observation mac does not match: {ident!r}")
+        if window is not None:
+            current, age_limit = window
+            age = current - observation.issued_at
+            if age < 0:
+                raise ValueError("attested observation issued_at is in the future")
+            if age > age_limit:
+                raise ValueError("attested observation is older than max_age")
+        verified.append(
+            Observation(
+                id=ident,
+                x=observation.x,
+                y=observation.y,
+                decision=observation.decision,
+            )
+        )
+
+    return locate(
+        verified,
+        point,
+        quorum=quorum,
+        tolerance=tolerance,
     )
