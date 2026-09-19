@@ -53,7 +53,11 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 为嵌套对象且键同样依字段顺序，`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：外层与嵌套 `decision` 对象的键都必须恰好是各自字段、各出现一次且依字段顺序（缺、多、重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
 - `attest_observation(id, x, y, decision, issued_at, key) -> AttestedObservation` — 用非空 key 对观察签名（见下）
-- `locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None) -> Consensus` — 先验签/验时效再按 `locate` 规则聚合（见下）
+- `locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, revocations=None) -> Consensus` — 先验签/验时效/验撤销再按 `locate` 规则聚合（见下）
+- `ObservationRevocation(version, id, revoked_at, mac)` — 带 HMAC 签名的冻结撤销记录（`version=1`，不含密钥；见下）
+  - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`mac` 为小写十六进制
+  - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
+- `revoke_observation(id, revoked_at, key) -> ObservationRevocation` — 用非空 key 签发撤销记录（见下）
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -156,18 +160,21 @@ consensus.accepted                     # True
 
 `AttestedObservation(version, id, x, y, decision, issued_at, mac)` 是冻结的带签名观察记录，构造时即校验全部字段契约，任何违约抛 `ValueError`：`version` 必须为 `1`；`id` 为非空字符串；`x`/`y`/`issued_at` 为非布尔、有限、非负的数；`decision` 为 `RangeDecision`，其 `sample_count` 为正整数（`bool` 不算）、`upper_bound` 有限非负、`accepted` 必须为 `bool`；`mac` 为恰好 32 字节的 `bytes`。`mac` 是共享密钥对“规范编码的无 mac 对象”的 HMAC-SHA256，记录本身不含密钥。
 
-`to_bytes()` 按无空白 UTF-8 JSON 编码：外层键依字段顺序（`version, id, x, y, decision, issued_at, mac`），`decision` 编码为键依 `sample_count, upper_bound, accepted` 顺序的嵌套对象，`mac` 为小写十六进制。`from_bytes(data)` 执行字段契约校验——键必须恰好是各自字段、**各出现一次且顺序一致**（缺、多、重复或乱序即拒绝，嵌套 `decision` 同样），非 bytes 或不合契约一律抛 `ValueError`；它不校验 MAC。
+`to_bytes()` 按无空白 UTF-8 JSON 编码：外层键依字段顺序（`version, id, x, y, decision, issued_at, mac`），`decision` 编码为键依 `sample_count, upper_bound, accepted` 顺序的嵌套对象，`mac` 为小写十六进制。`from_bytes(data)` 执行字段契约校验——键必须恰好是各自字段、**各出现一次且顺序一致**（缺、多、重复或乱序即拒绝，嵌套 `decision` 同样）——并在解析与字段校验后按同一规范**重编码，与输入字节逐字节精确比较**：带缩进或字段间/首尾空白、非规范的数字或字符串写法（如 `3` 代替 `3.0`、多余的转义）均抛 `ValueError`；它不校验 MAC。
 
 `attest_observation(id, x, y, decision, issued_at, key)` 用非空 `key` 签名一条观察（`version` 固定为 1），字段违约或空 key 均抛 `ValueError`；签名是纯计算，不触碰任何验证者状态。
 
-`locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None)` 在验签之后按 `locate` 的精确规则聚合：
+`locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, revocations=None)` 在验签之后按 `locate` 的精确规则聚合：
 
 - `observations` 可混用 `AttestedObservation` 对象与其 `to_bytes()` 字节编码；其他类型一律抛 `ValueError`。
 - `keys` 必须是非空映射，把观察 id 映射到该验证者的非空共享密钥字节。每条记录用 `keys[id]` 恒时复核 MAC；**未知 id、重复 id、错误的 key 或任何篡改均抛 `ValueError`**。
 - `max_age=None`（默认）不做时效检查；否则 `max_age` 必须是非布尔、有限、非负的数，且每条记录须满足 `0 <= now - issued_at <= max_age`（闭区间），`now` 缺省为 `time.time()`，显式传入时必须是非布尔有限数；过期或“来自未来”的记录抛 `ValueError`。
+- `revocations=None`（默认）不做撤销检查，行为与之前完全一致。否则 `revocations` 必须是可迭代对象，可混用 `ObservationRevocation` 对象与其规范字节编码：每条撤销用 `keys[id]` 恒时复核 MAC，**未知或重复 id、错误 key、篡改、非法项一律抛 `ValueError`**；此时 `now` 同样必需（非布尔有限数，缺省时仅读一次 `time.time()`），`revoked_at > now` 的“未来撤销”抛 `ValueError`。若某观察的 `issued_at <=` 同 id 撤销的 `revoked_at`，抛 `ValueError`；**严格晚于撤销时刻**签发的观察不受影响，沿用原时效与几何规则。
 - 验签通过的记录转为 `Observation` 后交给 `locate`（含 `quorum`/`tolerance` 校验与至少三条观察等全部规则），返回其 `Consensus`。`locate_attested` 是纯函数，除缺省读取一次 `time.time()` 外无副作用。
 
 ```python
+import time
+
 from nearproof import RangeDecision, attest_observation, locate_attested
 
 keys = {"alpha": b"\x01" * 32, "bravo": b"\x02" * 32, "charlie": b"\x03" * 32}
@@ -179,6 +186,24 @@ observations = [
 ]
 consensus = locate_attested(observations, (0.0, 0.0), keys, max_age=60.0)
 consensus.accepted                     # True
+```
+
+### 观察撤销 `ObservationRevocation` 与 `revoke_observation`
+
+`ObservationRevocation(version, id, revoked_at, mac)` 是冻结的带签名撤销记录，构造时即校验全部字段契约，任何违约抛 `ValueError`：`version` 必须为 `1`；`id` 为非空字符串；`revoked_at` 为非布尔、有限、非负的数；`mac` 为恰好 32 字节的 `bytes`。`mac` 是共享密钥对“规范编码的无 mac 对象”（`version, id, revoked_at`）的 HMAC-SHA256，记录本身不含密钥。
+
+`to_bytes()` 按无空白 UTF-8 JSON 编码：键依字段顺序（`version, id, revoked_at, mac`），`mac` 为小写十六进制。`from_bytes(data)` 的编解码与 MAC 规则和 `AttestedObservation` 相同：键必须恰好是四个字段、各出现一次且依字段顺序，解析与字段校验后按规范重编码并与输入逐字节比较，任何格式化 JSON、空白或非规范写法均抛 `ValueError`；它不校验 MAC。
+
+`revoke_observation(id, revoked_at, key)` 用非空 `key` 签发一条撤销记录（`version` 固定为 1），字段违约或空 key 均抛 `ValueError`；签发是纯计算，不触碰任何验证者状态。签发的记录（或其字节编码）通过 `locate_attested(..., revocations=...)` 传入后生效，语义见上节。
+
+```python
+import time
+
+from nearproof import revoke_observation
+
+revocation = revoke_observation("alpha", time.time(), keys["alpha"])
+blob = revocation.to_bytes()           # 可持久化或传输
+# locate_attested(observations, point, keys, revocations=[blob], now=time.time())
 ```
 
 ## 限制

@@ -263,6 +263,36 @@ class AttestedSerializationTest(unittest.TestCase):
         record = AttestedObservation.from_bytes(blob)
         self.assertEqual(record.mac, b"\x00" * 32)
 
+    def test_from_bytes_rejects_whitespace(self):
+        blob = self._blob()
+        # Whitespace between fields.
+        with self.assertRaises(ValueError):
+            AttestedObservation.from_bytes(blob.replace(b",", b", ", 1))
+        # Leading/trailing whitespace around the document.
+        for padded in (b" " + blob, blob + b"\n", b"\t" + blob + b" "):
+            with self.assertRaises(ValueError, msg=repr(padded[:8])):
+                AttestedObservation.from_bytes(padded)
+
+    def test_from_bytes_rejects_pretty_printed_json(self):
+        obj = json.loads(self._blob())
+        with self.assertRaises(ValueError):
+            AttestedObservation.from_bytes(json.dumps(obj, indent=2).encode())
+
+    def test_from_bytes_rejects_noncanonical_numbers(self):
+        # "3.00" parses to 3.0 but is not the canonical spelling of the value.
+        blob = self._blob().replace(b'"issued_at":3.0', b'"issued_at":3.00')
+        with self.assertRaises(ValueError):
+            AttestedObservation.from_bytes(blob)
+        blob = self._blob().replace(b'"x":1.0', b'"x":1.00')
+        with self.assertRaises(ValueError):
+            AttestedObservation.from_bytes(blob)
+
+    def test_from_bytes_rejects_noncanonical_strings(self):
+        # "a" parses to "a" but the canonical encoding does not escape it.
+        blob = self._blob().replace(b'"id":"a"', b'"id":"\\u0061"')
+        with self.assertRaises(ValueError):
+            AttestedObservation.from_bytes(blob)
+
 
 class LocateAttestedTest(unittest.TestCase):
     def test_basic_consensus(self):
