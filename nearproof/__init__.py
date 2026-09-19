@@ -1,7 +1,8 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: Challenge / ChallengeStateError / Evidence / Measurement /
-Prover / RangeDecision / Verifier / assess / audit.
+Public API: Challenge / ChallengeStateError / Consensus / Evidence /
+Measurement / Observation / Prover / RangeDecision / Verifier / assess /
+audit / locate.
 """
 
 from __future__ import annotations
@@ -20,14 +21,17 @@ from typing import Callable, Optional
 __all__ = [
     "Challenge",
     "ChallengeStateError",
+    "Consensus",
     "Evidence",
     "Measurement",
+    "Observation",
     "Prover",
     "RangeDecision",
     "SPEED_OF_LIGHT_MPS",
     "Verifier",
     "assess",
     "audit",
+    "locate",
 ]
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
@@ -78,6 +82,23 @@ class RangeDecision:
     sample_count: int
     upper_bound: float
     accepted: bool
+
+
+@dataclass(frozen=True)
+class Observation:
+    """One verifier's two-dimensional range claim for :func:`locate`.
+
+    ``id`` is the verifier's unique non-empty identifier, ``x``/``y`` are
+    its finite non-bool coordinates, and ``decision`` is the per-verifier
+    :class:`RangeDecision`: only its finite non-negative ``upper_bound``
+    participates in consensus — its ``accepted`` flag is deliberately
+    ignored.
+    """
+
+    id: str
+    x: float
+    y: float
+    decision: RangeDecision
 
 
 _EVIDENCE_FIELDS = (
@@ -732,4 +753,118 @@ def assess(
         sample_count=len(measurements),
         upper_bound=upper_bound,
         accepted=upper_bound <= bound,
+    )
+
+
+@dataclass(frozen=True)
+class Consensus:
+    """The outcome of :func:`locate` over a set of verifiers.
+
+    ``total`` counts every observation, ``support`` counts those whose
+    closed disk covers the point, ``rejected`` holds the lexicographically
+    sorted ids of the non-supporting observations, and ``accepted`` says
+    whether ``support`` reaches the quorum.
+    """
+
+    total: int
+    support: int
+    rejected: tuple
+    accepted: bool
+
+
+def _finite_non_bool(value: object) -> float:
+    """Return ``value`` as a float when it is a finite non-bool number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("value must be a finite non-bool number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("value must be a finite non-bool number")
+    return number
+
+
+def locate(
+    observations: object,
+    point: object,
+    *,
+    quorum: object = 3,
+    tolerance: object = 0.0,
+) -> "Consensus":
+    """Reach a two-dimensional multi-verifier consensus about ``point``.
+
+    ``observations`` must be an iterable of at least three
+    :class:`Observation` instances with unique non-empty ``id`` strings;
+    each observation's ``x``/``y`` must be finite non-bool numbers and its
+    ``decision`` a :class:`RangeDecision` whose ``upper_bound`` is a finite
+    non-negative number. The decision's ``accepted`` flag does not take
+    part in the consensus. ``point`` must be a tuple of exactly two finite
+    non-bool numbers. ``quorum`` must be a non-bool positive integer no
+    greater than the number of observations, and ``tolerance`` a finite
+    non-bool non-negative number. Any contract violation raises
+    :class:`ValueError`.
+
+    An observation supports the point when
+    ``math.hypot(point[0] - x, point[1] - y) <= upper_bound + tolerance``;
+    equality with the boundary counts as support. Contradictory disks are
+    simply counted as rejection rather than raising. The result is
+    independent of input order: ``rejected`` is the tuple of
+    non-supporting ids sorted lexicographically and ``accepted`` is
+    ``True`` exactly when ``support >= quorum``.
+    """
+    if not isinstance(point, tuple):
+        raise ValueError("point must be a tuple of exactly two finite numbers")
+    if len(point) != 2:
+        raise ValueError("point must be a tuple of exactly two finite numbers")
+    px = _finite_non_bool(point[0])
+    py = _finite_non_bool(point[1])
+
+    if isinstance(quorum, bool) or type(quorum) is not int or quorum < 1:
+        raise ValueError("quorum must be a positive integer")
+
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError("tolerance must be a finite non-negative number")
+    slack = float(tolerance)
+    if not math.isfinite(slack) or slack < 0:
+        raise ValueError("tolerance must be a finite non-negative number")
+
+    try:
+        raw_observations = list(observations)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("observations must be an iterable of Observation") from error
+
+    if len(raw_observations) < 3:
+        raise ValueError("observations must contain at least three Observation")
+    if quorum > len(raw_observations):
+        raise ValueError("quorum must not exceed the number of observations")
+
+    seen_ids: set[str] = set()
+    rejected: list[str] = []
+    support = 0
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must all be Observation instances")
+        obs_id = observation.id
+        if not isinstance(obs_id, str) or not obs_id:
+            raise ValueError("observation id must be a non-empty string")
+        if obs_id in seen_ids:
+            raise ValueError("observations contain a duplicate id")
+        seen_ids.add(obs_id)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        distance = math.hypot(px - ox, py - oy)
+        if distance <= bound + slack:
+            support += 1
+        else:
+            rejected.append(obs_id)
+
+    return Consensus(
+        total=len(raw_observations),
+        support=support,
+        rejected=tuple(sorted(rejected)),
+        accepted=support >= quorum,
     )
