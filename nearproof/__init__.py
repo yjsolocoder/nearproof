@@ -1,9 +1,10 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: AttestedObservation / Challenge / ChallengeStateError / Consensus /
-Evidence / Measurement / Observation / ObservationRevocation / Prover /
-RangeDecision / Verifier / assess / attest_observation / audit / locate /
-locate_attested / revoke_observation.
+Public API: AttestedObservation / BoundAttestedObservation / Challenge /
+ChallengeStateError / Consensus / Evidence / Measurement / Observation /
+ObservationRevocation / Prover / RangeDecision / Verifier / assess /
+attest_observation / attest_observation_for_point / audit / locate /
+locate_attested / locate_bound_attested / revoke_observation.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from typing import Callable, Optional
 
 __all__ = [
     "AttestedObservation",
+    "BoundAttestedObservation",
     "Challenge",
     "ChallengeStateError",
     "Consensus",
@@ -35,9 +37,11 @@ __all__ = [
     "Verifier",
     "assess",
     "attest_observation",
+    "attest_observation_for_point",
     "audit",
     "locate",
     "locate_attested",
+    "locate_bound_attested",
     "revoke_observation",
 ]
 
@@ -889,16 +893,29 @@ _ATTESTED_FIELDS = (
 
 _DECISION_FIELDS = ("sample_count", "upper_bound", "accepted")
 
+_BOUND_ATTESTED_FIELDS = (
+    "version",
+    "id",
+    "x",
+    "y",
+    "decision",
+    "point",
+    "context",
+    "issued_at",
+    "mac",
+)
+
 _REVOCATION_FIELDS = ("version", "id", "revoked_at", "mac")
 
 
 class _OrderedAttestedObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
 
-    The outer attested-observation object, the nested decision object and the
-    observation-revocation object must each contain exactly their own fields,
-    once each, in field order; the three field sets are distinguishable by
-    their key lists, so a single hook can check all of them.
+    The outer attested-observation object, the nested decision object, the
+    bound attested-observation object and the observation-revocation object
+    must each contain exactly their own fields, once each, in field order;
+    the field sets are distinguishable by their key lists, so a single hook
+    can check all of them.
     """
 
     def __init__(self) -> None:
@@ -910,6 +927,7 @@ class _OrderedAttestedObject(json.JSONDecoder):
         if keys in (
             list(_ATTESTED_FIELDS),
             list(_DECISION_FIELDS),
+            list(_BOUND_ATTESTED_FIELDS),
             list(_REVOCATION_FIELDS),
         ):
             return dict(pairs)
@@ -1068,6 +1086,196 @@ class AttestedObservation:
             # non-canonical number/string spellings (e.g. "3" for 3.0 or
             # escape sequences the encoder would not emit).
             raise ValueError("attested observation encoding is not canonical")
+        return record
+
+
+def _bound_attested_payload(observation: "BoundAttestedObservation") -> dict:
+    """The JSON-ready bound attested-observation fields except ``mac``, in field order."""
+    decision = observation.decision
+    return {
+        "version": observation.version,
+        "id": observation.id,
+        "x": observation.x,
+        "y": observation.y,
+        "decision": {
+            "sample_count": decision.sample_count,
+            "upper_bound": decision.upper_bound,
+            "accepted": decision.accepted,
+        },
+        "point": [observation.point[0], observation.point[1]],
+        "context": observation.context,
+        "issued_at": observation.issued_at,
+    }
+
+
+def _bound_attested_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over the canonical encoding of the fields without ``mac``."""
+    return hmac.new(key, _encode_payload(payload), hashlib.sha256).digest()
+
+
+@dataclass(frozen=True)
+class BoundAttestedObservation:
+    """A MAC'd, timestamped observation bound to one query point and context.
+
+    ``version`` is always ``1``; ``id`` a non-empty string; ``x``, ``y`` and
+    ``issued_at`` finite non-bool non-negative numbers; ``decision`` a
+    :class:`RangeDecision` with a positive-int ``sample_count``, a finite
+    non-negative ``upper_bound`` and a bool ``accepted``; ``point`` a tuple
+    of exactly two finite non-bool numbers; ``context`` a non-empty string;
+    ``mac`` exactly 32 bytes — HMAC-SHA256 over the canonical encoding of
+    every field except ``mac`` itself. Any contract violation raises
+    :class:`ValueError` at construction time. No key material is stored.
+    """
+
+    version: int
+    id: str
+    x: float
+    y: float
+    decision: "RangeDecision"
+    point: tuple[float, float]
+    context: str
+    issued_at: float
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("bound attested observation version must be 1")
+        if not isinstance(self.id, str) or not self.id:
+            raise ValueError("bound attested observation id must be a non-empty string")
+        for name in ("x", "y", "issued_at"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"bound attested observation {name} must be a finite non-negative number"
+                )
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"bound attested observation {name} must be a finite non-negative number"
+                )
+        decision = self.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("bound attested observation decision must be a RangeDecision")
+        if type(decision.sample_count) is not int or decision.sample_count < 1:
+            raise ValueError("decision sample_count must be a positive integer")
+        bound = decision.upper_bound
+        if (
+            isinstance(bound, bool)
+            or not isinstance(bound, (int, float))
+            or not math.isfinite(bound)
+            or bound < 0
+        ):
+            raise ValueError("decision upper_bound must be a finite non-negative number")
+        if type(decision.accepted) is not bool:
+            raise ValueError("decision accepted must be a bool")
+        point = self.point
+        if not isinstance(point, tuple) or len(point) != 2:
+            raise ValueError(
+                "bound attested observation point must be a tuple of exactly"
+                " two finite numbers"
+            )
+        for value in point:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    "bound attested observation point must be a tuple of exactly"
+                    " two finite numbers"
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    "bound attested observation point must be a tuple of exactly"
+                    " two finite numbers"
+                )
+        if not isinstance(self.context, str) or not self.context:
+            raise ValueError(
+                "bound attested observation context must be a non-empty string"
+            )
+        if not isinstance(self.mac, bytes) or len(self.mac) != 32:
+            raise ValueError("bound attested observation mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``decision`` as a
+        nested object with its keys in field order, ``point`` as a two-element
+        array, ``mac`` as lowercase hex, no whitespace, no NaN/Infinity."""
+        payload = _bound_attested_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BoundAttestedObservation":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: exactly the bound attested-observation
+        fields appearing once each in field order (missing, extra, duplicated
+        or out-of-order keys are rejected, likewise inside the nested decision
+        object), ``version == 1``, ``point`` a two-element array of finite
+        non-bool numbers, and the same per-field rules as the constructor,
+        with ``mac`` a lowercase hex string decoding to exactly 32 bytes.
+        After parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for byte,
+        so formatted JSON, whitespace between fields or around the document,
+        and any non-canonical number or string spelling are rejected as well.
+        The MAC is not verified here — use :func:`locate_bound_attested` with
+        the shared keys for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("bound attested observation data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedAttestedObject)
+        except ValueError as error:
+            raise ValueError(
+                f"bound attested observation is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(_BOUND_ATTESTED_FIELDS):
+            raise ValueError(
+                "bound attested observation must be a JSON object with exactly the"
+                " bound attested observation fields"
+            )
+        decision = obj["decision"]
+        if not isinstance(decision, dict) or list(decision) != list(_DECISION_FIELDS):
+            raise ValueError(
+                "bound attested observation decision must be a JSON object with"
+                " exactly the decision fields"
+            )
+        point = obj["point"]
+        if not isinstance(point, list) or len(point) != 2:
+            raise ValueError(
+                "bound attested observation point must be an array of exactly"
+                " two finite numbers"
+            )
+        raw_mac = obj["mac"]
+        if not isinstance(raw_mac, str):
+            raise ValueError("bound attested observation mac must be a lowercase hex string")
+        try:
+            mac = bytes.fromhex(raw_mac)
+        except ValueError as error:
+            raise ValueError(
+                "bound attested observation mac must be a lowercase hex string"
+            ) from error
+        if mac.hex() != raw_mac:
+            # Rejects uppercase digits, separators and odd-length input that
+            # bytes.fromhex would otherwise tolerate.
+            raise ValueError("bound attested observation mac must be a lowercase hex string")
+        record = cls(
+            version=obj["version"],
+            id=obj["id"],
+            x=obj["x"],
+            y=obj["y"],
+            decision=RangeDecision(
+                sample_count=decision["sample_count"],
+                upper_bound=decision["upper_bound"],
+                accepted=decision["accepted"],
+            ),
+            point=(point[0], point[1]),
+            context=obj["context"],
+            issued_at=obj["issued_at"],
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            # The fields parsed and validated, but the bytes are not the
+            # canonical encoding: whitespace anywhere, pretty-printing, or
+            # non-canonical number/string spellings (e.g. "3" for 3.0 or
+            # escape sequences the encoder would not emit).
+            raise ValueError("bound attested observation encoding is not canonical")
         return record
 
 
@@ -1234,6 +1442,40 @@ def attest_observation(
     return replace(record, mac=_attested_mac(key, _attested_payload(record)))
 
 
+def attest_observation_for_point(
+    id: object,
+    x: object,
+    y: object,
+    decision: object,
+    point: object,
+    context: object,
+    issued_at: object,
+    key: object,
+) -> BoundAttestedObservation:
+    """Sign one verifier's observation bound to ``point`` and ``context``.
+
+    ``key`` must be non-empty; every other argument must satisfy the
+    :class:`BoundAttestedObservation` field contract (``version`` is set to
+    ``1``), and any violation raises :class:`ValueError`. The record is pure
+    data: signing reads and mutates no verifier state.
+    """
+    if not key:
+        raise ValueError("key must not be empty")
+    key = bytes(key)
+    record = BoundAttestedObservation(
+        version=1,
+        id=id,  # type: ignore[arg-type]
+        x=x,  # type: ignore[arg-type]
+        y=y,  # type: ignore[arg-type]
+        decision=decision,  # type: ignore[arg-type]
+        point=point,  # type: ignore[arg-type]
+        context=context,  # type: ignore[arg-type]
+        issued_at=issued_at,  # type: ignore[arg-type]
+        mac=b"\x00" * 32,
+    )
+    return replace(record, mac=_bound_attested_mac(key, _bound_attested_payload(record)))
+
+
 def locate_attested(
     observations: object,
     point: object,
@@ -1385,6 +1627,178 @@ def locate_attested(
             if not 0.0 <= age <= age_limit:
                 raise ValueError(
                     f"attested observation outside the allowed age: {ident!r}"
+                )
+        verified.append(
+            Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
+        )
+
+    return locate(verified, point, quorum=quorum, tolerance=tolerance)
+
+
+def locate_bound_attested(
+    observations: object,
+    point: object,
+    context: object,
+    keys: object,
+    *,
+    quorum: object = 3,
+    tolerance: object = 0.0,
+    now: object = None,
+    max_age: object = None,
+    revocations: object = None,
+) -> "Consensus":
+    """Like :func:`locate_attested`, but over point/context-bound records.
+
+    ``observations`` is an iterable of :class:`BoundAttestedObservation`
+    instances and/or their :meth:`BoundAttestedObservation.to_bytes`
+    encodings (mixing is allowed). ``keys`` must be a non-empty mapping of
+    observation id to the non-empty shared key bytes of that verifier. Every
+    record's MAC is recomputed with ``keys[id]`` and compared in constant
+    time; an id missing from ``keys``, a duplicated id, a wrong key, or any
+    tampering raises :class:`ValueError`.
+
+    After the constant-time MAC check, each record's ``point`` must equal the
+    queried ``point`` element-wise and its ``context`` must equal the queried
+    ``context``; a record bound to any other point or context raises
+    :class:`ValueError`. ``point`` must be a tuple of exactly two finite
+    non-bool numbers and ``context`` a non-empty string.
+
+    ``quorum`` and ``tolerance`` are keyword-only, as are ``now``,
+    ``max_age`` and ``revocations``; passing them positionally raises
+    :class:`TypeError`. Freshness (``now``/``max_age``) and ``revocations``
+    follow exactly the :func:`locate_attested` rules, and every other
+    contract violation raises :class:`ValueError`. As in :func:`locate`,
+    falling short of ``quorum`` is reported through the result's ``accepted``
+    flag, never as an exception.
+
+    Verified records are then fed to :func:`locate` under its exact rules
+    (``quorum`` and ``tolerance`` included) and its :class:`Consensus` is
+    returned. The function is pure: it reads no verifier state and, aside
+    from the default ``now`` clock reading, has no side effects.
+    """
+    if not isinstance(keys, Mapping) or not keys:
+        raise ValueError("keys must be a non-empty mapping of observation id to key")
+    key_map: dict[str, bytes] = {}
+    for ident, key in keys.items():
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("keys must map non-empty string ids to non-empty keys")
+        if not isinstance(key, (bytes, bytearray)) or not key:
+            raise ValueError("keys must map non-empty string ids to non-empty keys")
+        key_map[ident] = bytes(key)
+
+    if not isinstance(point, tuple) or len(point) != 2:
+        raise ValueError("point must be a tuple of exactly two finite numbers")
+    px = _finite_non_bool(point[0])
+    py = _finite_non_bool(point[1])
+
+    if not isinstance(context, str) or not context:
+        raise ValueError("context must be a non-empty string")
+
+    check_age = max_age is not None
+    age_limit = 0.0
+    if check_age:
+        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+            raise ValueError("max_age must be a finite non-negative number")
+        age_limit = float(max_age)
+        if not math.isfinite(age_limit) or age_limit < 0:
+            raise ValueError("max_age must be a finite non-negative number")
+    current = 0.0
+    if check_age or revocations is not None:
+        # The clock is read at most once per call, and only when a freshness
+        # or revocation check actually needs the current time.
+        if now is None:
+            current = time.time()
+        elif isinstance(now, bool) or not isinstance(now, (int, float)):
+            raise ValueError("now must be a finite number")
+        else:
+            current = float(now)
+            if not math.isfinite(current):
+                raise ValueError("now must be a finite number")
+
+    revoked_at_by_id: dict[str, float] = {}
+    if revocations is not None:
+        try:
+            raw_revocations = list(revocations)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise ValueError(
+                "revocations must be an iterable of ObservationRevocation or bytes"
+            ) from error
+        for entry in raw_revocations:
+            if isinstance(entry, bytes):
+                entry = ObservationRevocation.from_bytes(entry)
+            if not isinstance(entry, ObservationRevocation):
+                raise ValueError(
+                    "revocations must contain only ObservationRevocation"
+                    " instances or bytes"
+                )
+            ident = entry.id
+            if ident in revoked_at_by_id:
+                raise ValueError(f"duplicate revocation id: {ident!r}")
+            key = key_map.get(ident)
+            if key is None:
+                raise ValueError(f"unknown revocation id: {ident!r}")
+            if not hmac.compare_digest(
+                _revocation_mac(key, _revocation_payload(entry)), entry.mac
+            ):
+                raise ValueError(
+                    f"observation revocation mac does not match: {ident!r}"
+                )
+            revoked_at = float(entry.revoked_at)
+            if revoked_at > current:
+                raise ValueError(
+                    f"observation revocation is dated in the future: {ident!r}"
+                )
+            revoked_at_by_id[ident] = revoked_at
+
+    try:
+        raw_observations = list(observations)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "observations must be an iterable of BoundAttestedObservation or bytes"
+        ) from error
+
+    verified: list[Observation] = []
+    seen_ids: set[str] = set()
+    for item in raw_observations:
+        if isinstance(item, bytes):
+            item = BoundAttestedObservation.from_bytes(item)
+        if not isinstance(item, BoundAttestedObservation):
+            raise ValueError(
+                "observations must contain only BoundAttestedObservation"
+                " instances or bytes"
+            )
+        ident = item.id
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        key = key_map.get(ident)
+        if key is None:
+            raise ValueError(f"unknown observation id: {ident!r}")
+        if not hmac.compare_digest(
+            _bound_attested_mac(key, _bound_attested_payload(item)), item.mac
+        ):
+            raise ValueError(
+                f"bound attested observation mac does not match: {ident!r}"
+            )
+        observed = item.point
+        if float(observed[0]) != px or float(observed[1]) != py:
+            raise ValueError(
+                f"bound attested observation point does not match the query: {ident!r}"
+            )
+        if item.context != context:
+            raise ValueError(
+                f"bound attested observation context does not match the query: {ident!r}"
+            )
+        revoked_at = revoked_at_by_id.get(ident)
+        if revoked_at is not None and float(item.issued_at) <= revoked_at:
+            raise ValueError(
+                f"bound attested observation not issued after its revocation: {ident!r}"
+            )
+        if check_age:
+            age = current - float(item.issued_at)
+            if not 0.0 <= age <= age_limit:
+                raise ValueError(
+                    f"bound attested observation outside the allowed age: {ident!r}"
                 )
         verified.append(
             Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
