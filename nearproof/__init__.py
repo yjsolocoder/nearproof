@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import os
 import threading
 import time
@@ -28,6 +29,7 @@ NONCE_BYTES = 16
 _PENDING = "pending"
 _CONSUMED = "consumed"
 _REVOKED = "revoked"
+_EXPIRED = "expired"
 
 
 @dataclass(frozen=True)
@@ -39,7 +41,8 @@ class Challenge:
 
 
 class ChallengeStateError(ValueError):
-    """A challenge is unknown to this verifier, already consumed, or revoked.
+    """A challenge is unknown to this verifier, already consumed, revoked,
+    or expired.
 
     Subclasses :class:`ValueError` so callers catching the legacy validation
     errors keep working.
@@ -83,6 +86,13 @@ class Verifier:
     issues and ``verify`` only accepts the exact pending challenge object the
     same instance issued. Challenges are consumed atomically on success and
     may be revoked explicitly with :meth:`revoke`.
+
+    With ``challenge_ttl_seconds`` set (requires ``replay_protection=True``)
+    each issued challenge also carries a deadline: the ``clock()`` value at
+    issuance plus the TTL. A challenge is only verifiable while the clock
+    reads strictly before that deadline; at or past it the challenge is
+    expired, a terminal state where both ``verify`` and ``revoke`` raise
+    :class:`ChallengeStateError`.
     """
 
     def __init__(
@@ -92,21 +102,41 @@ class Verifier:
         speed_mps: float = SPEED_OF_LIGHT_MPS,
         clock: Callable[[], float] = time.perf_counter,
         replay_protection: bool = False,
+        challenge_ttl_seconds: float | None = None,
     ) -> None:
         if not shared_key:
             raise ValueError("shared_key must not be empty")
         if speed_mps <= 0:
             raise ValueError("speed_mps must be positive")
+        if challenge_ttl_seconds is None:
+            self._challenge_ttl = None
+        else:
+            if isinstance(challenge_ttl_seconds, bool) or not isinstance(
+                challenge_ttl_seconds, (int, float)
+            ):
+                raise ValueError(
+                    "challenge_ttl_seconds must be None or a finite positive number"
+                )
+            ttl = float(challenge_ttl_seconds)
+            if not math.isfinite(ttl) or ttl <= 0:
+                raise ValueError(
+                    "challenge_ttl_seconds must be None or a finite positive number"
+                )
+            if not replay_protection:
+                raise ValueError("challenge_ttl_seconds requires replay_protection=True")
+            self._challenge_ttl = ttl
         self._key = bytes(shared_key)
         self._speed = float(speed_mps)
         self._clock = clock
         self._round = 0
         self._replay_protection = bool(replay_protection)
         self._lock = threading.Lock()
-        # id(issued challenge) -> [challenge, state]. Holding the challenge
-        # object in the value keeps its id alive (no reuse) and makes the
-        # registry bind to the issuing instance and the exact object, not to a
-        # collidable round_index.
+        # id(issued challenge) -> [challenge, state, deadline]. Holding the
+        # challenge object in the value keeps its id alive (no reuse) and
+        # makes the registry bind to the issuing instance and the exact
+        # object, not to a collidable round_index. ``deadline`` is the
+        # clock() value at issuance plus the TTL, or None when no TTL is
+        # configured (challenge never expires).
         self._challenges: dict[int, list] = {}
 
     @property
@@ -122,7 +152,12 @@ class Verifier:
         if self._replay_protection:
             with self._lock:
                 self._round += 1
-                self._challenges[id(challenge)] = [challenge, _PENDING]
+                deadline = None
+                if self._challenge_ttl is not None:
+                    # Stamp the issuance time once; the deadline never moves
+                    # afterwards, whatever happens to the challenge later.
+                    deadline = self._clock() + self._challenge_ttl
+                self._challenges[id(challenge)] = [challenge, _PENDING, deadline]
         else:
             self._round += 1
         return challenge
@@ -138,8 +173,8 @@ class Verifier:
         """Revoke a pending challenge so it can never be verified.
 
         Only a challenge issued by this verifier that is still pending can be
-        revoked. Unknown, already consumed, or already revoked challenges
-        raise :class:`ChallengeStateError`.
+        revoked. Unknown, already consumed, already revoked, or expired
+        challenges raise :class:`ChallengeStateError`.
         """
         if not isinstance(challenge, Challenge):
             raise TypeError("challenge must be a Challenge")
@@ -153,10 +188,16 @@ class Verifier:
                 raise ChallengeStateError("challenge was not issued by this verifier")
             state = entry[1]
             if state == _PENDING:
+                deadline = entry[2]
+                if deadline is not None and self._clock() >= deadline:
+                    entry[1] = _EXPIRED
+                    raise ChallengeStateError("challenge has expired")
                 entry[1] = _REVOKED
                 return
             if state == _CONSUMED:
                 raise ChallengeStateError("challenge has already been verified")
+            if state == _EXPIRED:
+                raise ChallengeStateError("challenge has expired")
             raise ChallengeStateError("challenge has already been revoked")
 
     def verify(self, challenge: Challenge, response: bytes, started_at: float) -> Measurement:
@@ -167,7 +208,9 @@ class Verifier:
         Failed validation (bad response, negative elapsed time, wrong argument
         types) leaves the challenge pending so the caller can retry; only a
         successful return consumes it, and concurrent attempts can succeed at
-        most once.
+        most once. If a TTL is configured, the challenge must also be checked
+        before its deadline: at or past the deadline it expires terminally
+        and every further ``verify`` raises :class:`ChallengeStateError`.
         """
         if not isinstance(challenge, Challenge):
             raise TypeError("challenge must be a Challenge")
@@ -183,11 +226,19 @@ class Verifier:
                 raise ChallengeStateError("challenge has already been verified")
             if state == _REVOKED:
                 raise ChallengeStateError("challenge has been revoked")
+            if state == _EXPIRED:
+                raise ChallengeStateError("challenge has expired")
 
             # All validations run while holding the lock so a failure leaves
             # the challenge pending and the pending -> consumed transition is
-            # atomic across concurrent calls.
-            elapsed = self._clock() - float(started_at)
+            # atomic across concurrent calls. The clock is read exactly once
+            # so the expiry check and the elapsed time share a single "now".
+            now = self._clock()
+            deadline = entry[2]
+            if deadline is not None and now >= deadline:
+                entry[1] = _EXPIRED
+                raise ChallengeStateError("challenge has expired")
+            elapsed = now - float(started_at)
             if elapsed < 0:
                 raise ValueError("elapsed time must not be negative")
             response_bytes = bytes(response)
@@ -222,7 +273,11 @@ class Verifier:
         )
 
     def measure(self, prover: Prover) -> Measurement:
-        """Run one complete round against ``prover``."""
+        """Run one complete round against ``prover``.
+
+        With a TTL configured this fails with :class:`ChallengeStateError`
+        if the response arrives at or after the challenge's deadline.
+        """
         challenge = self.new_challenge()
         started_at = self._clock()
         response = prover.respond(challenge)
