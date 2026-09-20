@@ -4,8 +4,8 @@ Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
 Challenge / ChallengeStateError / Consensus / Evidence / Measurement /
 Observation / ObservationRevocation / Prover / RangeDecision / Verifier /
 assess / attest_observation / attest_observation_for_point / audit /
-audit_bound / locate / locate_attested / locate_bound_attested /
-revoke_observation.
+audit_bound / audit_bound_policy / locate / locate_attested /
+locate_bound_attested / revoke_observation.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ __all__ = [
     "attest_observation_for_point",
     "audit",
     "audit_bound",
+    "audit_bound_policy",
     "locate",
     "locate_attested",
     "locate_bound_attested",
@@ -829,8 +830,11 @@ class Verifier:
         :class:`ValueError`. State, TTL and atomic-consumption semantics are
         exactly those of :meth:`verify_evidence`, including the validation
         order — state and expiry first, then ranging, then binding and
-        response — and any non-finite recorded number raises
-        :class:`ValueError` without consuming the challenge.
+        response — so an unknown, consumed, revoked or expired challenge
+        raises :class:`ChallengeStateError` even when the opening is
+        malformed, and any failure leaves the challenge pending. Any
+        non-finite recorded number raises :class:`ValueError` without
+        consuming the challenge.
 
         The returned record embeds the round's :class:`Evidence` (MAC'd with
         the shared key exactly as :meth:`verify_evidence` produces), the
@@ -838,12 +842,9 @@ class Verifier:
         and is itself MAC'd: ``mac = HMAC-SHA256(key, b"NPBE1" + encoding)``
         over the canonical encoding of every field except ``mac`` itself.
         """
-        if opening is None:
-            # None selects the legacy protocol in verify(); verify_bound only
-            # runs the context-bound protocol, so it is a shape error here.
-            raise TypeError("opening must be bytes")
         measurement, end, start = self._verify_round(
-            challenge, response, started_at, require_finite=True, opening=opening
+            challenge, response, started_at, require_finite=True,
+            opening=opening, opening_required=True,
         )
         entry = self._entry_for(challenge)
         # A successful bound round implies replay protection is on and the
@@ -895,6 +896,7 @@ class Verifier:
         *,
         require_finite: bool,
         opening: Optional[bytes] = None,
+        opening_required: bool = False,
     ) -> tuple[Measurement, float, float]:
         """Shared core of :meth:`verify` and :meth:`verify_evidence`.
 
@@ -903,10 +905,18 @@ class Verifier:
         With ``require_finite`` every recorded number is checked for
         finiteness before anything is consumed. ``opening`` selects the
         context-bound response protocol (``None`` is the legacy protocol).
+        With ``opening_required`` (used by :meth:`verify_bound`, which only
+        runs the context-bound protocol) a ``None`` opening is a shape error
+        raising :class:`TypeError` — but only after the challenge state and
+        TTL checks, so a malformed opening never masks them.
         """
         if not isinstance(challenge, Challenge):
             raise TypeError("challenge must be a Challenge")
         if not self._replay_protection:
+            if opening_required and opening is None:
+                # Without a registry there are no state or TTL checks, so the
+                # shape error surfaces immediately.
+                raise TypeError("opening must be bytes")
             return self._verify_legacy(
                 challenge, response, started_at, require_finite, opening
             )
@@ -945,6 +955,11 @@ class Verifier:
             # Opening/binding validation is part of response validation, so
             # it runs after state, expiry and ranging checks and leaves the
             # challenge pending on failure.
+            if opening_required and opening is None:
+                # verify_bound only runs the context-bound protocol; None is
+                # a shape error there, raised only here so state, expiry and
+                # ranging failures take precedence over it.
+                raise TypeError("opening must be bytes")
             expected = self._expected_response(
                 challenge, entry[3], entry[4], opening
             )
@@ -1144,6 +1159,58 @@ def audit_bound(bound: "BoundEvidence | bytes", key: bytes) -> Measurement:
         elapsed_seconds=evidence.elapsed,
         distance_meters=evidence.distance,
     )
+
+
+def audit_bound_policy(
+    bound: "BoundEvidence | bytes",
+    key: bytes,
+    *,
+    now: object = None,
+    max_age: object = None,
+) -> Measurement:
+    """Re-verify a :class:`BoundEvidence` and enforce an optional freshness policy.
+
+    ``bound`` may be the record itself or its canonical
+    :meth:`BoundEvidence.to_bytes` encoding. The cryptographic,
+    canonical-encoding and ranging checks are exactly those of
+    :func:`audit_bound`, which runs first; every check it performs (and every
+    :class:`ValueError` it raises) applies unchanged.
+
+    With ``max_age=None`` (the default) no freshness check is performed:
+    ``now`` is ignored and no clock is read. Otherwise ``max_age`` must be a
+    non-bool finite non-negative number and ``now`` is required — a non-bool
+    finite number; omitting it or violating either contract raises
+    :class:`ValueError`. The audited ``bound.evidence.end`` is taken as the
+    issuance completion time and must satisfy the closed interval
+    ``0 <= now - end <= max_age``: future-dated or over-age evidence raises
+    :class:`ValueError`, and equality at either boundary is valid.
+
+    Like :func:`audit_bound` this is a pure check: it touches no verifier
+    state and no challenge lifecycle.
+    """
+    measurement = audit_bound(bound, key)
+    if max_age is None:
+        # No freshness policy: `now` is ignored entirely and no clock read.
+        return measurement
+    if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+        raise ValueError("max_age must be a finite non-negative number")
+    age_limit = float(max_age)
+    if not math.isfinite(age_limit) or age_limit < 0:
+        raise ValueError("max_age must be a finite non-negative number")
+    if now is None:
+        raise ValueError("now is required when max_age is set")
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValueError("now must be a finite number")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be a finite number")
+    record = (
+        BoundEvidence.from_bytes(bound) if isinstance(bound, bytes) else bound
+    )
+    age = current - record.evidence.end
+    if not 0.0 <= age <= age_limit:
+        raise ValueError("bound evidence is outside the allowed age")
+    return measurement
 
 
 def _check_assess_params(limit: object, min_samples: object) -> tuple[float, int]:

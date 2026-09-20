@@ -53,6 +53,7 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
 - `audit_bound(bound, key)` — 用共享密钥复核 `BoundEvidence`（或其字节编码），返回对应的 `Measurement`
+- `audit_bound_policy(bound, key, *, now=None, max_age=None) -> Measurement` — 先按 `audit_bound` 复核，再可选做时效复核（见下）
 - `locate(observations, point, *, quorum=3, tolerance=0.0) -> Consensus` — 二维多验证者位置共识（见下）
 - `AttestedObservation(version, id, x, y, decision, issued_at, mac)` — 带 HMAC 签名与时间戳的冻结观察（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 为嵌套对象且键同样依字段顺序，`mac` 为小写十六进制
@@ -148,13 +149,15 @@ measurement = audit(Evidence.from_bytes(blob), key)  # 复核通过则返回测�
 
 ### 绑定证据记录 `BoundEvidence` 与 `audit_bound`
 
-`verify_bound(challenge, response, started_at, *, opening)` 是上下文绑定轮次的 `verify_evidence`：**仅限** `new_challenge(context=..., digest=...)` 签发的绑定挑战（未绑定挑战、或未开启重放防护的验证者一律抛 `ValueError`），`opening` 仅限关键字且必需——非 bytes（含 `None`）抛 `TypeError`，长度或承诺不匹配抛 `ValueError`。状态、有效期、校验顺序（状态/到期 → 测距 → 绑定与应答）与原子消费语义和 `verify_evidence` 完全一致；任何将被记录的非有限数值抛 `ValueError` 且不消费挑战。
+`verify_bound(challenge, response, started_at, *, opening)` 是上下文绑定轮次的 `verify_evidence`：**仅限** `new_challenge(context=..., digest=...)` 签发的绑定挑战（未绑定挑战、或未开启重放防护的验证者一律抛 `ValueError`），`opening` 仅限关键字且必需——非 bytes（含 `None`）抛 `TypeError`，长度或承诺不匹配抛 `ValueError`。状态、有效期、校验顺序（状态/到期 → 测距 → 绑定与应答）与原子消费语义和 `verify_evidence` 完全一致：挑战状态与 TTL 检查先于一切 opening 类型、长度、承诺与应答检查（未知/已消费/已撤销/已过期的挑战即使 opening 畸形也抛 `ChallengeStateError`），任何失败都不消费挑战；任何将被记录的非有限数值抛 `ValueError` 且不消费挑战。
 
 成功时返回冻结的 `BoundEvidence(version, evidence, context, digest, opening, mac)`：`version=1`；`evidence` 为本轮的 `Evidence`（与 `verify_evidence` 同样用共享密钥计算内层 MAC）；`context`/`digest`/`opening` 为登记的承诺三元组（均恰 32 字节）；`mac = HMAC-SHA256(key, b"NPBE1" + 去 mac 的规范编码)`。构造时即校验字段契约（`version==1`、四个 bytes 字段恰 32 字节、内层证据合法），违约抛 `ValueError`；记录不含密钥。
 
 `to_bytes()` 按无空白 UTF-8 JSON 编码：键依字段顺序（`version, evidence, context, digest, opening, mac`），`evidence` 为键序同 `Evidence` 字段序的规范嵌套对象（含其自身 `mac`），bytes 字段为小写十六进制。`from_bytes(data)` 要求外层与嵌套对象的键都恰好是各自字段、各出现一次且依字段顺序，四个 bytes 字段均为解码后恰 32 字节的小写十六进制，并在解析与字段校验后重编码逐字节比对；非 bytes 或不合契约一律抛 `ValueError`，它不校验 MAC。
 
 `audit_bound(bound, key)` 接受 `BoundEvidence` 或其字节编码，拒绝空 key，依次恒时复核四项——外层 `NPBE1` MAC、内层证据 MAC、承诺 `SHA256(b"NPC1" + context + opening) == digest`、绑定应答 `HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) + nonce)`——再按 `start`/`end`/`speed` 复算耗时与折半距离；任何不符抛 `ValueError`，全部通过则返回对应的 `Measurement`。审计是纯函数，不触碰任何验证者状态。
+
+`audit_bound_policy(bound, key, *, now=None, max_age=None)` 在 `audit_bound` 的全部密码学、规范编码与测距复核（及其 `ValueError` 语义）完全不变的基础上，增加可选的时效复核：`max_age=None`（默认）时不做时效检查——`now` 被完全忽略且不读取任何时钟；否则 `max_age` 必须是非布尔、有限、非负的数，`now` 为必传的非布尔有限数（不提供或违约均抛 `ValueError`）。启用时以已审计的 `bound.evidence.end` 为签发完成时刻，必须满足闭区间 `0 <= now - end <= max_age`——未来或超龄证据抛 `ValueError`，两端边界相等均有效。与 `audit_bound` 一样，它是纯函数：不触碰任何验证者状态与挑战生命周期。
 
 ```python
 challenge = verifier.new_challenge(context=context, digest=digest)
