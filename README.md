@@ -91,6 +91,11 @@ python3 -m nearproof
   - `from_bytes(data)` — 仅收 `bytes`（否则 `TypeError`）；缺/多/重复/乱序键、entries 不是数组、某条 entry 不合 `TrustRevocation` 契约、u64/float-u64 等字段违约、编码非规范均抛 `ValueError`；成功返回本类且不验任何 MAC
 - `make_crl(items, seq, time, root) -> TrustRevocationList` — 用与签证书相同的 root bytes 对一批 `TrustRevocation`（可为空；不接受字节）签快照：先按 `(id, target)` 排序、重复对抛 `ValueError`，`mac = HMAC-SHA256(root, b"NPVRL1" + 去mac规范JSON)`，直拼无长度前缀；`root` 非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError`
 - `audit_crl(x, root, now, min=0) -> None` — 收快照对象或字节；恒时复核双层 MAC（列表层 `NPVRL1`、每条 entry 的 `NPVR1`，同一 root），并检查 `issued_at <= now`、`sequence >= min`；对象/root 形状错抛 `TypeError`，其余（含 MAC 不符、未来时间、序号过低）一律抛 `ValueError`
+- `CertifiedConsensusEvidence(version, body, mac)` — 根密钥 MAC 的冻结**认证共识证据**（`version=1`，`body`/`mac` 为 bytes 且 `mac` 恰 32 字节；见下）
+  - `to_bytes()` — 两层均为紧凑 UTF-8 JSON：外层键序 `version, body, mac`，`body`/`mac` 为小写十六进制；body 经全契约校验并规范化重编码
+  - `from_bytes(data)` — 仅收 bytes；外层缺/多/重复/乱序键、body 非契约数组、record/trust 非规范 hex、id 未排序或未对齐、consensus 不合约束、mac 非恰 32 字节、任一层编码非规范均抛 `ValueError`；成功返回本类且不验 MAC
+- `locate_cert_evidence(records, point, context, trusts, root) -> CertifiedConsensusEvidence` — 跑一遍 `locate_cert`（无撤销/now/min 选项，契约与错误语义不变），把共识与参与项封装成证据：参与的 records/trusts 为按唯一 id 排序、一一对应的规范 hex 数组，`mac = HMAC-SHA256(root, b"NPCCE1" + body)`，直拼无长度前缀
+- `audit_cert_evidence(x, root) -> Consensus` — 收证据对象或字节；先过完整 body 契约，再恒时验证 `NPCCE1` MAC，然后用 body 内 point/context/records/trusts 重跑 `locate_cert`；重跑共识与 body 所载逐项不等即抛 `ValueError`，通过则返回重跑的 `Consensus`
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -392,6 +397,33 @@ blob = crl.to_bytes()                                     # 可持久化或分�
 audit_crl(blob, root, now=1_700_000_600.0, min=42)        # 成功返回 None
 # locate_cert(records, point, context, trusts, root,
 #             revocations=blob, now=1_700_000_600.0)
+```
+
+### 认证共识证据 `CertifiedConsensusEvidence`、`locate_cert_evidence` 与 `audit_cert_evidence`
+
+`CertifiedConsensusEvidence(version, body, mac)` 是根密钥 MAC 的冻结证据，把一次 `locate_cert` 共识连同其全部参与项固化为一份可持久化、可分发、可离线复核的记录：按字段序位置构造、冻结且按字段相等。`version` 固定为 `1`；`body` 与 `mac` 必须是 `bytes`，且 `mac` 恰好 32 字节；构造时违约一律抛 `ValueError`。
+
+`body` 是一层紧凑 UTF-8 JSON，解码为五元数组 `[point, context, records, trusts, consensus]`：
+
+- `point` 为恰含两个**有限非布尔**数的 JSON 数组（布尔、非有限数、长度不为 2 均违约）；`context` 为**非空字符串**。
+- `records`/`trusts` 为字符串数组：每项是一条 `BoundAttestedObservation` / `VerifierTrust` 规范字节编码的**小写十六进制**。两个数组均按各自**唯一 id 字典序排列**，同序位一一对应（id 集合相等、无重复、顺序一致），否则违约。每条 record 都必须绑定到 body 的 `point`/`context`，其对应 trust 的 `x`/`y` 必须与 record 相等。
+- `consensus` 为按 `Consensus` 字段序排列的四元数组 `[total, support, rejected, accepted]`：`total`/`support` 为非负非布尔整数且 `support <= total`、`accepted` 为布尔；`rejected` 为字符串数组，**字典序严格排列、无重复**，且只能引用 records 中出现的 id；`total` 必须等于记录条数，`support` 必须等于 `total - len(rejected)`。
+
+外层同样是紧凑 UTF-8 JSON，键序固定为 `version, body, mac`，`body` 与 `mac` 均为小写十六进制，无空白、无 NaN/Infinity、无长度前缀。`mac = HMAC-SHA256(root, b"NPCCE1" + body)`，前缀与 body 两段直接拼接、无分隔符或长度前缀；记录本身不含根密钥。
+
+`to_bytes()` 在编码时重新解析并规范化 body（body 不满足上述契约即抛 `ValueError`）。`from_bytes(data)` **仅收 bytes**（否则 `ValueError`）：外层键必须恰好是 `version`/`body`/`mac` 且各出现一次、依字段顺序（缺、多、重复、乱序即拒绝）；`version` 必须为 `1`；body 经小写十六进制解码后必须通过上述全部数组与字段契约（含 record/trust 自身的完整字节契约与 id 排序对齐）；`mac` 必须是解码后恰好 32 字节的小写十六进制。解析与校验后按规范重编码并与输入**逐字节相等**——任一层的格式化 JSON、空白、非规范数字/字符串写法（如 `3.00`）、大写十六进制或额外定界均抛 `ValueError`；成功返回实例，**不校验 MAC**。
+
+`locate_cert_evidence(records, point, context, trusts, root)` 是签发入口：参数即不带撤销选项的 `locate_cert` 前五个位置参数（`records`/`trusts` 允许对象与规范字节混输；`point` 为恰含两个有限非布尔数的 tuple，`context` 为非空字符串，`root` 为非空 bytes——非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError`）。它先原样跑一遍 `locate_cert`：其全部验签、绑定、几何与契约检查（及 `ValueError` 语义）保持不变；通过后把**实际参与**的 records/trusts 规范化（解析为对象、按唯一 id 排序、按 id 对齐）连同查询点（二元 JSON 数组）、context 与所得 `Consensus`（`rejected` 为字典序列表）组成 body，再以 root 计算 `NPCCE1` MAC。未达 quorum 不是错误，共识结果（含 `rejected`/`accepted=False`）照常封装。函数是纯计算，不读取也不修改任何验证者状态。
+
+`audit_cert_evidence(x, root)` 接受证据对象或其规范字节（其他类型抛 `ValueError`），`root` 规则同上。它依次执行：① 对 bytes 走完整 `from_bytes` 契约、对对象重跑完整 body 契约；② 用 root 恒时复核 `HMAC-SHA256(root, b"NPCCE1" + body) == mac`，不符抛 `ValueError`；③ 从 body 取出 point/context/records/trusts **重跑 `locate_cert`**（每条 trust MAC、record MAC、点/用途绑定与几何全部重新验证），重跑所得 `Consensus` 必须与 body 所载 `[total, support, rejected, accepted]` **逐项相等**，否则抛 `ValueError`——因此即使持有 root 的一方重新签名了被篡改的 body（MAC 合法），任何记录替换、点/用途或共识伪造仍会被重跑抓出。全部通过则返回重跑的 `Consensus`。审计是纯函数，不触碰任何状态。
+
+```python
+from nearproof import locate_cert_evidence, audit_cert_evidence
+
+ev = locate_cert_evidence(records, (0.0, 0.0), context, trusts, root)
+blob = ev.to_bytes()                           # 可持久化或分发
+consensus = audit_cert_evidence(blob, root)    # 验 MAC 并重跑 locate_cert
+consensus.accepted                             # True
 ```
 
 ### 观察撤销 `ObservationRevocation` 与 `revoke_observation`
