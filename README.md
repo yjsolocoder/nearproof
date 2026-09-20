@@ -80,8 +80,12 @@ python3 -m nearproof
 - `VerifierTrust(version, id, x, y, key, mac)` — 根密钥 MAC 的冻结信任记录，把验证者 id 绑定到其坐标与共享密钥（`version=1`，`key`/`mac` 各恰 32 字节，不含根密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`key`/`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
-- `cert(id, x, y, key, root) -> VerifierTrust` — 用非空 root 签发信任记录：`mac = HMAC-SHA256(root, b"NPVT1" + 去mac编码)`，两段直接拼接、无长度前缀（见下）
-- `locate_cert(records, point, context, trusts, root) -> Consensus` — 以根证书信任链验签既有绑定观察，`quorum` 固定 3、`tolerance` 固定 0.0（见下）
+- `cert(id, x, y, key, root) -> VerifierTrust` — 用非空 root bytes 签发信任记录：`mac = HMAC-SHA256(root, b"NPVT1" + 去mac编码)`，两段直接拼接、无长度前缀（见下）
+- `locate_cert(records, point, context, trusts, root, *, revocations=None) -> Consensus` — 以根证书信任链验签既有绑定观察，`quorum` 固定 3、`tolerance` 固定 0.0；可选传入单证书永久撤销列表（见下）
+- `TrustRevocation(version, id, target, mac)` — 根密钥 MAC 的冻结单证书永久撤销记录（`version=1`，`id` 为非空 str，`target`/`mac` 各恰 32 字节，不含根密钥；见下）；字段类型错（形状错）抛 `TypeError`，值违约抛 `ValueError`
+  - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`target`/`mac` 为小写十六进制，无长度前缀
+  - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对（不校验 MAC）：仅收 `bytes`，非 bytes 或字段类型错抛 `TypeError`，其余不合契约一律抛 `ValueError`
+- `revoke_trust(trust, root) -> TrustRevocation` — 仅收 `VerifierTrust` 与非空 root bytes，对该证书签发永久撤销：`mac = HMAC-SHA256(root, b"NPVR1" + 去mac编码)`，两段直接拼接、无长度前缀（见下）
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -329,9 +333,11 @@ consensus.accepted                     # True
 
 `to_bytes()` 按无空白 UTF-8 JSON 编码：键依字段顺序（`version, id, x, y, key, mac`），`key`/`mac` 为小写十六进制。`from_bytes(data)` 只收 `bytes`：键必须恰好是六个字段、各出现一次且依字段顺序，解析与字段校验后按规范重编码并与输入逐字节相等，否则抛 `ValueError`；它不校验 MAC。
 
-`cert(id, x, y, key, root)` 用非空 `root` 签发一条信任记录（`version` 固定为 1），字段违约或空 root 均抛 `ValueError`；纯计算，不触碰任何验证者状态。
+`cert(id, x, y, key, root)` 的 `root` 必须是**非空 `bytes`**：非 bytes（含 `bytearray`、`str`、`None`）抛 `TypeError`，空 bytes 抛 `ValueError`，不做任何隐式转换；其余字段违约抛 `ValueError`；纯计算，不触碰任何验证者状态。
 
-`locate_cert(records, point, context, trusts, root) -> Consensus` 以根证书信任链复核既有绑定观察（`BoundAttestedObservation` 或其字节编码，混输允许）：`trusts` 同样是对象/字节混输，每个 id 恰有一条，重复 id 抛 `ValueError`；`root` 必须非空，每条 trust 的根 MAC 用 `root` 恒时重算比对。随后每条观察记录以其 id 对应证书的 `key` 恒时验 MAC，且证书的 `id`/`x`/`y` 必须与记录相等；缺证书、MAC 不符或坐标不等均抛 `ValueError`。其余规则与 `locate_bound_attested` 相同（点逐项相等、用途精确相等、几何聚合），但 `quorum` 固定为 `3`、`tolerance` 固定为 `0.0`，且不做时效与撤销检查；未达 quorum 只体现在结果中，不抛异常。
+`locate_cert(records, point, context, trusts, root, *, revocations=None) -> Consensus` 以根证书信任链复核既有绑定观察（`BoundAttestedObservation` 或其字节编码，混输允许）：`trusts` 同样是对象/字节混输，每个 id 恰有一条，重复 id 抛 `ValueError`；`root` 同样必须是非空 `bytes`（非 bytes 抛 `TypeError`，空 bytes 抛 `ValueError`），每条 trust 的根 MAC 用 `root` 恒时重算比对。随后每条观察记录以其 id 对应证书的 `key` 恒时验 MAC，且证书的 `id`/`x`/`y` 必须与记录相等；缺证书、MAC 不符或坐标不等均抛 `ValueError`。其余规则与 `locate_bound_attested` 相同（点逐项相等、用途精确相等、几何聚合），但 `quorum` 固定为 `3`、`tolerance` 固定为 `0.0`，且不做时效检查；未达 quorum 只体现在结果中，不抛异常。
+
+`revocations=None`（默认）或空可迭代对象时不做撤销检查，共识结果与之前完全一致。否则 `revocations` 必须是可迭代对象，可混用 `TrustRevocation` 对象与其规范字节编码；每条撤销用同一 `root` **恒时**复核根 MAC，非法项、错误 root、篡改一律抛 `ValueError`；两条撤销携带相同 `(id, target)` 对即按重复拒绝。撤销在其 `id` 等于某条**所用证书**的 id 且 `target` 等于该证书的 `mac` 时命中——命中即把该证书永久撤销，凡使用该证书 id 的观察一律抛 `ValueError`；**未命中也一律抛 `ValueError`**（未知 id、同 id 但 target 是另一张证书、或 target 是 `trusts` 中存在但记录未使用的证书，均算未命中）。`revocations` 仅限关键字传入。
 
 ```python
 from nearproof import cert, locate_cert
@@ -342,6 +348,22 @@ trusts = [cert("alpha", 0.0, 0.0, keys["alpha"], root),
           cert("charlie", 0.0, 4.0, keys["charlie"], root)]
 consensus = locate_cert(records, (0.0, 0.0), context, trusts, root)
 consensus.accepted                     # True
+```
+
+### 单证书永久撤销 `TrustRevocation` 与 `revoke_trust`
+
+`TrustRevocation(version, id, target, mac)` 是根密钥 MAC 的冻结**单证书永久**撤销记录，按字段序位置构造、冻结且按字段相等。字段类型依次为 `int`/`str`/`bytes`/`bytes`；构造时即校验全部字段契约——**形状错（字段类型不对）抛 `TypeError`，值违约抛 `ValueError`**：`version` 必须为 `1`；`id` 为非空字符串，且等于被撤销证书的 id；`target` 为恰好 32 字节的 `bytes`，且等于被撤销证书（`VerifierTrust`）的 `mac`，因此一条撤销只能撤销 target 精确对应的那一张证书；`mac` 为恰好 32 字节的 `bytes`。`mac = HMAC-SHA256(root, b"NPVR1" + 去 mac 规范 JSON)`，前缀与编码直接拼接、无分隔符、无长度前缀；记录本身不含根密钥。
+
+`to_bytes()` 按无空白 UTF-8 JSON 编码：键依字段顺序（`version, id, target, mac`），`target`/`mac` 为小写十六进制，无长度前缀。`from_bytes(data)` **仅收 `bytes`**（非 bytes 抛 `TypeError`）：键必须恰好是四个字段、各出现一次且依字段顺序，`target`/`mac` 为解码后恰 32 字节的小写十六进制，`version`/`id`/字段类型违约分别按 `TypeError`/`ValueError` 抛出；解析与字段校验后按规范重编码并与输入逐字节比较，任何格式化 JSON、空白或非规范写法均抛 `ValueError`；它不校验 MAC。
+
+`revoke_trust(trust, root)` **仅接受 `VerifierTrust` 实例**（不接受字节编码；其他任何类型抛 `TypeError`），`root` 必须是非空 `bytes`（非 bytes 抛 `TypeError`，空 bytes 抛 `ValueError`）。返回的记录 `version` 固定为 `1`、`id` 取自该证书、`target` 等于该证书的 `mac`；签发是纯计算，不触碰任何验证者状态。签发的记录（或其字节编码）通过 `locate_cert(..., revocations=...)` 传入后生效，语义见上节。
+
+```python
+from nearproof import revoke_trust
+
+revocation = revoke_trust(trusts[0], root)
+blob = revocation.to_bytes()           # 可持久化或传输
+# locate_cert(records, point, context, trusts, root, revocations=[blob])
 ```
 
 ### 观察撤销 `ObservationRevocation` 与 `revoke_observation`

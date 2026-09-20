@@ -180,8 +180,13 @@ class CertTest(unittest.TestCase):
         self.assertNotEqual(record.mac, b"\x00" * 32)
 
     def test_empty_root_rejected(self):
-        for bad in (b"", bytearray()):
-            with self.assertRaises(ValueError, msg=repr(bad)):
+        with self.assertRaises(ValueError):
+            cert("a", 0.0, 0.0, KEY_A, b"")
+
+    def test_non_bytes_root_rejected(self):
+        for bad in (bytearray(), bytearray(b"\x09" * 32), "", None, 0,
+                    bytearray(ROOT)):
+            with self.assertRaises(TypeError, msg=repr(bad)):
                 cert("a", 0.0, 0.0, KEY_A, bad)
 
     def test_field_violations_rejected(self):
@@ -230,6 +235,13 @@ class LocateCertTest(unittest.TestCase):
     def test_empty_root_rejected(self):
         with self.assertRaises(ValueError):
             locate_cert(triangle_records(), POINT, CONTEXT, triangle_trusts(), b"")
+
+    def test_non_bytes_root_rejected(self):
+        for bad in (bytearray(ROOT), "", None, 0, bytearray()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                locate_cert(
+                    triangle_records(), POINT, CONTEXT, triangle_trusts(), bad
+                )
 
     def test_wrong_root_rejected(self):
         with self.assertRaises(ValueError):
