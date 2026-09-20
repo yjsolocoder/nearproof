@@ -4,10 +4,10 @@ Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / Challenge / ChallengeStateError / Consensus /
 ContextRevocation / Evidence / Measurement / Observation /
 ObservationRevocation / Prover / RangeDecision / SPEED_OF_LIGHT_MPS /
-Verifier / VerifierTrust / assess / attest_observation /
+TrustRevocation / Verifier / VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_bound / audit_bound_policy /
 cert / locate / locate_attested / locate_bound_attested / locate_cert /
-revoke_bound / revoke_context / revoke_observation.
+revoke_bound / revoke_context / revoke_observation / revoke_trust.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ __all__ = [
     "Prover",
     "RangeDecision",
     "SPEED_OF_LIGHT_MPS",
+    "TrustRevocation",
     "Verifier",
     "VerifierTrust",
     "assess",
@@ -56,6 +57,7 @@ __all__ = [
     "revoke_bound",
     "revoke_context",
     "revoke_observation",
+    "revoke_trust",
 ]
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
@@ -75,6 +77,8 @@ _BOUND_REVOCATION_PREFIX = b"NPBR1"
 _CONTEXT_REVOCATION_PREFIX = b"NPCR1"
 # Domain separation prefix for the verifier-trust MAC.
 _TRUST_PREFIX = b"NPVT1"
+# Domain separation prefix for the verifier-trust revocation MAC.
+_TRUST_REVOCATION_PREFIX = b"NPVR1"
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -1944,15 +1948,18 @@ _REVOCATION_FIELDS = ("version", "id", "revoked_at", "mac")
 
 _TRUST_FIELDS = ("version", "id", "x", "y", "key", "mac")
 
+_TRUST_REVOCATION_FIELDS = ("version", "id", "target", "mac")
+
 
 class _OrderedAttestedObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
 
     The outer attested-observation object, the bound attested-observation
-    object, the nested decision object, the observation-revocation object and
-    the verifier-trust object must each contain exactly their own fields, once
-    each, in field order; the field sets are distinguishable by their key
-    lists, so a single hook can check all of them.
+    object, the nested decision object, the observation-revocation object,
+    the verifier-trust object and the verifier-trust revocation object must
+    each contain exactly their own fields, once each, in field order; the
+    field sets are distinguishable by their key lists, so a single hook can
+    check all of them.
     """
 
     def __init__(self) -> None:
@@ -1967,6 +1974,7 @@ class _OrderedAttestedObject(json.JSONDecoder):
             list(_DECISION_FIELDS),
             list(_REVOCATION_FIELDS),
             list(_TRUST_FIELDS),
+            list(_TRUST_REVOCATION_FIELDS),
         ):
             return dict(pairs)
         raise ValueError(
@@ -2884,6 +2892,19 @@ def _trust_mac(root: bytes, payload: dict) -> bytes:
     ).digest()
 
 
+def _trust_root(root: object) -> bytes:
+    """Validate a root key: ``bytes`` (exactly), and non-empty.
+
+    A non-bytes value is a shape error (:class:`TypeError`); empty bytes are
+    a value error (:class:`ValueError`).
+    """
+    if not isinstance(root, bytes):
+        raise TypeError("root must be non-empty bytes")
+    if not root:
+        raise ValueError("root must not be empty")
+    return root
+
+
 @dataclass(frozen=True)
 class VerifierTrust:
     """A root-MAC'd trust record binding one verifier id to its position and key.
@@ -2986,17 +3007,17 @@ def cert(
     """Sign a verifier-trust record under the root key, returning a
     :class:`VerifierTrust`.
 
-    ``root`` must be non-empty; every other argument must satisfy the
-    :class:`VerifierTrust` field contract (``version`` is set to ``1``), and
-    any violation raises :class:`ValueError`. The MAC is
+    ``root`` must be non-empty ``bytes`` (any other type raises
+    :class:`TypeError`; empty bytes raise :class:`ValueError`); every other
+    argument must satisfy the :class:`VerifierTrust` field contract
+    (``version`` is set to ``1``), and any violation raises
+    :class:`ValueError`. The MAC is
     ``HMAC-SHA256(root, b"NPVT1" + encoding)`` over the canonical encoding of
     every field except ``mac`` itself, the two segments concatenated directly
     with no length prefix. The record is pure data: signing reads and mutates
     no verifier state.
     """
-    if not root:
-        raise ValueError("root must not be empty")
-    root = bytes(root)  # type: ignore[arg-type]
+    root = _trust_root(root)
     record = VerifierTrust(
         version=1,
         id=id,  # type: ignore[arg-type]
@@ -3014,6 +3035,8 @@ def locate_cert(
     context: object,
     trusts: object,
     root: object,
+    *,
+    revocations: object = None,
 ) -> "Consensus":
     """Like :func:`locate_bound_attested`, but keyed by root-certified
     :class:`VerifierTrust` records instead of a caller-supplied key mapping.
@@ -3022,14 +3045,32 @@ def locate_cert(
     and/or their :meth:`BoundAttestedObservation.to_bytes` encodings (mixing
     is allowed). ``trusts`` is an iterable of :class:`VerifierTrust`
     instances and/or their :meth:`VerifierTrust.to_bytes` encodings (mixing
-    is allowed), at most one per id; ``root`` must be non-empty. Every
-    trust's MAC is recomputed with ``root`` and compared in constant time; a
-    duplicated trust id, a wrong root, or any tampering raises
-    :class:`ValueError`. Each record id must then have exactly one trust:
-    the record's MAC is recomputed with that trust's ``key`` and compared in
-    constant time, and the trust's ``id``/``x``/``y`` must equal the record's
-    — a missing trust, a MAC mismatch, or an ``x``/``y`` disagreement raises
-    :class:`ValueError`.
+    is allowed), at most one per id; ``root`` must be non-empty ``bytes``
+    (any other type raises :class:`TypeError`; empty bytes raise
+    :class:`ValueError`). Every trust's MAC is recomputed with ``root`` and
+    compared in constant time; a duplicated trust id, a wrong root, or any
+    tampering raises :class:`ValueError`. Each record id must then have
+    exactly one trust: the record's MAC is recomputed with that trust's
+    ``key`` and compared in constant time, and the trust's ``id``/``x``/``y``
+    must equal the record's — a missing trust, a MAC mismatch, or an
+    ``x``/``y`` disagreement raises :class:`ValueError`.
+
+    With ``revocations=None`` (the default) no revocation check is
+    performed. Otherwise ``revocations`` must be an iterable of
+    :class:`TrustRevocation` instances and/or their canonical
+    :meth:`TrustRevocation.to_bytes` encodings (mixing is allowed). Every
+    revocation's root MAC is recomputed with ``root`` and compared in
+    constant time; any item that is neither a revocation nor its canonical
+    bytes, any tampering, or a duplicate ``(id, target)`` pair raises
+    :class:`ValueError`. A revocation is a permanent, single-certificate
+    revocation: it applies only when its ``id`` equals the id of the
+    certificate of a presented record *and* its ``target`` equals that
+    certificate's ``mac`` byte for byte, in which case that record's
+    certificate is revoked and the call raises :class:`ValueError`. A
+    revocation that matches no certificate actually used by a record (an
+    unknown id, an id without a record, or an unknown target) is itself
+    invalid and raises :class:`ValueError` — revocations cannot be filed
+    against certificates absent from the call.
 
     The remaining rules are exactly those of :func:`locate_bound_attested`
     with ``quorum`` fixed at ``3`` and ``tolerance`` fixed at ``0.0``:
@@ -3039,9 +3080,7 @@ def locate_cert(
     whose :class:`Consensus` is returned. Contract violations raise
     :class:`ValueError`; the function is pure and reads no verifier state.
     """
-    if not root:
-        raise ValueError("root must not be empty")
-    root = bytes(root)  # type: ignore[arg-type]
+    root = _trust_root(root)
 
     # The query binding is needed while examining every record, so enforce
     # the point/context contract up front under the same rules as locate().
@@ -3075,6 +3114,42 @@ def locate_cert(
             raise ValueError(f"verifier trust mac does not match: {ident!r}")
         trust_map[ident] = entry
 
+    # Trust revocations are root-MAC'd like the trusts themselves. Parse,
+    # de-duplicate and verify every one up front; whether each hits the
+    # certificate actually used by a record is decided while the records are
+    # examined.
+    revocations_by_id: dict[str, list[TrustRevocation]] = {}
+    seen_revocations: set[tuple[str, bytes]] = set()
+    if revocations is not None:
+        try:
+            raw_revocations = list(revocations)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise ValueError(
+                "revocations must be an iterable of TrustRevocation or bytes"
+            ) from error
+        for entry in raw_revocations:
+            if isinstance(entry, bytes):
+                entry = TrustRevocation.from_bytes(entry)
+            if not isinstance(entry, TrustRevocation):
+                raise ValueError(
+                    "revocations must contain only TrustRevocation instances"
+                    " or bytes"
+                )
+            pair = (entry.id, entry.target)
+            if pair in seen_revocations:
+                raise ValueError(f"duplicate trust revocation: {entry.id!r}")
+            seen_revocations.add(pair)
+            if not hmac.compare_digest(
+                _trust_revocation_mac(
+                    root, _trust_revocation_payload(entry)
+                ),
+                entry.mac,
+            ):
+                raise ValueError(
+                    f"trust revocation mac does not match: {entry.id!r}"
+                )
+            revocations_by_id.setdefault(entry.id, []).append(entry)
+
     try:
         raw_records = list(records)  # type: ignore[arg-type]
     except TypeError as error:
@@ -3084,6 +3159,7 @@ def locate_cert(
 
     verified: list[Observation] = []
     seen_ids: set[str] = set()
+    matched_revocations: set[tuple[str, bytes]] = set()
     for item in raw_records:
         if isinstance(item, bytes):
             item = BoundAttestedObservation.from_bytes(item)
@@ -3105,6 +3181,15 @@ def locate_cert(
             raise ValueError(
                 f"bound attested observation mac does not match: {ident!r}"
             )
+        # A single-certificate revocation names both the cert id and the
+        # cert's own mac, so it hits exactly one issued certificate; that
+        # certificate must never be treated as valid, whatever its record.
+        for revocation in revocations_by_id.get(ident, ()):
+            if hmac.compare_digest(revocation.target, trust.mac):
+                matched_revocations.add((ident, trust.mac))
+                raise ValueError(
+                    f"verifier trust certificate is revoked: {ident!r}"
+                )
         # Only after both MACs verify do the trust bindings count: the
         # certified id/x/y must equal the record's, or it is a contract
         # breach.
@@ -3124,4 +3209,177 @@ def locate_cert(
             Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
         )
 
+    if revocations is not None and len(matched_revocations) != len(
+        seen_revocations
+    ):
+        # Every revocation must hit the exact certificate actually used by a
+        # record; an unknown id, an id with no record, or a target that
+        # matches no presented cert's mac is invalid rather than silently
+        # ignored.
+        raise ValueError(
+            "trust revocation does not match a certificate used by a record"
+        )
+
     return locate(verified, point, quorum=3, tolerance=0.0)
+
+
+def _trust_revocation_payload(revocation: "TrustRevocation") -> dict:
+    """The JSON-ready trust-revocation fields except ``mac``, in field order."""
+    return {
+        "version": revocation.version,
+        "id": revocation.id,
+        "target": revocation.target.hex(),
+    }
+
+
+def _trust_revocation_mac(root: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPVR1"`` plus the canonical encoding without ``mac``.
+
+    The prefix and the encoding are concatenated directly, with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        root, _TRUST_REVOCATION_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+def _parse_trust_revocation_hex(value: object, name: str) -> bytes:
+    # Same lowercase-hex rule as the other records, but a non-string value
+    # is a shape error (TypeError), not a value error.
+    if not isinstance(value, str):
+        raise TypeError(
+            f"trust revocation {name} must be a lowercase hex string"
+        )
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"trust revocation {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        # Rejects uppercase digits, separators and odd-length input that
+        # bytes.fromhex would otherwise tolerate.
+        raise ValueError(f"trust revocation {name} must be a lowercase hex string")
+    return raw
+
+
+@dataclass(frozen=True)
+class TrustRevocation:
+    """A root-MAC'd permanent revocation of one issued verifier certificate.
+
+    ``version`` is always ``1``; ``id`` a non-empty string, equal to the id
+    of the revoked :class:`VerifierTrust`; ``target`` the revoked
+    certificate's ``mac``, exactly 32 bytes; ``mac`` exactly 32 bytes —
+    ``HMAC-SHA256(root, b"NPVR1" + encoding)`` over the canonical encoding
+    of every field except ``mac`` itself, the prefix and the encoding
+    concatenated directly with no length prefix. Because ``target`` names a
+    concrete certificate, reissuing the verifier a new certificate (with a
+    new mac) is not revoked. A field of the wrong type raises
+    :class:`TypeError` at construction time; a value contract violation
+    raises :class:`ValueError`. Instances are frozen, constructed
+    positionally in field order and compare equal by their fields. No root
+    material is stored.
+    """
+
+    version: int
+    id: str
+    target: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("trust revocation version must be an integer")
+        if self.version != 1:
+            raise ValueError("trust revocation version must be 1")
+        if not isinstance(self.id, str):
+            raise TypeError("trust revocation id must be a string")
+        if not self.id:
+            raise ValueError("trust revocation id must be a non-empty string")
+        if not isinstance(self.target, bytes):
+            raise TypeError("trust revocation target must be bytes")
+        if len(self.target) != 32:
+            raise ValueError("trust revocation target must be exactly 32 bytes")
+        if not isinstance(self.mac, bytes):
+            raise TypeError("trust revocation mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("trust revocation mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``target`` and
+        ``mac`` as lowercase hex, no whitespace, no length prefix, no
+        NaN/Infinity."""
+        payload = _trust_revocation_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "TrustRevocation":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and for
+        fields of the wrong type; raises :class:`ValueError` for anything
+        that does not satisfy the contract: exactly the revocation fields
+        appearing once each in field order (missing, extra, duplicated or
+        out-of-order keys are rejected), ``version == 1``, a non-empty
+        ``id``, and ``target``/``mac`` lowercase hex strings decoding to
+        exactly 32 bytes each. After parsing and field validation the record
+        is re-encoded with :meth:`to_bytes` and the result must equal the
+        input byte for byte, so formatted JSON, whitespace and any
+        non-canonical spelling are rejected as well. The MAC is not verified
+        here — use :func:`revoke_trust` for issuance and :func:`locate_cert`
+        with the root key for verification.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("trust revocation data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedAttestedObject)
+        except ValueError as error:
+            raise ValueError(
+                f"trust revocation is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _TRUST_REVOCATION_FIELDS
+        ):
+            raise ValueError(
+                "trust revocation must be a JSON object with exactly the"
+                " trust revocation fields"
+            )
+        record = cls(
+            version=obj["version"],
+            id=obj["id"],
+            target=_parse_trust_revocation_hex(obj["target"], "target"),
+            mac=_parse_trust_revocation_hex(obj["mac"], "mac"),
+        )
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError("trust revocation encoding is not canonical")
+        return record
+
+
+def revoke_trust(trust: object, root: object) -> TrustRevocation:
+    """Permanently revoke one issued verifier certificate.
+
+    ``trust`` must be a :class:`VerifierTrust` (any other type raises
+    :class:`TypeError`) and ``root`` must be non-empty ``bytes`` (any other
+    type raises :class:`TypeError`; empty bytes raise
+    :class:`ValueError`). The returned :class:`TrustRevocation` has
+    ``version`` set to ``1``, ``id`` copied from the certificate and
+    ``target`` equal to the certificate's ``mac``; its own ``mac`` is
+    ``HMAC-SHA256(root, b"NPVR1" + encoding)`` over the canonical encoding
+    of every field except ``mac`` itself, with no length prefix. The record
+    is pure data: signing reads and mutates no verifier state.
+    """
+    if not isinstance(trust, VerifierTrust):
+        raise TypeError("trust must be a VerifierTrust instance")
+    root = _trust_root(root)
+    record = TrustRevocation(
+        version=1,
+        id=trust.id,
+        target=trust.mac,
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record, mac=_trust_revocation_mac(root, _trust_revocation_payload(record))
+    )
