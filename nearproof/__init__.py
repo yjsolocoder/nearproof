@@ -2,11 +2,11 @@
 
 Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / Challenge / ChallengeStateError / Consensus /
-Evidence / Measurement / Observation / ObservationRevocation / Prover /
-RangeDecision / SPEED_OF_LIGHT_MPS / Verifier / assess /
-attest_observation / attest_observation_for_point / audit /
-audit_bound / audit_bound_policy / locate / locate_attested /
-locate_bound_attested / revoke_bound / revoke_observation.
+ContextRevocation / Evidence / Measurement / Observation /
+ObservationRevocation / Prover / RangeDecision / SPEED_OF_LIGHT_MPS /
+Verifier / assess / attest_observation / attest_observation_for_point /
+audit / audit_bound / audit_bound_policy / locate / locate_attested /
+locate_bound_attested / revoke_bound / revoke_context / revoke_observation.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ __all__ = [
     "Challenge",
     "ChallengeStateError",
     "Consensus",
+    "ContextRevocation",
     "Evidence",
     "Measurement",
     "Observation",
@@ -49,6 +50,7 @@ __all__ = [
     "locate_attested",
     "locate_bound_attested",
     "revoke_bound",
+    "revoke_context",
     "revoke_observation",
 ]
 
@@ -65,6 +67,8 @@ _RESPONSE_PREFIX = b"NPR1"
 _BOUND_EVIDENCE_PREFIX = b"NPBE1"
 # Domain separation prefix for the bound-evidence revocation MAC.
 _BOUND_REVOCATION_PREFIX = b"NPBR1"
+# Domain separation prefix for the context revocation MAC.
+_CONTEXT_REVOCATION_PREFIX = b"NPCR1"
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -352,14 +356,22 @@ _BOUND_REVOCATION_FIELDS = (
     "mac",
 )
 
+_CONTEXT_REVOCATION_FIELDS = (
+    "version",
+    "context",
+    "revoked_at",
+    "mac",
+)
+
 
 class _OrderedBoundEvidenceObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
 
-    The outer bound-evidence object, the nested evidence object and the
-    bound-evidence-revocation object must each contain exactly their own
-    fields, once each, in field order; the field sets are distinguishable by
-    their key lists, so a single hook can check all of them.
+    The outer bound-evidence object, the nested evidence object, the
+    bound-evidence-revocation object and the context-revocation object must
+    each contain exactly their own fields, once each, in field order; the
+    field sets are distinguishable by their key lists, so a single hook can
+    check all of them.
     """
 
     def __init__(self) -> None:
@@ -372,6 +384,7 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
             list(_BOUND_EVIDENCE_FIELDS),
             list(_EVIDENCE_FIELDS),
             list(_BOUND_REVOCATION_FIELDS),
+            list(_CONTEXT_REVOCATION_FIELDS),
         ):
             return dict(pairs)
         raise ValueError(
@@ -590,13 +603,14 @@ class BoundEvidenceRevocation:
         once each in field order (missing, extra, duplicated or out-of-order
         keys are rejected), ``version == 1``, a non-bool u64 ``round_index``,
         ``nonce`` a lowercase hex string decoding to exactly 16 bytes, a
-        finite non-bool non-negative ``revoked_at`` and ``mac`` a lowercase
-        hex string decoding to exactly 32 bytes. After parsing and field
-        validation the record is re-encoded with :meth:`to_bytes` and the
-        result must equal the input byte for byte, so formatted JSON,
-        whitespace and any non-canonical number or string spelling are
-        rejected as well. The MAC is not verified here — use
-        :func:`audit_bound_policy` with the shared key for that.
+        finite non-bool non-negative ``revoked_at`` (its parsed integer or
+        float type is preserved, so both the ``3`` and ``3.0`` spellings
+        round-trip) and ``mac`` a lowercase hex string decoding to exactly 32
+        bytes. After parsing and field validation the record is re-encoded
+        with :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical number or
+        string spelling are rejected as well. The MAC is not verified here —
+        use :func:`audit_bound_policy` with the shared key for that.
         """
         if not isinstance(data, bytes):
             raise ValueError("bound evidence revocation data must be bytes")
@@ -626,11 +640,23 @@ class BoundEvidenceRevocation:
                 f"bound evidence revocation nonce must decode to exactly"
                 f" {NONCE_BYTES} bytes"
             )
-        revoked_at = _parse_float_field(obj["revoked_at"], "revoked_at")
-        if revoked_at < 0:
+        raw_revoked_at = obj["revoked_at"]
+        if isinstance(raw_revoked_at, bool) or not isinstance(
+            raw_revoked_at, (int, float)
+        ):
             raise ValueError(
-                "bound evidence revocation revoked_at must be non-negative"
+                "bound evidence revocation revoked_at must be a finite"
+                " non-negative number"
             )
+        if not math.isfinite(raw_revoked_at) or raw_revoked_at < 0:
+            raise ValueError(
+                "bound evidence revocation revoked_at must be a finite"
+                " non-negative number"
+            )
+        # Keep the parsed type: an integer revoked_at re-encodes as an
+        # integer (``3``), a float as a float (``3.0``), so both canonical
+        # spellings round-trip instead of only the float one.
+        revoked_at = raw_revoked_at
         mac = _parse_hex_field(obj["mac"], "mac")
         if len(mac) != 32:
             raise ValueError("bound evidence revocation mac must decode to 32 bytes")
@@ -680,6 +706,185 @@ def revoke_bound(
     )
     return replace(
         record, mac=_bound_revocation_mac(key, _bound_revocation_payload(record))
+    )
+
+
+def _context_revocation_payload(revocation: "ContextRevocation") -> dict:
+    """The JSON-ready context revocation fields except ``mac``."""
+    return {
+        "version": revocation.version,
+        "context": revocation.context.hex(),
+        "revoked_at": revocation.revoked_at,
+    }
+
+
+def _context_revocation_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPCR1"`` plus the canonical encoding without ``mac``."""
+    return hmac.new(
+        key, _CONTEXT_REVOCATION_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+@dataclass(frozen=True)
+class ContextRevocation:
+    """A MAC'd, timestamped revocation of every bound evidence under one context.
+
+    ``version`` is always ``1``; ``context`` exactly 32 bytes, identifying the
+    use context whose context-bound evidence is revoked in batch;
+    ``revoked_at`` a finite non-bool non-negative number, normalized to and
+    stored as a ``float``; ``mac`` exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPCR1" + encoding)`` over the canonical encoding of
+    every field except ``mac`` itself. A non-bytes ``context`` or ``mac``
+    raises :class:`TypeError`; any other contract violation raises
+    :class:`ValueError` at construction time. No key material is stored.
+    """
+
+    version: int
+    context: bytes
+    revoked_at: float
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("context revocation version must be 1")
+        if not isinstance(self.context, bytes):
+            raise TypeError("context revocation context must be bytes")
+        if len(self.context) != CONTEXT_BYTES:
+            raise ValueError(
+                f"context revocation context must be exactly {CONTEXT_BYTES}"
+                " bytes"
+            )
+        value = self.revoked_at
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                "context revocation revoked_at must be a finite non-negative"
+                " number"
+            )
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                "context revocation revoked_at must be a finite non-negative"
+                " number"
+            )
+        # Normalized to float so the canonical encoding always spells it as
+        # one (``3`` becomes ``3.0``) regardless of the caller's type.
+        object.__setattr__(self, "revoked_at", float(value))
+        if not isinstance(self.mac, bytes):
+            raise TypeError("context revocation mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("context revocation mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``context`` and
+        ``mac`` as lowercase hex, no whitespace, no NaN/Infinity, no length
+        prefix or framing around the single JSON document."""
+        payload = _context_revocation_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ContextRevocation":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        :class:`ValueError` for anything that does not satisfy the contract:
+        exactly the revocation fields appearing once each in field order
+        (missing, extra, duplicated or out-of-order keys are rejected),
+        ``version == 1``, ``context`` a lowercase hex string decoding to
+        exactly 32 bytes, a finite non-bool non-negative ``revoked_at``
+        (stored as a ``float``, so only its canonical float spelling
+        round-trips) and ``mac`` a lowercase hex string decoding to exactly
+        32 bytes. After parsing and field validation the record is re-encoded
+        with :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical number or
+        string spelling are rejected as well. The MAC is not verified here —
+        use :func:`audit_bound_policy` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("context revocation data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedBoundEvidenceObject)
+        except ValueError as error:
+            raise ValueError(
+                f"context revocation is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(_CONTEXT_REVOCATION_FIELDS):
+            raise ValueError(
+                "context revocation must be a JSON object with exactly the"
+                " context revocation fields"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("context revocation version must be 1")
+        context = _parse_hex_field(obj["context"], "context")
+        if len(context) != CONTEXT_BYTES:
+            raise ValueError(
+                f"context revocation context must decode to exactly"
+                f" {CONTEXT_BYTES} bytes"
+            )
+        revoked_at = _parse_float_field(obj["revoked_at"], "revoked_at")
+        if revoked_at < 0:
+            raise ValueError("context revocation revoked_at must be non-negative")
+        mac = _parse_hex_field(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError("context revocation mac must decode to 32 bytes")
+        record = cls(
+            version=version,
+            context=context,
+            revoked_at=revoked_at,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError("context revocation encoding is not canonical")
+        return record
+
+
+def revoke_context(
+    context: object,
+    revoked_at: object,
+    key: object,
+) -> ContextRevocation:
+    """Sign a batch revocation of every bound evidence round under ``context``.
+
+    Returns a :class:`ContextRevocation` whose ``context`` names the use
+    context being revoked (``version`` is set to ``1``). ``key`` must be
+    non-empty; a non-bytes ``context`` raises :class:`TypeError`, and every
+    other contract violation (a context that is not exactly 32 bytes, an
+    empty key, a non-finite or negative ``revoked_at``) raises
+    :class:`ValueError`. The record is pure data: signing reads and mutates
+    no verifier state.
+    """
+    if not key:
+        raise ValueError("key must not be empty")
+    key = bytes(key)
+    record = ContextRevocation(
+        version=1,
+        context=context,  # type: ignore[arg-type]
+        revoked_at=revoked_at,  # type: ignore[arg-type]
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record, mac=_context_revocation_mac(key, _context_revocation_payload(record))
+    )
+
+
+def _parse_revocation_bytes(
+    data: bytes,
+) -> "BoundEvidenceRevocation | ContextRevocation":
+    """Decode revocation bytes as either revocation record, by their key shape."""
+    try:
+        obj = json.loads(data, cls=_OrderedBoundEvidenceObject)
+    except ValueError as error:
+        raise ValueError(f"revocation is not valid JSON: {error}") from error
+    if isinstance(obj, dict) and list(obj) == list(_BOUND_REVOCATION_FIELDS):
+        return BoundEvidenceRevocation.from_bytes(data)
+    if isinstance(obj, dict) and list(obj) == list(_CONTEXT_REVOCATION_FIELDS):
+        return ContextRevocation.from_bytes(data)
+    raise ValueError(
+        "revocation bytes must encode a BoundEvidenceRevocation or"
+        " ContextRevocation"
     )
 
 
@@ -1379,21 +1584,26 @@ def audit_bound_policy(
 
     With ``revocations=None`` (the default) no revocation check is performed
     and the behaviour is exactly as before. Otherwise ``revocations`` must be
-    an iterable of :class:`BoundEvidenceRevocation` instances and/or their
-    canonical :meth:`BoundEvidenceRevocation.to_bytes` encodings (mixing is
-    allowed); an item that is neither, or bytes that do not parse, raises
-    :class:`ValueError`. Every revocation's MAC is recomputed with the same
-    ``key`` the evidence is audited under and compared in constant time, so a
-    wrong key or any tampering raises :class:`ValueError`. Two revocations
-    carrying the same ``(round_index, nonce)`` pair are likewise rejected, so
-    at most one revocation can match this bound. When revocations are given
-    ``now`` is required exactly as under ``max_age`` (a finite non-bool
-    number): a revocation with ``revoked_at > now`` raises
-    :class:`ValueError`, and a revocation whose ``round_index`` and ``nonce``
-    identify this bound's evidence with ``revoked_at >= bound.evidence.end``
-    (i.e. ``end <= revoked_at``) raises :class:`ValueError`; evidence whose
-    ``end`` is strictly after the matching revocation survives and then
-    follows the usual freshness check.
+    an iterable of :class:`BoundEvidenceRevocation` and/or
+    :class:`ContextRevocation` instances and/or their canonical
+    ``to_bytes`` encodings (all mixing is allowed); an item that is none of
+    these, or bytes that do not parse, raises :class:`ValueError`. Every
+    revocation's MAC is recomputed with the same ``key`` the evidence is
+    audited under and compared in constant time, so a wrong key or any
+    tampering raises :class:`ValueError`. Two revocations of the same kind
+    carrying the same identity — the same ``(round_index, nonce)`` pair or
+    the same ``context`` — are likewise rejected, so at most one revocation
+    of each kind can match this bound. When revocations are given ``now`` is
+    required exactly as under ``max_age`` (a finite non-bool number): a
+    revocation with ``revoked_at > now`` raises :class:`ValueError`. A
+    :class:`BoundEvidenceRevocation` whose ``round_index`` and ``nonce``
+    identify this bound's evidence, or a :class:`ContextRevocation` whose
+    ``context`` equals this bound's ``context``, with
+    ``revoked_at >= bound.evidence.end`` (i.e. ``end <= revoked_at``) raises
+    :class:`ValueError`; revocations identifying a different round or context
+    are ignored for this purpose, and evidence whose ``end`` is strictly
+    after the matching revocation survives and then follows the usual
+    freshness check.
 
     Like :func:`audit_bound` this is a pure check: it touches no verifier
     state and no challenge lifecycle.
@@ -1425,37 +1635,67 @@ def audit_bound_policy(
             raw_revocations = list(revocations)  # type: ignore[arg-type]
         except TypeError as error:
             raise ValueError(
-                "revocations must be an iterable of BoundEvidenceRevocation"
-                " or bytes"
+                "revocations must be an iterable of BoundEvidenceRevocation,"
+                " ContextRevocation or bytes"
             ) from error
         target = (record.evidence.round_index, record.evidence.nonce)
-        seen: set[tuple[int, bytes]] = set()
+        seen_pairs: set[tuple[int, bytes]] = set()
+        seen_contexts: set[bytes] = set()
         for entry in raw_revocations:
             if isinstance(entry, bytes):
-                entry = BoundEvidenceRevocation.from_bytes(entry)
-            if not isinstance(entry, BoundEvidenceRevocation):
+                entry = _parse_revocation_bytes(entry)
+            if isinstance(entry, BoundEvidenceRevocation):
+                pair = (entry.round_index, entry.nonce)
+                if pair in seen_pairs:
+                    raise ValueError(
+                        "revocations contain a duplicate (round_index, nonce) pair"
+                    )
+                seen_pairs.add(pair)
+                if not hmac.compare_digest(
+                    _bound_revocation_mac(bytes(key), _bound_revocation_payload(entry)),
+                    entry.mac,
+                ):
+                    raise ValueError("bound evidence revocation mac does not match")
+                revoked_at = float(entry.revoked_at)
+                if revoked_at > current:
+                    raise ValueError(
+                        "bound evidence revocation is dated in the future"
+                    )
+                # Pair uniqueness above guarantees at most one matching entry.
+                if pair == target and record.evidence.end <= revoked_at:
+                    raise ValueError(
+                        "bound evidence was not completed after its revocation"
+                    )
+            elif isinstance(entry, ContextRevocation):
+                if entry.context in seen_contexts:
+                    raise ValueError(
+                        "revocations contain a duplicate context"
+                    )
+                seen_contexts.add(entry.context)
+                if not hmac.compare_digest(
+                    _context_revocation_mac(
+                        bytes(key), _context_revocation_payload(entry)
+                    ),
+                    entry.mac,
+                ):
+                    raise ValueError("context revocation mac does not match")
+                revoked_at = float(entry.revoked_at)
+                if revoked_at > current:
+                    raise ValueError("context revocation is dated in the future")
+                # Context uniqueness above guarantees at most one matching
+                # entry; a revocation naming another context is ignored here.
+                if (
+                    entry.context == record.context
+                    and record.evidence.end <= revoked_at
+                ):
+                    raise ValueError(
+                        "bound evidence was not completed after its context"
+                        " revocation"
+                    )
+            else:
                 raise ValueError(
-                    "revocations must contain only BoundEvidenceRevocation"
-                    " instances or bytes"
-                )
-            pair = (entry.round_index, entry.nonce)
-            if pair in seen:
-                raise ValueError(
-                    "revocations contain a duplicate (round_index, nonce) pair"
-                )
-            seen.add(pair)
-            if not hmac.compare_digest(
-                _bound_revocation_mac(bytes(key), _bound_revocation_payload(entry)),
-                entry.mac,
-            ):
-                raise ValueError("bound evidence revocation mac does not match")
-            revoked_at = float(entry.revoked_at)
-            if revoked_at > current:
-                raise ValueError("bound evidence revocation is dated in the future")
-            # Pair uniqueness above guarantees at most one matching entry.
-            if pair == target and record.evidence.end <= revoked_at:
-                raise ValueError(
-                    "bound evidence was not completed after its revocation"
+                    "revocations must contain only BoundEvidenceRevocation or"
+                    " ContextRevocation instances or bytes"
                 )
     if check_age:
         age = current - record.evidence.end

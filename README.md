@@ -58,6 +58,10 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`nonce`/`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
 - `revoke_bound(bound, revoked_at, key) -> BoundEvidenceRevocation` — 用非空 key 对一条 `BoundEvidence`（或其字节编码）签发撤销记录（见下）
+- `ContextRevocation(version, context, revoked_at, mac)` — 带 HMAC 签名的冻结上下文批量撤销记录（`version=1`，`context`/`mac` 各恰 32 字节，`revoked_at` 存为 float，不含密钥；见下）
+  - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`context`/`mac` 为小写十六进制，无长度前缀
+  - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 抛 `TypeError`，不合契约抛 `ValueError`（不校验 MAC）
+- `revoke_context(context, revoked_at, key) -> ContextRevocation` — 用非空 key 对一个 32 字节上下文签发批量撤销记录（见下）
 - `locate(observations, point, *, quorum=3, tolerance=0.0) -> Consensus` — 二维多验证者位置共识（见下）
 - `AttestedObservation(version, id, x, y, decision, issued_at, mac)` — 带 HMAC 签名与时间戳的冻结观察（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 为嵌套对象且键同样依字段顺序，`mac` 为小写十六进制
@@ -164,7 +168,7 @@ measurement = audit(Evidence.from_bytes(blob), key)  # 复核通过则返回测�
 `audit_bound_policy(bound, key, *, now=None, max_age=None, revocations=None)` 在 `audit_bound` 的全部密码学、规范编码与测距复核（及其 `ValueError` 语义）完全不变的基础上，增加可选的时效与撤销复核：`max_age=None` 且 `revocations=None`（均为默认）时不做任何额外检查——`now` 被完全忽略且不读取任何时钟。
 
 - `max_age` 启用时必须是非布尔、有限、非负的数，以已审计的 `bound.evidence.end` 为签发完成时刻，必须满足闭区间 `0 <= now - end <= max_age`——未来或超龄证据抛 `ValueError`，两端边界相等均有效。
-- `revocations` 启用时必须是可迭代对象，可混用 `BoundEvidenceRevocation` 对象与其规范字节编码：每条撤销用同一 `key` **恒时**复核 MAC，非法项、重复的 `(round_index, nonce)` 对、错误 key 或篡改一律抛 `ValueError`；`revoked_at > now` 的“未来撤销”抛 `ValueError`。当某条撤销的 `round_index`/`nonce` 与本证据嵌套 `Evidence` 完全相同且 `end <= revoked_at` 时抛 `ValueError`（重复对保证至多一条命中）；完成时刻严格晚于撤销时刻的证据不受影响，再走时效检查。
+- `revocations` 启用时必须是可迭代对象，可混用 `BoundEvidenceRevocation`、`ContextRevocation` 对象与它们的规范字节编码：每条撤销用同一 `key` **恒时**复核 MAC，非法项、同类撤销的重复标识（`(round_index, nonce)` 对或 `context`）、错误 key 或篡改一律抛 `ValueError`；`revoked_at > now` 的“未来撤销”抛 `ValueError`。当某条 `BoundEvidenceRevocation` 的 `round_index`/`nonce` 与本证据嵌套 `Evidence` 完全相同、或某条 `ContextRevocation` 的 `context` 与本证据的 `context` 相同，且 `end <= revoked_at` 时抛 `ValueError`（同类标识唯一保证每类至多一条命中）；指向其他轮次或其他上下文的撤销不影响本证据，完成时刻严格晚于撤销时刻的证据也不受影响，再走时效检查。
 - 任一检查启用时 `now` 为必传的非布尔有限数（不提供或违约均抛 `ValueError`）。
 
 与 `audit_bound` 一样，它是纯函数：不触碰任何验证者状态与挑战生命周期。
@@ -181,7 +185,7 @@ measurement = audit_bound(BoundEvidence.from_bytes(blob), key)
 
 `BoundEvidenceRevocation(version, round_index, nonce, revoked_at, mac)` 是冻结的带签名绑定证据撤销记录，构造时即校验全部字段契约，任何违约抛 `ValueError`：`version` 必须为 `1`；`round_index` 为非布尔、取值于 `[0, 2^64-1]` 的整数；`nonce` 为恰好 16 字节的 `bytes`；`revoked_at` 为非布尔、有限、非负的数；`mac` 为恰好 32 字节的 `bytes`。`round_index`/`nonce` 共同标识被撤销的那轮 `BoundEvidence`（即其嵌套 `Evidence` 的同名字段）。`mac = HMAC-SHA256(key, b"NPBR1" + 去 mac 规范 JSON)`，记录本身不含密钥。
 
-`to_bytes()` 按无空白 UTF-8 JSON 编码：键依字段顺序（`version, round_index, nonce, revoked_at, mac`），`nonce`/`mac` 为小写十六进制，无长度前缀。`from_bytes(data)` 要求键恰好是五个字段、各出现一次且依字段顺序，`round_index` 为非布尔 u64，`nonce` 解码后恰 16 字节，`revoked_at` 有限非负，`mac` 解码后恰 32 字节；解析与字段校验后按规范重编码并与输入逐字节比较，任何格式化 JSON、空白或非规范写法均抛 `ValueError`；它不校验 MAC。
+`to_bytes()` 按无空白 UTF-8 JSON 编码：键依字段顺序（`version, round_index, nonce, revoked_at, mac`），`nonce`/`mac` 为小写十六进制，无长度前缀。`from_bytes(data)` 要求键恰好是五个字段、各出现一次且依字段顺序，`round_index` 为非布尔 u64，`nonce` 解码后恰 16 字节，`revoked_at` 有限非负（保留解析出的整数/浮点类型并规范重编码，`3` 与 `3.0` 两种写法都能往返），`mac` 解码后恰 32 字节；解析与字段校验后按规范重编码并与输入逐字节比较，任何格式化 JSON、空白或非规范写法均抛 `ValueError`；它不校验 MAC。
 
 `revoke_bound(bound, revoked_at, key)` 接受 `BoundEvidence` 或其字节编码，用非空 `key` 签发一条撤销记录（`version` 固定为 `1`，`round_index`/`nonce` 取自其嵌套证据）；字段违约或空 key 均抛 `ValueError`；签发是纯计算，不触碰任何验证者状态。签发的记录（或其字节编码）通过 `audit_bound_policy(..., revocations=...)` 传入后生效，语义见上节。
 
@@ -189,6 +193,22 @@ measurement = audit_bound(BoundEvidence.from_bytes(blob), key)
 from nearproof import revoke_bound
 
 revocation = revoke_bound(bound, time.time(), key)
+blob = revocation.to_bytes()                     # 可持久化或传输
+# audit_bound_policy(bound, key, now=time.time(), revocations=[blob])
+```
+
+### 上下文批量撤销 `ContextRevocation` 与 `revoke_context`
+
+`ContextRevocation(version, context, revoked_at, mac)` 是冻结的带签名批量撤销记录，按序构造、按字段相等，构造时即校验全部字段契约：`version` 必须为 `1`；`context` 为恰好 32 字节的 `bytes`，标识被批量撤销的用途上下文；`revoked_at` 为非布尔、有限、非负的数，并**归一化存为 `float`**；`mac` 为恰好 32 字节的 `bytes`。`context`/`mac` 非 bytes 抛 `TypeError`，其余字段违约（版本不对、长度不对、空 key、`revoked_at` 为布尔/非有限/负数等）均抛 `ValueError`。`mac = HMAC-SHA256(key, b"NPCR1" + 去 mac 规范 JSON)`，记录本身不含密钥。
+
+`to_bytes()` 按无空白 UTF-8 JSON 编码：键依字段顺序（`version, context, revoked_at, mac`），`context`/`mac` 为小写十六进制，无长度前缀。`from_bytes(data)` 要求键恰好是四个字段、各出现一次且依字段顺序，`context`/`mac` 解码后各恰 32 字节，`revoked_at` 有限非负且以浮点规范写法存储（整数写法 `3` 会因重编码为 `3.0` 而被判为非规范）；解析与字段校验后按规范重编码并与输入逐字节比较。非 bytes 输入抛 `TypeError`，不合契约抛 `ValueError`；它不校验 MAC。
+
+`revoke_context(context, revoked_at, key)` 用非空 `key` 对一个 32 字节上下文签发批量撤销记录（`version` 固定为 1）；`context` 非 bytes 抛 `TypeError`，其余字段违约或空 key 均抛 `ValueError`；签发是纯计算，不触碰任何验证者状态。签发的记录（或其字节编码）通过 `audit_bound_policy(..., revocations=...)` 与 `BoundEvidenceRevocation` 混传后生效：`context` 与被审证据的 `context` 相同且 `end <= revoked_at` 时拒绝该证据，不匹配的上下文忽略；恒时 MAC 复核、`now` 契约与 `ValueError` 语义与逐轮撤销完全一致，同一 `context` 重复出现即拒绝。
+
+```python
+from nearproof import revoke_context
+
+revocation = revoke_context(context, time.time(), key)
 blob = revocation.to_bytes()                     # 可持久化或传输
 # audit_bound_policy(bound, key, now=time.time(), revocations=[blob])
 ```
