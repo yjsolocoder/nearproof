@@ -53,7 +53,11 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
 - `audit_bound(bound, key)` — 用共享密钥复核 `BoundEvidence`（或其字节编码），返回对应的 `Measurement`
-- `audit_bound_policy(bound, key, *, now=None, max_age=None) -> Measurement` — 先按 `audit_bound` 复核，再可选做时效复核（见下）
+- `audit_bound_policy(bound, key, *, now=None, max_age=None, revocations=None) -> Measurement` — 先按 `audit_bound` 复核，再可选做时效/撤销复核（见下）
+- `BoundEvidenceRevocation(version, round_index, nonce, revoked_at, mac)` — 带 HMAC 签名的冻结绑定证据撤销记录（`version=1`，`round_index` 为非布尔 u64，`nonce` 恰 16 字节，`mac` 恰 32 字节，不含密钥；见下）
+  - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`nonce`/`mac` 为小写十六进制
+  - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
+- `revoke_bound(bound, revoked_at, key) -> BoundEvidenceRevocation` — 用非空 key 对一条 `BoundEvidence`（或其字节编码）签发撤销记录（见下）
 - `locate(observations, point, *, quorum=3, tolerance=0.0) -> Consensus` — 二维多验证者位置共识（见下）
 - `AttestedObservation(version, id, x, y, decision, issued_at, mac)` — 带 HMAC 签名与时间戳的冻结观察（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 为嵌套对象且键同样依字段顺序，`mac` 为小写十六进制
@@ -157,7 +161,13 @@ measurement = audit(Evidence.from_bytes(blob), key)  # 复核通过则返回测�
 
 `audit_bound(bound, key)` 接受 `BoundEvidence` 或其字节编码，拒绝空 key，依次恒时复核四项——外层 `NPBE1` MAC、内层证据 MAC、承诺 `SHA256(b"NPC1" + context + opening) == digest`、绑定应答 `HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) + nonce)`——再按 `start`/`end`/`speed` 复算耗时与折半距离；任何不符抛 `ValueError`，全部通过则返回对应的 `Measurement`。审计是纯函数，不触碰任何验证者状态。
 
-`audit_bound_policy(bound, key, *, now=None, max_age=None)` 在 `audit_bound` 的全部密码学、规范编码与测距复核（及其 `ValueError` 语义）完全不变的基础上，增加可选的时效复核：`max_age=None`（默认）时不做时效检查——`now` 被完全忽略且不读取任何时钟；否则 `max_age` 必须是非布尔、有限、非负的数，`now` 为必传的非布尔有限数（不提供或违约均抛 `ValueError`）。启用时以已审计的 `bound.evidence.end` 为签发完成时刻，必须满足闭区间 `0 <= now - end <= max_age`——未来或超龄证据抛 `ValueError`，两端边界相等均有效。与 `audit_bound` 一样，它是纯函数：不触碰任何验证者状态与挑战生命周期。
+`audit_bound_policy(bound, key, *, now=None, max_age=None, revocations=None)` 在 `audit_bound` 的全部密码学、规范编码与测距复核（及其 `ValueError` 语义）完全不变的基础上，增加可选的时效与撤销复核：`max_age=None` 且 `revocations=None`（均为默认）时不做任何额外检查——`now` 被完全忽略且不读取任何时钟。
+
+- `max_age` 启用时必须是非布尔、有限、非负的数，以已审计的 `bound.evidence.end` 为签发完成时刻，必须满足闭区间 `0 <= now - end <= max_age`——未来或超龄证据抛 `ValueError`，两端边界相等均有效。
+- `revocations` 启用时必须是可迭代对象，可混用 `BoundEvidenceRevocation` 对象与其规范字节编码：每条撤销用同一 `key` **恒时**复核 MAC，非法项、重复的 `(round_index, nonce)` 对、错误 key 或篡改一律抛 `ValueError`；`revoked_at > now` 的“未来撤销”抛 `ValueError`。当某条撤销的 `round_index`/`nonce` 与本证据嵌套 `Evidence` 完全相同且 `end <= revoked_at` 时抛 `ValueError`（重复对保证至多一条命中）；完成时刻严格晚于撤销时刻的证据不受影响，再走时效检查。
+- 任一检查启用时 `now` 为必传的非布尔有限数（不提供或违约均抛 `ValueError`）。
+
+与 `audit_bound` 一样，它是纯函数：不触碰任何验证者状态与挑战生命周期。
 
 ```python
 challenge = verifier.new_challenge(context=context, digest=digest)
@@ -165,6 +175,22 @@ response = prover.reveal(challenge, context, opening)
 bound = verifier.verify_bound(challenge, response, verifier.clock(), opening=opening)
 blob = bound.to_bytes()                          # 可持久化或传输
 measurement = audit_bound(BoundEvidence.from_bytes(blob), key)
+```
+
+### 绑定证据撤销 `BoundEvidenceRevocation` 与 `revoke_bound`
+
+`BoundEvidenceRevocation(version, round_index, nonce, revoked_at, mac)` 是冻结的带签名绑定证据撤销记录，构造时即校验全部字段契约，任何违约抛 `ValueError`：`version` 必须为 `1`；`round_index` 为非布尔、取值于 `[0, 2^64-1]` 的整数；`nonce` 为恰好 16 字节的 `bytes`；`revoked_at` 为非布尔、有限、非负的数；`mac` 为恰好 32 字节的 `bytes`。`round_index`/`nonce` 共同标识被撤销的那轮 `BoundEvidence`（即其嵌套 `Evidence` 的同名字段）。`mac = HMAC-SHA256(key, b"NPBR1" + 去 mac 规范 JSON)`，记录本身不含密钥。
+
+`to_bytes()` 按无空白 UTF-8 JSON 编码：键依字段顺序（`version, round_index, nonce, revoked_at, mac`），`nonce`/`mac` 为小写十六进制，无长度前缀。`from_bytes(data)` 要求键恰好是五个字段、各出现一次且依字段顺序，`round_index` 为非布尔 u64，`nonce` 解码后恰 16 字节，`revoked_at` 有限非负，`mac` 解码后恰 32 字节；解析与字段校验后按规范重编码并与输入逐字节比较，任何格式化 JSON、空白或非规范写法均抛 `ValueError`；它不校验 MAC。
+
+`revoke_bound(bound, revoked_at, key)` 接受 `BoundEvidence` 或其字节编码，用非空 `key` 签发一条撤销记录（`version` 固定为 `1`，`round_index`/`nonce` 取自其嵌套证据）；字段违约或空 key 均抛 `ValueError`；签发是纯计算，不触碰任何验证者状态。签发的记录（或其字节编码）通过 `audit_bound_policy(..., revocations=...)` 传入后生效，语义见上节。
+
+```python
+from nearproof import revoke_bound
+
+revocation = revoke_bound(bound, time.time(), key)
+blob = revocation.to_bytes()                     # 可持久化或传输
+# audit_bound_policy(bound, key, now=time.time(), revocations=[blob])
 ```
 
 ### 批量判定 `assess`
