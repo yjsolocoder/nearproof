@@ -2,7 +2,8 @@
 
 Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
-ChallengeStateError / Consensus / ContextRevocation / CrlProof / Evidence /
+ChallengeStateError / Consensus / ContextRevocation / CrlProof /
+CrlProofAuditor / CrlState / Evidence /
 Measurement / Observation / ObservationRevocation / Prover / RangeDecision
 / SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList / Verifier /
 VerifierTrust / assess / attest_observation /
@@ -38,6 +39,8 @@ __all__ = [
     "Consensus",
     "ContextRevocation",
     "CrlProof",
+    "CrlProofAuditor",
+    "CrlState",
     "Evidence",
     "Measurement",
     "Observation",
@@ -97,6 +100,8 @@ _TRUST_REVOCATION_LIST_PREFIX = b"NPVRL1"
 _CERT_EVIDENCE_PREFIX = b"NPCCE1"
 # Domain separation prefix for the CRL-snapshot proof MAC.
 _CRL_PROOF_PREFIX = b"NPCCE2"
+# Domain separation prefix for the CRL-checkpoint-state MAC.
+_CRL_STATE_PREFIX = b"NPCK1"
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -4889,3 +4894,266 @@ def _audit_proof(x: object, root: bytes) -> "Consensus":
             "crl proof consensus does not match the recomputed result"
         )
     return consensus
+
+
+_CRL_STATE_FIELDS = ("version", "sequence", "digest", "mac")
+
+
+def _crl_state_payload(state: "CrlState") -> dict:
+    """The JSON-ready crl-state fields except ``mac``, in field order."""
+    return {
+        "version": state.version,
+        "sequence": state.sequence,
+        "digest": state.digest.hex(),
+    }
+
+
+def _crl_state_mac(root: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPCK1"`` plus the mac-less canonical encoding.
+
+    The prefix and the encoding are concatenated directly, with no
+    separator or length prefix.
+    """
+    return hmac.new(
+        root, _CRL_STATE_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+def _parse_crl_state_hex(value: object, name: str) -> bytes:
+    # Same lowercase, round-tripping hex rule as the other records; both
+    # shape and value failures are ValueErrors for this record.
+    if not isinstance(value, str):
+        raise ValueError(f"crl state {name} must be a lowercase hex string")
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"crl state {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        # Rejects uppercase digits, separators and odd-length input that
+        # bytes.fromhex would otherwise tolerate.
+        raise ValueError(f"crl state {name} must be a lowercase hex string")
+    return raw
+
+
+class _OrderedCrlStateObject(json.JSONDecoder):
+    """JSON decoder rejecting duplicate/out-of-order keys at the outer layer.
+
+    The state object must carry exactly ``version, sequence, digest, mac``
+    in field order; there are no nested objects, so the outer key set is
+    the only one to enforce.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys == list(_CRL_STATE_FIELDS):
+            return dict(pairs)
+        raise ValueError(
+            "crl state JSON keys must be exactly version, sequence, digest"
+            " and mac in field order"
+        )
+
+
+@dataclass(frozen=True)
+class CrlState:
+    """A root-MAC'd anti-rollback checkpoint over audited CRL snapshots.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer — the sequence of the newest audited
+    :class:`TrustRevocationList` snapshot; ``digest`` exactly 32 bytes —
+    ``SHA256(crl)`` over the canonical
+    :meth:`TrustRevocationList.to_bytes` encoding the audited proof
+    carried; ``mac`` exactly 32 bytes —
+    ``HMAC-SHA256(root, b"NPCK1" + encoding)`` over the canonical
+    encoding of every field except ``mac`` itself, the prefix and the
+    encoding concatenated directly with no length prefix. Any contract
+    violation raises :class:`ValueError` at construction time. Instances
+    are frozen, constructed positionally in field order and compare equal
+    by their fields. No root material is stored.
+    """
+
+    version: int
+    sequence: int
+    digest: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("crl state version must be 1")
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise ValueError("crl state sequence must be an integer")
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "crl state sequence must fit in an unsigned 64-bit integer"
+            )
+        if not isinstance(self.digest, bytes) or len(self.digest) != 32:
+            raise ValueError("crl state digest must be exactly 32 bytes")
+        if not isinstance(self.mac, bytes) or len(self.mac) != 32:
+            raise ValueError("crl state mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``digest`` and
+        ``mac`` as lowercase hex, no whitespace, no length prefix."""
+        payload = _crl_state_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "CrlState":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or
+        does not satisfy the contract: exactly the state fields appearing
+        once each in field order (missing, extra, duplicated or
+        out-of-order keys are rejected), ``version == 1``, a non-bool u64
+        ``sequence``, and ``digest``/``mac`` lowercase hex strings decoding
+        to exactly 32 bytes each. After parsing and field validation the
+        record is re-encoded with :meth:`to_bytes` and the result must
+        equal the input byte for byte, so formatted JSON, whitespace and
+        any non-canonical number or string spelling are rejected as well.
+        The MAC is not verified here — only :class:`CrlProofAuditor`, which
+        holds the root key, can do that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("crl state data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedCrlStateObject)
+        except ValueError as error:
+            raise ValueError(f"crl state is not valid JSON: {error}") from error
+        if not isinstance(obj, dict) or list(obj) != list(_CRL_STATE_FIELDS):
+            raise ValueError(
+                "crl state must be a JSON object with exactly the version,"
+                " sequence, digest and mac fields in field order"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("crl state version must be 1")
+        sequence = _parse_int_field(obj["sequence"], "sequence")
+        if not 0 <= sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "crl state sequence must fit in an unsigned 64-bit integer"
+            )
+        digest = _parse_crl_state_hex(obj["digest"], "digest")
+        if len(digest) != 32:
+            raise ValueError("crl state digest must decode to exactly 32 bytes")
+        mac = _parse_crl_state_hex(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError("crl state mac must decode to exactly 32 bytes")
+        state = cls(version=version, sequence=sequence, digest=digest, mac=mac)
+        if state.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError("crl state encoding is not canonical")
+        return state
+
+
+class CrlProofAuditor:
+    """A stateful auditor that rejects CRL snapshot rollbacks across proofs.
+
+    ``root`` is the same non-empty ``bytes`` root key the proofs and their
+    CRL snapshots are signed with — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`. The
+    keyword-only ``checkpoint`` restores a previously exported state: it
+    accepts a :class:`CrlState` instance or its canonical
+    :meth:`CrlState.to_bytes` encoding, and the state MAC is verified
+    against ``root`` (a mismatch, a non-canonical encoding or any other
+    type raises :class:`ValueError`); ``None`` (the default) starts empty.
+    The auditor persists nothing itself — after a restart the caller must
+    hand the latest exported checkpoint back in, or rollback protection
+    across the restart is lost.
+
+    :meth:`audit` authenticates each proof with :func:`audit_proof` and
+    then compares the carried CRL snapshot against the current checkpoint:
+    a lower sequence is rejected, an equal sequence only replays when the
+    snapshot hash matches, and a higher sequence advances the checkpoint.
+    The compare-and-update runs atomically under a lock, a failed audit
+    never changes the state, and concurrent audits can never move the
+    checkpoint backwards. Every failure other than the ``root`` type
+    raises :class:`ValueError`.
+    """
+
+    def __init__(
+        self, root: bytes, *, checkpoint: "CrlState | bytes | None" = None
+    ) -> None:
+        self._root = _require_root(root)
+        self._lock = threading.Lock()
+        self._state: CrlState | None = None
+        if checkpoint is not None:
+            self._state = self._verify_checkpoint(checkpoint)
+
+    def _verify_checkpoint(self, checkpoint: object) -> "CrlState":
+        if isinstance(checkpoint, bytes):
+            state = CrlState.from_bytes(checkpoint)
+        elif isinstance(checkpoint, CrlState):
+            state = checkpoint
+        else:
+            raise ValueError(
+                "checkpoint must be a CrlState instance or bytes"
+            )
+        if not hmac.compare_digest(
+            _crl_state_mac(self._root, _crl_state_payload(state)), state.mac
+        ):
+            raise ValueError("crl state mac does not match")
+        return state
+
+    @property
+    def checkpoint(self) -> "CrlState | None":
+        """The current checkpoint, or ``None`` before the first accepted proof.
+
+        The exported :class:`CrlState` (or its :meth:`CrlState.to_bytes`
+        encoding) is what the caller must persist and pass back as
+        ``checkpoint=`` after a restart.
+        """
+        with self._lock:
+            return self._state
+
+    def audit(self, proof: "CrlProof | bytes") -> "Consensus":
+        """Authenticate ``proof`` and advance the anti-rollback checkpoint.
+
+        Accepts a :class:`CrlProof` or its canonical
+        :meth:`CrlProof.to_bytes` encoding. The proof is first verified
+        with :func:`audit_proof` under the auditor's root (outer MAC plus
+        the full snapshot replay); any failure raises before the state is
+        touched. On success the carried CRL's ``sequence`` and the SHA-256
+        of its canonical encoding are compared against the checkpoint
+        under the lock: a lower sequence raises :class:`ValueError`; an
+        equal sequence must carry the same digest (a same-list replay) or
+        :class:`ValueError` is raised; a higher sequence atomically
+        replaces the checkpoint with a fresh :class:`CrlState` whose MAC
+        is ``HMAC-SHA256(root, b"NPCK1" + encoding)`` over the mac-less
+        canonical encoding. The rerun :class:`Consensus` is returned.
+        """
+        consensus = audit_proof(proof, self._root)
+        record = CrlProof.from_bytes(proof) if isinstance(proof, bytes) else proof
+        body = _parse_crl_proof_body(record.body)
+        crl_blob = _parse_crl_proof_hex(body[4], "crl")
+        sequence = TrustRevocationList.from_bytes(crl_blob).sequence
+        digest = hashlib.sha256(crl_blob).digest()
+        with self._lock:
+            state = self._state
+            if state is not None:
+                if sequence < state.sequence:
+                    raise ValueError(
+                        "crl sequence is below the audited checkpoint"
+                    )
+                if sequence == state.sequence:
+                    if digest != state.digest:
+                        raise ValueError(
+                            "crl digest does not match the audited checkpoint"
+                        )
+                    # Same list replayed: the checkpoint already covers it.
+                    return consensus
+            candidate = CrlState(
+                version=1, sequence=sequence, digest=digest, mac=b"\x00" * 32
+            )
+            self._state = replace(
+                candidate,
+                mac=_crl_state_mac(self._root, _crl_state_payload(candidate)),
+            )
+            return consensus
