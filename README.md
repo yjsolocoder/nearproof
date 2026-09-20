@@ -101,6 +101,11 @@ python3 -m nearproof
   - `from_bytes(data)` — 非 bytes 或任一层不合契约一律抛 `ValueError`（不验 MAC）；外层须恰为 `version, body, mac`；body 解码为数组 `[point, context, records, trusts, crl, now, min, consensus]`：`point` 为两个有限非布尔数的数组、`context` 为非空字符串、`records`/`trusts` 为规范小写 hex 数组（参与项 id 升序、按 id 一一对应）、`crl` 为规范 `TrustRevocationList` 字节的小写 hex、`now` 为有限非布尔数、`min` 为非布尔整数、`consensus` 为 `[total, support, rejected, accepted]`（`rejected` 按字典序）
 - `prove_crl(records, point, context, trusts, root, crl, *, now, min=0) -> CrlProof` — 按 `locate_cert` 的签名快照路径（`revocations=crl`、`now` 必填、`min` 默认 `0`，均仅限关键字）求共识并把参与项封进证明；`crl` 收 `TrustRevocationList` 对象或规范字节；参与记录按 id 升序、信任按 id 同序对齐，`crl`/记录/信任均为规范字节的小写 hex；`mac = HMAC-SHA256(root, b"NPCCE2" + body)`，直拼无定界/长度前缀；`root` 非 bytes 抛 `TypeError`、空 bytes 及其他违约抛 `ValueError`
 - `audit_proof(x, root) -> Consensus` — 收 `CrlProof` 对象或规范字节；恒时验证 `HMAC-SHA256(root, b"NPCCE2" + body)`，再按 body 重放 `audit_crl`（双层 MAC、`issued_at <= now`、`sequence >= min`）和 `locate_cert` 快照路径，重算 `Consensus` 与 body 所载逐字段相等；`root` 类型错抛 `TypeError`（空 bytes 抛 `ValueError`），其余错误（含重放中冒出的 `TypeError`）一律抛 `ValueError`；成功返回重算的 `Consensus`
+- `CrlState(version, sequence, digest, mac)` — 防回滚的冻结 CRL 前沿检查点（`version=1`、`sequence` 为非布尔 u64、`digest`/`mac` 各恰 32 字节；`digest=SHA256(证明内规范 CRL 字节)`、`mac=HMAC-SHA256(root, b"NPCK1"+去mac规范编码)`，直拼无长度前缀；违约抛 `ValueError`）
+  - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON（键序 `version, sequence, digest, mac`，bytes 字段小写 hex）；`from_bytes` 仅收 `bytes`、重编码须逐字节相等，不验 MAC
+- `CrlProofAuditor(root, *, checkpoint=None)` — 带状态、防回滚的证明审计器；`root` 为非空 `bytes`（类型错抛 `TypeError`，空值抛 `ValueError`）；`checkpoint` 收 `CrlState` 或其规范字节并恒时验 MAC（`None` 为空状态），重启时须由调用方传回保存的最新检查点
+  - `audit(proof) -> Consensus` — 先跑无状态 `audit_proof`，再在锁内取证明所载 CRL 的序号与规范字节哈希做门控：低序拒绝、同序仅同哈希重放、高序推进；比较与更新锁内原子，失败不改状态，并发绝不回退
+  - 只读 `checkpoint` 属性导出当前 `CrlState | None`
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -458,6 +463,41 @@ proof = prove_crl(records, (0.0, 0.0), context, trusts, root, crl,
 blob = proof.to_bytes()                  # 可持久化或分发
 consensus = audit_proof(blob, root)
 consensus.accepted                       # True
+```
+
+### 防回滚前沿 `CrlState` 与 `CrlProofAuditor`
+
+无状态的 `audit_proof` 只认证单个证明，攻击者仍可把一张序号更低（更旧）的快照证明重新送达。`CrlState` 与 `CrlProofAuditor` 在其之上加一道单调门控，防止 CRL 序号回退。
+
+`CrlState(version, sequence, digest, mac)` 是冻结的根密钥 MAC **检查点记录**：位置构造、按字段相等，字段契约、编码规则与其余记录一致——`version=1`；`sequence` 为非布尔 u64（最近通过审计的 `TrustRevocationList.sequence`）；`digest` 恰 32 字节，即证明 body 所载**规范 CRL 字节**（`TrustRevocationList.to_bytes()`，在证明里以小写 hex 承载）的 `SHA256`；`mac` 恰 32 字节，`mac = HMAC-SHA256(root, b"NPCK1" + 去mac规范编码)`，前缀与编码直接拼接、无定界符、无长度前缀。任何字段违约在构造时抛 `ValueError`，记录本身不含 root。
+
+`to_bytes()` 输出字段序紧凑 UTF-8 JSON（键序 `version, sequence, digest, mac`，`digest`/`mac` 为小写 hex，无空白、无长度前缀）。`from_bytes(data)` **仅收 `bytes`**（其他类型抛 `ValueError`）：键必须恰好四个、各一次且依字段序（缺失、多余、重复、乱序即拒），`version == 1`，`sequence` 为非布尔 u64，两个 hex 字段须解码为恰好 32 字节；解析后重编码须与输入逐字节相等；**不验 MAC**。
+
+`CrlProofAuditor(root, *, checkpoint=None)` 持有当前前沿：
+
+- `root` 必须是非空 `bytes`——非 bytes（含 `bytearray`/`str`/`None`）抛 `TypeError`，空值抛 `ValueError`。
+- `checkpoint` 仅限关键字。`None`（默认）为空状态；否则收 `CrlState` 对象或其规范字节，字节先过 `CrlState.from_bytes` 契约，再以 `root` 恒时复核其 `NPCK1` MAC——编码不合契约或 MAC 不符抛 `ValueError`。审计器自身不做任何持久化：**重启时调用方必须把上次保存的最新检查点传回来**（取 `checkpoint` 属性、`to_bytes()` 落盘）。
+- `audit(proof) -> Consensus` 收 `CrlProof` 或其规范字节。先调用无状态 `audit_proof`（全部密码学、规范性与重放检查照原样执行）；成功后才取证明所载 CRL 的序号与规范字节哈希，在锁内与当前前沿比较并更新：
+  - **低序拒绝**：`sequence` 低于前沿抛 `ValueError`；
+  - **同序仅同哈希重放**：序号相等且 `digest` 相同则视为重放，返回共识但不改动检查点；序号相等而 `digest` 不同（同序号的另一张快照）抛 `ValueError`；
+  - **高序推进**：序号更高则生成并 MAC 新的 `CrlState`。
+- 比较与更新在同一把锁内原子完成：任何失败（含 `audit_proof` 失败、低序、同序异哈希）都不改动检查点，并发审计绝不可能把前沿回退。
+- 只读属性 `checkpoint: CrlState | None` 导出当前前沿（首次成功审计前为 `None`）；返回的是冻结对象，外部无法借此改写内部状态。
+
+除 `root` 类型错误抛 `TypeError` 外，其余失败一律抛 `ValueError`；旧接口（`audit_proof` 等）行为不变。
+
+```python
+from nearproof import CrlProofAuditor
+
+auditor = CrlProofAuditor(root)
+auditor.audit(proof1)                     # sequence=1，首次推进
+saved = auditor.checkpoint.to_bytes()    # 调用方自行持久化
+
+# ... 重启后：
+auditor = CrlProofAuditor(root, checkpoint=saved)
+auditor.audit(proof1)                     # 同序同哈希：重放，接受
+auditor.audit(proof_old)                  # 低序：ValueError，前沿不变
+auditor.audit(proof2)                     # sequence=2：推进
 ```
 
 ### 观察撤销 `ObservationRevocation` 与 `revoke_observation`
