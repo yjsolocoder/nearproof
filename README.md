@@ -37,11 +37,11 @@ python3 -m nearproof
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：JSON 对象的键必须恰好是十一个字段且各出现一次、顺序与字段顺序一致（重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
 - `Measurement(round_index, nonce, response, elapsed_seconds, distance_meters)`
 - `Observation(id, x, y, decision)` — 二维共识中一个验证者的冻结观察：`id` 为非空字符串，`(x, y)` 为非布尔有限数坐标，`decision` 为 `RangeDecision`（仅其有限非负的 `upper_bound` 参与共识，`accepted` 不参与）
-- `Prover(shared_key)` — `respond(challenge) -> bytes`，HMAC-SHA256 应答
+- `Prover(shared_key)` — `respond(challenge) -> bytes`，HMAC-SHA256 应答；`reveal(challenge, context, opening) -> bytes`，绑定挑战的揭示应答（见下）
 - `RangeDecision(sample_count, upper_bound, accepted)` — `assess` 的冻结结果：`sample_count` 统计全部输入样本（含离群点），`upper_bound` 为内点最大距离，`accepted` 表示其不超过 limit
 - `Verifier(shared_key, *, speed_mps=SPEED_OF_LIGHT_MPS, clock=time.perf_counter, replay_protection=False, challenge_ttl_seconds=None)`
-  - `new_challenge()` — 生成 16 字节随机 nonce；配置有效期时按 `clock()` 记录签发时刻
-  - `verify(challenge, response, started_at)` — 校验应答并把往返时间折半换算为距离
+  - `new_challenge(*, context=None, digest=None)` — 生成 16 字节随机 nonce；配置有效期时按 `clock()` 记录签发时刻；`context`/`digest` 成对给出时把挑战绑定到承诺摘要（见下）
+  - `verify(challenge, response, started_at, *, opening=None)` — 校验应答并把往返时间折半换算为距离；绑定挑战必须提供匹配的 `opening`（见下）
   - `verify_evidence(challenge, response, started_at)` — 同 `verify` 的参数与语义，成功时返回 `Evidence`
   - `measure(prover)` — 一次完整往返
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
@@ -94,6 +94,27 @@ verifier = Verifier(key, replay_protection=True, challenge_ttl_seconds=0.05)
 challenge = verifier.new_challenge()          # 签发时刻 t，截止时刻 t + 0.05
 verifier.verify(challenge, prover.respond(challenge), verifier.clock())  # 截止前成功
 # 另一个挑战在 t + 0.05 或之后验证 -> ChallengeStateError("challenge has expired")
+```
+
+### 挑战绑定与开启揭示
+
+`new_challenge` 可把挑战绑定到一个承诺摘要：`context` 与 `digest` 必须**同时给出或同时省略**（全 `None` 时保持旧行为），且均须为恰好 32 字节的 `bytes`；绑定挑战要求重放防护开启（`replay_protection=True`），否则抛 `ValueError`。承诺摘要为 `digest = SHA256(b"NPC1" + context + opening)`：`context` 与 `opening` 各 32 字节，在域标签后直接拼接、无额外前缀。
+
+证明者用 `Prover.reveal(challenge, context, opening) -> bytes` 应答绑定挑战：返回 `HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) + nonce)`，其中 `u64be` 为固定 8 字节无符号大端。挑战的 `round_index` 必须是 u64（非 bool），`nonce` 必须是 16 字节，`context`/`opening` 必须各为 32 字节，违约抛 `ValueError`；非 `Challenge` 对象抛 `TypeError`。
+
+验证者用 `verify(challenge, response, started_at, opening=...)` 复核：`opening` 必须恰好 32 字节，且 `SHA256(b"NPC1" + context + opening)` 必须等于挑战绑定的 `digest`，应答必须等于上述绑定的 HMAC。**已绑定的挑战必须提供 `opening`，未绑定的挑战不得提供 `opening`**，否则抛 `ValueError`；`opening=None` 时保持旧行为。状态、有效期与测距语义与旧 `verify` 完全一致（失败不消费挑战、成功原子消费）；对象类型/形状错误抛 `TypeError`，其余契约违约抛 `ValueError`。`verify_evidence` 等其余旧接口不变。
+
+```python
+import hashlib
+
+context, opening = b"\x02" * 32, b"\x03" * 32
+digest = hashlib.sha256(b"NPC1" + context + opening).digest()
+
+verifier = Verifier(key, replay_protection=True)
+challenge = verifier.new_challenge(context=context, digest=digest)
+response = prover.reveal(challenge, context, opening)
+verifier.verify(challenge, response, verifier.clock(), opening=opening)
+# verify(challenge, response, ...) 缺 opening 或 opening 不匹配 -> ValueError
 ```
 
 ### 证据记录与审计
@@ -238,7 +259,7 @@ blob = revocation.to_bytes()           # 可持久化或传输
 
 ## 限制
 
-当前是单验证者的朴素往返测距：挑战先发出、应答后到达，两者之间没有任何延迟承诺，应答正确性也不绑定到挑战发出时刻（配置 `challenge_ttl_seconds` 后仅按验证者时钟限制挑战本身的有效期，并不约束证明者的应答时刻）。单轮距离直接由一次往返时间换算；跨轮的稳健判定由 `assess` 在事后基于中位数 / MAD 离群点剔除完成，它不改变单轮验证语义，也不提供多轮间的密码学一致性。默认模式下 nonce 只保证随机，不记录已用集合；开启 `replay_protection` 后则按签发实例登记并追踪每个挑战的待验证 / 已消费 / 已撤销 / 已过期状态，但注册表（含截止时刻）仅保存在内存中、随实例生命周期结束，过期判定也完全信任注入的 `clock`。二维共识 `locate` 只把各验证者 `assess` 出的距离上界按圆盘覆盖做纯几何聚合：它不交叉验证观察来源、不绑定验证者身份与坐标的真实性，圆盘矛盾只表现为拒绝计数而非异常。`locate_attested` 在此之上为每条观察加了 HMAC 签名复核与可选的时效检查，但它完全信任调用方给出的 `keys` 映射（id 与密钥、坐标的绑定由调用方保证），时效判定也完全信任注入的 `now` 或系统时钟；签名不绑定候选点，同一条记录可被拿到任意点上重放聚合。`locate_bound_attested` 用的 `BoundAttestedObservation` 把候选点与用途串也纳入 MAC，并要求与查询值逐项/精确相等，因此不能跨点或跨用途重放，但仍完全信任调用方提供的 `keys`、`now` 与点/用途串本身的真实性。
+当前是单验证者的朴素往返测距：挑战先发出、应答后到达，两者之间没有任何延迟承诺，应答正确性也不绑定到挑战发出时刻（配置 `challenge_ttl_seconds` 后仅按验证者时钟限制挑战本身的有效期，并不约束证明者的应答时刻）。挑战绑定把应答密码学地系到承诺摘要 `SHA256(b"NPC1" + context + opening)` 上，但 `context`/`digest`/`opening` 的真实性与协商过程完全由调用方保证，绑定也不约束证明者的应答时刻。单轮距离直接由一次往返时间换算；跨轮的稳健判定由 `assess` 在事后基于中位数 / MAD 离群点剔除完成，它不改变单轮验证语义，也不提供多轮间的密码学一致性。默认模式下 nonce 只保证随机，不记录已用集合；开启 `replay_protection` 后则按签发实例登记并追踪每个挑战的待验证 / 已消费 / 已撤销 / 已过期状态，但注册表（含截止时刻与挑战绑定）仅保存在内存中、随实例生命周期结束，过期判定也完全信任注入的 `clock`。二维共识 `locate` 只把各验证者 `assess` 出的距离上界按圆盘覆盖做纯几何聚合：它不交叉验证观察来源、不绑定验证者身份与坐标的真实性，圆盘矛盾只表现为拒绝计数而非异常。`locate_attested` 在此之上为每条观察加了 HMAC 签名复核与可选的时效检查，但它完全信任调用方给出的 `keys` 映射（id 与密钥、坐标的绑定由调用方保证），时效判定也完全信任注入的 `now` 或系统时钟；签名不绑定候选点，同一条记录可被拿到任意点上重放聚合。`locate_bound_attested` 用的 `BoundAttestedObservation` 把候选点与用途串也纳入 MAC，并要求与查询值逐项/精确相等，因此不能跨点或跨用途重放，但仍完全信任调用方提供的 `keys`、`now` 与点/用途串本身的真实性。
 
 ## 测试
 
