@@ -4,7 +4,7 @@ Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
 Challenge / ChallengeStateError / Consensus / Evidence / Measurement /
 Observation / ObservationRevocation / Prover / RangeDecision / Verifier /
 assess / attest_observation / attest_observation_for_point / audit /
-audit_bound / locate / locate_attested / locate_bound_attested /
+audit_bound / audit_bound_policy / locate / locate_attested / locate_bound_attested /
 revoke_observation.
 """
 
@@ -42,6 +42,7 @@ __all__ = [
     "attest_observation_for_point",
     "audit",
     "audit_bound",
+    "audit_bound_policy",
     "locate",
     "locate_attested",
     "locate_bound_attested",
@@ -826,11 +827,18 @@ class Verifier:
         registered) raises :class:`ValueError`. ``opening`` is keyword-only
         and required: a non-bytes opening (``None`` included) raises
         :class:`TypeError`, a wrong length or a commitment mismatch raises
-        :class:`ValueError`. State, TTL and atomic-consumption semantics are
-        exactly those of :meth:`verify_evidence`, including the validation
-        order — state and expiry first, then ranging, then binding and
-        response — and any non-finite recorded number raises
-        :class:`ValueError` without consuming the challenge.
+        :class:`ValueError`.
+
+        The challenge-state and TTL gate runs before every other check —
+        before the opening type and length, before ranging and before the
+        commitment and response checks — so an unknown, consumed, revoked or
+        expired challenge raises :class:`ChallengeStateError` no matter what
+        the other arguments look like. Any failure leaves the challenge
+        pending and otherwise untouched (its issue time and deadline are
+        never refreshed); only a successful return consumes it, atomically.
+        Ranging is then checked exactly as in :meth:`verify_evidence` (any
+        non-finite recorded number raises :class:`ValueError`), followed by
+        the opening/binding and response checks.
 
         The returned record embeds the round's :class:`Evidence` (MAC'd with
         the shared key exactly as :meth:`verify_evidence` produces), the
@@ -838,25 +846,68 @@ class Verifier:
         and is itself MAC'd: ``mac = HMAC-SHA256(key, b"NPBE1" + encoding)``
         over the canonical encoding of every field except ``mac`` itself.
         """
-        if opening is None:
+        if not isinstance(challenge, Challenge):
+            raise TypeError("challenge must be a Challenge")
+        if not self._replay_protection:
+            # Without a registry no binding exists, so a bound round can
+            # never complete here.
+            raise ValueError(
+                "context-bound challenges require replay_protection=True"
+            )
+
+        with self._lock:
+            # State and expiry first, before opening, ranging or response
+            # validation; the clock is read at most once inside the gate.
+            entry, now = self._gate_locked(challenge)
+
+            # Ranging keeps the same place it has in verify(): before the
+            # opening/binding/response checks and leaving the challenge
+            # pending on failure.
+            start = float(started_at)
+            elapsed = now - start
+            distance = elapsed * self._speed / 2.0
+            _require_finite(start, now, elapsed, self._speed, distance)
+            if elapsed < 0:
+                raise ValueError("elapsed time must not be negative")
+
             # None selects the legacy protocol in verify(); verify_bound only
             # runs the context-bound protocol, so it is a shape error here.
-            raise TypeError("opening must be bytes")
-        measurement, end, start = self._verify_round(
-            challenge, response, started_at, require_finite=True, opening=opening
+            if opening is None or not isinstance(opening, bytes):
+                raise TypeError("opening must be bytes")
+            if len(opening) != OPENING_BYTES:
+                raise ValueError(f"opening must be exactly {OPENING_BYTES} bytes")
+            bound_context, bound_digest = entry[3], entry[4]
+            if bound_context is None:
+                raise ValueError("challenge was not issued with a context binding")
+            if not hmac.compare_digest(
+                context_digest(bound_context, opening), bound_digest
+            ):
+                raise ValueError("opening does not match the challenge context binding")
+            expected = bound_response(
+                self._key, bound_digest, challenge.round_index, challenge.nonce
+            )
+            response_bytes = bytes(response)
+            if not hmac.compare_digest(expected, response_bytes):
+                raise ValueError("response does not match the challenge")
+
+            # Every check passed: the pending -> consumed transition is the
+            # only lifecycle mutation and happens atomically under this lock.
+            entry[1] = _CONSUMED
+
+        measurement = Measurement(
+            round_index=challenge.round_index,
+            nonce=challenge.nonce,
+            response=response_bytes,
+            elapsed_seconds=elapsed,
+            distance_meters=distance,
         )
-        entry = self._entry_for(challenge)
-        # A successful bound round implies replay protection is on and the
-        # challenge was issued bound, so the registry entry and its binding
-        # are still there after the atomic consumption.
-        bound_context, bound_digest = entry[3], entry[4]
         payload = {
             "version": 1,
             "round_index": measurement.round_index,
             "nonce": measurement.nonce.hex(),
             "response": measurement.response.hex(),
             "start": start,
-            "end": end,
+            "end": now,
             "speed": self._speed,
             "elapsed": measurement.elapsed_seconds,
             "distance": measurement.distance_meters,
@@ -868,7 +919,7 @@ class Verifier:
             nonce=measurement.nonce,
             response=measurement.response,
             start=start,
-            end=end,
+            end=now,
             speed=self._speed,
             elapsed=measurement.elapsed_seconds,
             distance=measurement.distance_meters,
@@ -886,6 +937,36 @@ class Verifier:
         return replace(
             record, mac=_bound_evidence_mac(self._key, _bound_evidence_payload(record))
         )
+
+    def _gate_locked(self, challenge: Challenge) -> tuple[list, float]:
+        """State and TTL gate for a registered challenge; caller holds the lock.
+
+        Returns ``(entry, now)`` for a live pending challenge with ``now`` the
+        single clock reading of the call. Unknown, consumed, revoked or
+        expired challenges raise :class:`ChallengeStateError`; reaching the
+        deadline pins the terminal expired state so nothing can revive the
+        challenge, even with a clock rolled backwards.
+        """
+        entry = self._entry_for(challenge)
+        if entry is None:
+            raise ChallengeStateError("challenge was not issued by this verifier")
+        state = entry[1]
+        if state == _CONSUMED:
+            raise ChallengeStateError("challenge has already been verified")
+        if state == _REVOKED:
+            raise ChallengeStateError("challenge has been revoked")
+        if state == _EXPIRED:
+            raise ChallengeStateError("challenge has expired")
+
+        # State, expiry and consumption are all decided under the same lock,
+        # with the clock read at most once, so a challenge can succeed at most
+        # once before its deadline and never at/after it.
+        now = self._clock()
+        if entry[2] is not None and now >= entry[2]:
+            # Terminal: pin the state so nothing can revive the challenge.
+            entry[1] = _EXPIRED
+            raise ChallengeStateError("challenge has expired")
+        return entry, now
 
     def _verify_round(
         self,
@@ -912,25 +993,7 @@ class Verifier:
             )
 
         with self._lock:
-            entry = self._entry_for(challenge)
-            if entry is None:
-                raise ChallengeStateError("challenge was not issued by this verifier")
-            state = entry[1]
-            if state == _CONSUMED:
-                raise ChallengeStateError("challenge has already been verified")
-            if state == _REVOKED:
-                raise ChallengeStateError("challenge has been revoked")
-            if state == _EXPIRED:
-                raise ChallengeStateError("challenge has expired")
-
-            # State, expiry and consumption are all decided under the same
-            # lock, with the clock read at most once, so a challenge can
-            # succeed at most once before its deadline and never at/after it.
-            now = self._clock()
-            if entry[2] is not None and now >= entry[2]:
-                # Terminal: pin the state so nothing can revive the challenge.
-                entry[1] = _EXPIRED
-                raise ChallengeStateError("challenge has expired")
+            entry, now = self._gate_locked(challenge)
 
             # All validations run while holding the lock so a failure leaves
             # the challenge pending and the pending -> consumed transition is
@@ -1144,6 +1207,55 @@ def audit_bound(bound: "BoundEvidence | bytes", key: bytes) -> Measurement:
         elapsed_seconds=evidence.elapsed,
         distance_meters=evidence.distance,
     )
+
+
+def audit_bound_policy(
+    bound: "BoundEvidence | bytes",
+    key: bytes,
+    *,
+    now: object = None,
+    max_age: object = None,
+) -> Measurement:
+    """Re-verify a :class:`BoundEvidence` record and optionally its age.
+
+    The cryptographic, canonical-encoding and ranging checks are exactly
+    those of :func:`audit_bound`, which always runs first; on success its
+    :class:`Measurement` is returned. Every :class:`ValueError` from those
+    checks is raised unchanged.
+
+    With ``max_age=None`` (the default) no freshness check is performed:
+    ``now`` is ignored and no clock is read. Otherwise ``max_age`` must be a
+    non-bool finite non-negative number and ``now`` is required and must be a
+    non-bool finite number; an omitted ``now`` or any contract violation
+    raises :class:`ValueError`. The audited record's ``evidence.end`` is
+    taken as the round's completion time and the age must lie in the closed
+    interval ``0 <= now - end <= max_age``: future-dated evidence
+    (``now < end``) and evidence older than ``max_age`` are rejected, while
+    equality at either boundary is valid.
+
+    Auditing is a pure check: it touches no verifier state and no challenge
+    lifecycle.
+    """
+    measurement = audit_bound(bound, key)
+    if max_age is None:
+        return measurement
+    if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+        raise ValueError("max_age must be a finite non-negative number")
+    age_limit = float(max_age)
+    if not math.isfinite(age_limit) or age_limit < 0:
+        raise ValueError("max_age must be a finite non-negative number")
+    if now is None or isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValueError("now must be a finite number")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be a finite number")
+    # audit_bound succeeded, so bytes input decodes to a valid record; reuse
+    # the audited completion timestamp rather than any caller-supplied one.
+    record = BoundEvidence.from_bytes(bound) if isinstance(bound, bytes) else bound
+    age = current - record.evidence.end
+    if not 0 <= age <= age_limit:
+        raise ValueError("bound evidence is outside its permitted age window")
+    return measurement
 
 
 def _check_assess_params(limit: object, min_samples: object) -> tuple[float, int]:
