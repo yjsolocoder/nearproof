@@ -281,6 +281,28 @@ class BoundRevocationSerializationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             BoundEvidenceRevocation.from_bytes(blob)
 
+    def test_from_bytes_preserves_integer_revoked_at(self):
+        blob = self._blob(revoked_at=3)
+        record = BoundEvidenceRevocation.from_bytes(blob)
+        self.assertEqual(record.revoked_at, 3)
+        self.assertIs(type(record.revoked_at), int)
+        self.assertEqual(record.to_bytes(), blob)
+
+    def test_from_bytes_preserves_float_revoked_at(self):
+        blob = self._blob(revoked_at=3.5)
+        record = BoundEvidenceRevocation.from_bytes(blob)
+        self.assertEqual(record.revoked_at, 3.5)
+        self.assertIs(type(record.revoked_at), float)
+        self.assertEqual(record.to_bytes(), blob)
+
+    def test_from_bytes_integer_revoked_at_contract(self):
+        with self.assertRaises(ValueError):
+            BoundEvidenceRevocation.from_bytes(self._blob(revoked_at=-3))
+        with self.assertRaises(ValueError):
+            BoundEvidenceRevocation.from_bytes(
+                self._blob(revoked_at="3")
+            )
+
     def test_from_bytes_rejects_length_prefix(self):
         blob = self._blob()
         with self.assertRaises(ValueError):
