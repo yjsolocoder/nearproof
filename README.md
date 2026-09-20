@@ -35,6 +35,9 @@ python3 -m nearproof
 - `Evidence(version, round_index, nonce, response, start, end, speed, elapsed, distance, result, mac)` — 一轮已接受验证的防篡改记录（`version=1`、`result="accepted"`，不含密钥）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：JSON 对象的键必须恰好是十一个字段且各出现一次、顺序与字段顺序一致（重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
+- `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮**已接受的上下文绑定验证**的防篡改记录（`version=1`，不含密钥；见下）：`evidence` 为嵌套的普通 `Evidence`，`context`/`digest`/`opening`/`mac` 均为恰好 32 字节，且 `digest` 必须满足 NPC1 承诺关系
+  - `to_bytes()` — 无空白 UTF-8 JSON 编码：外层键依字段顺序，`evidence` 为嵌套的规范 `Evidence` 对象（键同样依字段顺序、其 `mac` 为小写十六进制），四个 bytes 字段均为小写十六进制
+  - `from_bytes(data)` — 按字段契约解码并在解析后重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（两层 MAC 均不校验）：外层键必须恰好是六个字段、各出现一次且依字段顺序，嵌套 `evidence` 满足完整 `Evidence` 契约，四个 bytes 字段各解码为恰好 32 字节，且 NPC1 承诺成立
 - `Measurement(round_index, nonce, response, elapsed_seconds, distance_meters)`
 - `Observation(id, x, y, decision)` — 二维共识中一个验证者的冻结观察：`id` 为非空字符串，`(x, y)` 为非布尔有限数坐标，`decision` 为 `RangeDecision`（仅其有限非负的 `upper_bound` 参与共识，`accepted` 不参与）
 - `Prover(shared_key)` — `respond(challenge) -> bytes`（HMAC-SHA256 应答）；`reveal(challenge, context, opening) -> bytes` 用于上下文绑定轮次（见下）
@@ -43,11 +46,13 @@ python3 -m nearproof
   - `new_challenge(*, context=None, digest=None)` — 默认（均为 `None`）生成 16 字节随机 nonce，行为与旧版一致；成对传入 32 字节 `context`/`digest` 则签发上下文绑定挑战（要求 `replay_protection=True`，只传一个抛 `ValueError`）；配置有效期时按 `clock()` 记录签发时刻
   - `verify(challenge, response, started_at, *, opening=None) -> Measurement` — 校验应答并把往返时间折半换算为距离；`opening=None` 为旧行为，传入 32 字节 `opening` 则走上下文绑定协议（见下）
   - `verify_evidence(challenge, response, started_at)` — 同 `verify` 的参数与语义，成功时返回 `Evidence`
+  - `verify_bound(challenge, response, started_at, *, opening) -> BoundEvidence` — 上下文绑定版的 `verify_evidence`：`opening` 仅限关键字且**必传**，状态 / TTL / 测距 / 原子消费 / 非有限数规则与 `verify_evidence` 完全一致（见下）
   - `measure(prover)` — 一次完整往返
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
   - `clock` — 只读属性，暴露计时函数
 - `assess(samples, limit, *, key=None, min_samples=5) -> RangeDecision` — 基于一批轮次的稳健距离判定（见下）
 - `audit(evidence, key)` — 用共享密钥复核 `Evidence`（或其字节编码），返回对应的 `Measurement`
+- `audit_bound(bound, key)` — 用共享密钥复核 `BoundEvidence`（或其字节编码）：核 NPC1 承诺、双层 MAC、NPR1 绑定应答与测距复算，全部通过返回对应的 `Measurement`（见下）
 - `locate(observations, point, *, quorum=3, tolerance=0.0) -> Consensus` — 二维多验证者位置共识（见下）
 - `AttestedObservation(version, id, x, y, decision, issued_at, mac)` — 带 HMAC 签名与时间戳的冻结观察（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 为嵌套对象且键同样依字段顺序，`mac` 为小写十六进制
@@ -139,6 +144,33 @@ measurement = verifier.verify(challenge, response, verifier.clock(), opening=ope
 evidence = verifier.verify_evidence(challenge, prover.respond(challenge), verifier.clock())
 blob = evidence.to_bytes()                    # 可持久化或传输
 measurement = audit(Evidence.from_bytes(blob), key)  # 复核通过则返回测量值
+```
+
+### 绑定证据记录与审计 `BoundEvidence` / `verify_bound` / `audit_bound`
+
+`BoundEvidence(version, evidence, context, digest, opening, mac)` 是一轮**已接受的上下文绑定验证**的冻结记录，构造时即校验全部字段契约，任何违约抛 `ValueError`：`version` 必须为 `1`；`evidence` 必须是满足完整契约的嵌套 `Evidence`；`context`、`digest`、`opening`、`mac` 都必须是**恰好 32 字节的 bytes**；并且 `digest` 必须满足承诺关系 `SHA256(b"NPC1" + context + opening) == digest`。记录有**两层 MAC**：嵌套 `evidence.mac` 与普通证据一样覆盖该轮字段；外层 `mac = HMAC-SHA256(key, b"NPBE1" + 去mac编码)`，其中“去 mac 编码”是外层字段（含嵌套 evidence 整体，但不含外层 `mac`）的规范无空白 JSON 编码，域前缀 `b"NPBE1"` 与 NPC1/NPR1 分离。记录本身不含密钥。
+
+`to_bytes()` 按无空白 UTF-8 JSON 编码：外层键依字段顺序（`version, evidence, context, digest, opening, mac`），`evidence` 编码为键序固定的嵌套规范对象（含其小写十六进制 `mac`），四个 bytes 字段均为小写十六进制；整份即单个无定界 JSON 文档。`from_bytes(data)` 执行字段契约校验——外层键必须恰好是六个字段、**各出现一次且顺序一致**（缺、多、重复或乱序即拒绝），嵌套 `evidence` 必须满足完整 `Evidence` 契约（键集合与顺序、`version==1`、`result=="accepted"`、有限数、32 字节 MAC 等），四个 bytes 字段必须是小写十六进制且各解码为恰好 32 字节，NPC1 承诺必须成立——并在解析与字段校验后按同一规范**重编码，与输入字节逐字节精确比较**，故任何空白、格式化、非规范数字 / 字符串写法或额外定界均抛 `ValueError`；它不校验任何一层 MAC。
+
+`verify_bound(challenge, response, started_at, *, opening)` 是 `verify_evidence` 的上下文绑定版本：`opening` **仅限关键字且必传**（缺失或按位置传入抛 `TypeError`），它让本轮走 NPC1/NPR1 绑定协议——挑战必须是本实例用 `new_challenge(context=..., digest=...)` 签发的那个仍待验证对象，`opening` 必须是 bytes 且恰好 32 字节（非 bytes 抛 `TypeError`），其 NPC1 承诺必须与登记的 digest 相符（长度错或承诺不符抛 `ValueError`），应答必须是对应的 NPR1 HMAC。状态、有效期、消费顺序与非有限数规则与 `verify_evidence` **完全一致**：状态 / 到期判定先于测距与绑定校验；任何将被记录的非有限数值（`started_at`、时钟读数及派生的耗时、速度、距离）都抛 `ValueError` 且**不消费**挑战；绑定或应答失败同样保持待验证、可在原截止时刻前重试，只有成功才原子消费。由于绑定挑战只能用开启方式应答，`verify_evidence`（旧协议）无法满足绑定挑战；而没有开启重放防护的验证者没有绑定登记表，`verify_bound` 对其一律抛 `ValueError`。成功时嵌套 `Evidence` 记录该轮（其 `response` 即 NPR1 应答，`start=float(started_at)`，`end` 为唯一时钟读数），外层再绑定 `context`/`digest`/`opening` 并加 NPBE1 MAC。
+
+`audit_bound(bound, key)` 接受 `BoundEvidence` 或其字节编码，拒绝空 key，依次复核：① NPC1 承诺 `SHA256(b"NPC1" + context + opening) == digest`；② **双层 MAC**——嵌套证据 MAC 与其 NPR1 轮字段相符、外层 MAC 等于 `HMAC-SHA256(key, b"NPBE1" + 去mac编码)`；③ NPR1 绑定应答 `HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) + nonce)`（注意嵌套记录的应答是 NPR1 而非旧的 nonce-only 应答，故普通 `audit` 会因应答不符而拒绝它）；④ 按 `start`/`end`/`speed` 复算耗时与折半距离。MAC / 哈希比较均为恒时比较，任何不符抛 `ValueError`；全部通过返回对应的 `Measurement`。它是纯函数，不触碰任何验证者状态，也不能替代验证时的重放防护与挑战有效期。
+
+```python
+import os
+
+from nearproof import Prover, Verifier, audit_bound, context_digest
+
+context, opening = os.urandom(32), os.urandom(32)
+digest = context_digest(context, opening)
+
+verifier = Verifier(key, replay_protection=True)
+challenge = verifier.new_challenge(context=context, digest=digest)
+started = verifier.clock()
+response = Prover(key).reveal(challenge, context, opening)
+bound = verifier.verify_bound(challenge, response, started, opening=opening)
+blob = bound.to_bytes()                              # 可持久化或传输
+measurement = audit_bound(blob, key)                 # 双层 MAC + NPC1/NPR1 + 测距复核
 ```
 
 ### 批量判定 `assess`

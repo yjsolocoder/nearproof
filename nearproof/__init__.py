@@ -1,10 +1,11 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: AttestedObservation / BoundAttestedObservation / Challenge /
-ChallengeStateError / Consensus / Evidence / Measurement / Observation /
-ObservationRevocation / Prover / RangeDecision / Verifier / assess /
-attest_observation / attest_observation_for_point / audit / locate /
-locate_attested / locate_bound_attested / revoke_observation.
+Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
+Challenge / ChallengeStateError / Consensus / Evidence / Measurement /
+Observation / ObservationRevocation / Prover / RangeDecision / Verifier /
+assess / attest_observation / attest_observation_for_point / audit /
+audit_bound / locate / locate_attested / locate_bound_attested /
+revoke_observation.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Callable, Optional
 __all__ = [
     "AttestedObservation",
     "BoundAttestedObservation",
+    "BoundEvidence",
     "Challenge",
     "ChallengeStateError",
     "Consensus",
@@ -39,6 +41,7 @@ __all__ = [
     "attest_observation",
     "attest_observation_for_point",
     "audit",
+    "audit_bound",
     "locate",
     "locate_attested",
     "locate_bound_attested",
@@ -51,9 +54,11 @@ NONCE_BYTES = 16
 CONTEXT_BYTES = 32
 OPENING_BYTES = 32
 DIGEST_BYTES = 32
-# Domain separation prefixes for the commitment hash and the bound response.
+# Domain separation prefixes for the commitment hash, the bound response and
+# the bound evidence MAC.
 _DIGEST_PREFIX = b"NPC1"
 _RESPONSE_PREFIX = b"NPR1"
+_BOUND_EVIDENCE_PREFIX = b"NPBE1"
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -324,6 +329,192 @@ def _validate_evidence(evidence: Evidence) -> None:
         raise ValueError('evidence result must be "accepted"')
 
 
+_BOUND_EVIDENCE_FIELDS = (
+    "version",
+    "evidence",
+    "context",
+    "digest",
+    "opening",
+    "mac",
+)
+
+
+class _OrderedBoundEvidenceObject(json.JSONDecoder):
+    """JSON decoder that rejects duplicate and out-of-field-order object keys.
+
+    The outer bound-evidence object must contain exactly its own fields, once
+    each, in field order; the nested evidence object keeps the exact evidence
+    key contract enforced by :class:`_OrderedObject`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys in (
+            list(_BOUND_EVIDENCE_FIELDS),
+            list(_EVIDENCE_FIELDS),
+        ):
+            return dict(pairs)
+        raise ValueError("bound evidence JSON keys must be exactly the fields in field order")
+
+
+def _bound_evidence_payload(bound: "BoundEvidence") -> dict:
+    """The JSON-ready bound-evidence fields except ``mac``, in field order.
+
+    The nested ``evidence`` is its own canonical field-order object with its
+    ``mac`` included; the outer record wraps rather than replaces it.
+    """
+    evidence = bound.evidence
+    nested = _evidence_payload(evidence)
+    nested["mac"] = evidence.mac.hex()
+    return {
+        "version": bound.version,
+        "evidence": nested,
+        "context": bound.context.hex(),
+        "digest": bound.digest.hex(),
+        "opening": bound.opening.hex(),
+    }
+
+
+def _bound_evidence_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPBE1"`` and the canonical de-mac'd encoding."""
+    return hmac.new(
+        key, _BOUND_EVIDENCE_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+@dataclass(frozen=True)
+class BoundEvidence:
+    """A tamper-evident record of one accepted context-bound verification round.
+
+    Produced by :meth:`Verifier.verify_bound`. ``version`` is always ``1``;
+    ``evidence`` is the nested :class:`Evidence` record of the round with its
+    own MAC over the round fields; ``context``, ``digest`` and ``opening`` are
+    each exactly 32 bytes, with ``digest`` the NPC1 commitment
+    ``SHA256(b"NPC1" + context + opening)``; ``mac`` is exactly 32 bytes and
+    is HMAC-SHA256 over ``b"NPBE1"`` plus the canonical encoding of every outer
+    field except ``mac`` itself. Any contract violation raises
+    :class:`ValueError` at construction time. No key material is stored.
+    """
+
+    version: int
+    evidence: "Evidence"
+    context: bytes
+    digest: bytes
+    opening: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("bound evidence version must be 1")
+        if not isinstance(self.evidence, Evidence):
+            raise ValueError("bound evidence evidence must be an Evidence")
+        _validate_evidence(self.evidence)
+        for name in ("context", "digest", "opening", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise ValueError(f"bound evidence {name} must be bytes")
+            if len(value) != 32:
+                raise ValueError(f"bound evidence {name} must be exactly 32 bytes")
+        if not hmac.compare_digest(
+            context_digest(self.context, self.opening), self.digest
+        ):
+            raise ValueError("bound evidence digest must match context and opening")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: outer keys in field order, the nested
+        ``evidence`` as its own canonical object in field order, byte fields as
+        lowercase hex, no whitespace, no NaN/Infinity."""
+        payload = _bound_evidence_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BoundEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: exactly the bound-evidence outer fields
+        appearing once each in field order, ``version == 1``, a nested
+        ``evidence`` object satisfying the full :class:`Evidence` contract
+        (including ``version == 1``, ``result == "accepted"`` and a 32-byte
+        MAC), ``context``/``digest``/``opening`` lowercase hex strings each
+        decoding to exactly 32 bytes, the NPC1 commitment relation, and an
+        outer ``mac`` decoding to exactly 32 bytes. After parsing and field
+        validation the record is re-encoded with :meth:`to_bytes` and the
+        result must equal the input byte for byte. Neither MAC is verified
+        here — use :func:`audit_bound` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("bound evidence data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedBoundEvidenceObject)
+        except ValueError as error:
+            raise ValueError(f"bound evidence is not valid JSON: {error}") from error
+        if not isinstance(obj, dict) or list(obj) != list(_BOUND_EVIDENCE_FIELDS):
+            raise ValueError(
+                "bound evidence must be a JSON object with exactly the bound"
+                " evidence fields"
+            )
+        raw_evidence = obj["evidence"]
+        if not isinstance(raw_evidence, dict) or list(raw_evidence) != list(
+            _EVIDENCE_FIELDS
+        ):
+            raise ValueError(
+                "bound evidence evidence must be a JSON object with exactly the"
+                " evidence fields"
+            )
+        evidence = Evidence(
+            version=_parse_int_field(raw_evidence["version"], "version"),
+            round_index=_parse_int_field(
+                raw_evidence["round_index"], "round_index"
+            ),
+            nonce=_parse_hex_field(raw_evidence["nonce"], "nonce"),
+            response=_parse_hex_field(raw_evidence["response"], "response"),
+            start=_parse_float_field(raw_evidence["start"], "start"),
+            end=_parse_float_field(raw_evidence["end"], "end"),
+            speed=_parse_float_field(raw_evidence["speed"], "speed"),
+            elapsed=_parse_float_field(raw_evidence["elapsed"], "elapsed"),
+            distance=_parse_float_field(raw_evidence["distance"], "distance"),
+            result=raw_evidence["result"],
+            mac=_parse_hex_field(raw_evidence["mac"], "mac"),
+        )
+        # Evidence() does not validate itself, so run the full nested contract
+        # (version == 1, result == "accepted", finite numbers...).
+        _validate_evidence(evidence)
+        if len(evidence.mac) != 32:
+            raise ValueError("evidence mac must decode to exactly 32 bytes")
+        context = _parse_hex_field(obj["context"], "context")
+        digest = _parse_hex_field(obj["digest"], "digest")
+        opening = _parse_hex_field(obj["opening"], "opening")
+        mac = _parse_hex_field(obj["mac"], "mac")
+        for name, value in (
+            ("context", context),
+            ("digest", digest),
+            ("opening", opening),
+            ("mac", mac),
+        ):
+            if len(value) != 32:
+                raise ValueError(f"bound evidence {name} must be exactly 32 bytes")
+        record = cls(
+            version=_parse_int_field(obj["version"], "version"),
+            evidence=evidence,
+            context=context,
+            digest=digest,
+            opening=opening,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            # The fields parsed and validated, but the bytes are not the
+            # canonical encoding: whitespace, pretty-printing, framing or
+            # non-canonical number/string spellings.
+            raise ValueError("bound evidence encoding is not canonical")
+        return record
+
+
 def keyed_response(key: bytes, nonce: bytes) -> bytes:
     """The response a holder of ``key`` must produce for ``nonce``."""
     return hmac.new(key, nonce, hashlib.sha256).digest()
@@ -354,6 +545,37 @@ def bound_response(
         + nonce
     )
     return hmac.new(key, message, hashlib.sha256).digest()
+
+
+def _evidence_record(
+    key: bytes, measurement: Measurement, start: float, end: float, speed: float
+) -> Evidence:
+    """Build the MAC'd :class:`Evidence` record for one accepted round."""
+    payload = {
+        "version": 1,
+        "round_index": measurement.round_index,
+        "nonce": measurement.nonce.hex(),
+        "response": measurement.response.hex(),
+        "start": start,
+        "end": end,
+        "speed": speed,
+        "elapsed": measurement.elapsed_seconds,
+        "distance": measurement.distance_meters,
+        "result": "accepted",
+    }
+    return Evidence(
+        version=1,
+        round_index=measurement.round_index,
+        nonce=measurement.nonce,
+        response=measurement.response,
+        start=start,
+        end=end,
+        speed=speed,
+        elapsed=measurement.elapsed_seconds,
+        distance=measurement.distance_meters,
+        result="accepted",
+        mac=_evidence_mac(key, payload),
+    )
 
 
 class Prover:
@@ -617,30 +839,61 @@ class Verifier:
         measurement, end, start = self._verify_round(
             challenge, response, started_at, require_finite=True
         )
-        payload = {
-            "version": 1,
-            "round_index": measurement.round_index,
-            "nonce": measurement.nonce.hex(),
-            "response": measurement.response.hex(),
-            "start": start,
-            "end": end,
-            "speed": self._speed,
-            "elapsed": measurement.elapsed_seconds,
-            "distance": measurement.distance_meters,
-            "result": "accepted",
-        }
-        return Evidence(
+        return _evidence_record(
+            self._key, measurement, start, end, self._speed
+        )
+
+    def verify_bound(
+        self,
+        challenge: Challenge,
+        response: bytes,
+        started_at: float,
+        *,
+        opening: bytes,
+    ) -> "BoundEvidence":
+        """Like :meth:`verify_evidence`, but for a context-bound round.
+
+        ``opening`` is keyword-only: unlike :meth:`verify` it is required,
+        because only a round issued bound to ``(context, digest)`` by
+        :meth:`new_challenge` can produce a bound record. The state, TTL,
+        ranging, atomic-consumption and non-finite-number rules are exactly
+        those of :meth:`verify_evidence`; a non-bytes ``opening`` raises
+        :class:`TypeError`, a wrong-length opening or a commitment mismatch
+        raises :class:`ValueError`, and every failure leaves the challenge
+        pending.
+
+        On success the nested :class:`Evidence` records the round and is MAC'd
+        exactly as in :meth:`verify_evidence`; the outer
+        :class:`BoundEvidence` additionally binds ``context``, ``digest`` and
+        ``opening`` (all 32 bytes, with the NPC1 commitment checked) and is
+        MAC'd with ``HMAC-SHA256(key, b"NPBE1" + canonical-de-mac'd-encoding)``.
+        """
+        measurement, end, start = self._verify_round(
+            challenge,
+            response,
+            started_at,
+            require_finite=True,
+            opening=opening,
+            require_opening=True,
+        )
+        # _verify_round only returns successfully for a challenge still in the
+        # registry and bound to a (context, digest) pair the opening satisfied,
+        # so the entry and its binding slots are guaranteed present.
+        entry = self._entry_for(challenge)
+        context, digest = entry[3], entry[4]
+        evidence = _evidence_record(
+            self._key, measurement, start, end, self._speed
+        )
+        bound = BoundEvidence(
             version=1,
-            round_index=measurement.round_index,
-            nonce=measurement.nonce,
-            response=measurement.response,
-            start=start,
-            end=end,
-            speed=self._speed,
-            elapsed=measurement.elapsed_seconds,
-            distance=measurement.distance_meters,
-            result="accepted",
-            mac=_evidence_mac(self._key, payload),
+            evidence=evidence,
+            context=context,
+            digest=digest,
+            opening=opening,
+            mac=b"\x00" * 32,
+        )
+        return replace(
+            bound, mac=_bound_evidence_mac(self._key, _bound_evidence_payload(bound))
         )
 
     def _verify_round(
@@ -651,20 +904,30 @@ class Verifier:
         *,
         require_finite: bool,
         opening: Optional[bytes] = None,
+        require_opening: bool = False,
     ) -> tuple[Measurement, float, float]:
-        """Shared core of :meth:`verify` and :meth:`verify_evidence`.
+        """Shared core of :meth:`verify`, :meth:`verify_evidence` and
+        :meth:`verify_bound`.
 
         Returns ``(measurement, end, start)`` where ``end`` is the single
         clock reading of the call and ``start`` is ``float(started_at)``.
         With ``require_finite`` every recorded number is checked for
         finiteness before anything is consumed. ``opening`` selects the
-        context-bound response protocol (``None`` is the legacy protocol).
+        context-bound response protocol (``None`` is the legacy protocol);
+        ``require_opening`` additionally demands a non-``None`` bytes opening
+        so a bound round can never consume an unbound (or legacy-registry)
+        challenge.
         """
         if not isinstance(challenge, Challenge):
             raise TypeError("challenge must be a Challenge")
         if not self._replay_protection:
             return self._verify_legacy(
-                challenge, response, started_at, require_finite, opening
+                challenge,
+                response,
+                started_at,
+                require_finite,
+                opening,
+                require_opening,
             )
 
         with self._lock:
@@ -702,7 +965,7 @@ class Verifier:
             # it runs after state, expiry and ranging checks and leaves the
             # challenge pending on failure.
             expected = self._expected_response(
-                challenge, entry[3], entry[4], opening
+                challenge, entry[3], entry[4], opening, require_opening
             )
             response_bytes = bytes(response)
             if not hmac.compare_digest(expected, response_bytes):
@@ -724,6 +987,7 @@ class Verifier:
         bound_context: Optional[bytes],
         bound_digest: Optional[bytes],
         opening: Optional[bytes],
+        require_opening: bool = False,
     ) -> bytes:
         """The response bytes expected for a round under the selected protocol.
 
@@ -731,9 +995,14 @@ class Verifier:
         challenge (both ``None`` when it is unbound or, in legacy mode, when no
         registry exists). ``opening=None`` selects the nonce-only response; an
         opening that is not 32-byte ``bytes`` raises :class:`TypeError` for the
-        shape error and :class:`ValueError` for every other mismatch.
+        shape error and :class:`ValueError` for every other mismatch. With
+        ``require_opening`` even a missing opening on an unbound challenge is a
+        :class:`ValueError`, so a bound round can never match the legacy
+        protocol.
         """
         if opening is None:
+            if require_opening:
+                raise ValueError("an opening is required")
             if bound_context is None:
                 return keyed_response(self._key, challenge.nonce)
             # The challenge was issued bound to a context, so it can only be
@@ -766,6 +1035,7 @@ class Verifier:
         started_at: float,
         require_finite: bool = False,
         opening: Optional[bytes] = None,
+        require_opening: bool = False,
     ) -> tuple[Measurement, float, float]:
         """Original single-round behaviour, unchanged when protection is off."""
         end = self._clock()
@@ -777,8 +1047,11 @@ class Verifier:
         if elapsed < 0:
             raise ValueError("elapsed time must not be negative")
         # Without a registry no binding can exist, so reveal-style verification
-        # can never match here; opening=None keeps the original behaviour.
-        expected = self._expected_response(challenge, None, None, opening)
+        # can never match here; opening=None keeps the original behaviour, and
+        # require_opening makes that an explicit failure before consumption.
+        expected = self._expected_response(
+            challenge, None, None, opening, require_opening
+        )
         response_bytes = bytes(response)
         if not hmac.compare_digest(expected, response_bytes):
             raise ValueError("response does not match the challenge")
@@ -831,6 +1104,77 @@ def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
     distance = elapsed * evidence.speed / 2.0
     if distance != evidence.distance:
         raise ValueError("evidence distance does not match elapsed and speed")
+    return Measurement(
+        round_index=evidence.round_index,
+        nonce=evidence.nonce,
+        response=evidence.response,
+        elapsed_seconds=evidence.elapsed,
+        distance_meters=evidence.distance,
+    )
+
+
+def audit_bound(bound: "BoundEvidence | bytes", key: bytes) -> Measurement:
+    """Re-verify a :class:`BoundEvidence` record against the shared ``key``.
+
+    Accepts the record itself or its ``to_bytes()`` encoding and rejects an
+    empty ``key``. Every check is performed in constant time where it compares
+    MACs/hashes, and any mismatch raises :class:`ValueError`:
+
+    1. the NPC1 commitment ``SHA256(b"NPC1" + context + opening)`` equals
+       ``digest``;
+    2. both MACs recompute with ``key`` — the nested evidence MAC over its
+       canonical de-mac'd encoding and the outer MAC over
+       ``b"NPBE1"`` plus the outer canonical de-mac'd encoding;
+    3. the nested response is the NPR1 bound response
+       ``HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) + nonce)`` for
+       the bound round, not the legacy nonce response;
+    4. the elapsed time and halved distance recomputed from
+       ``start``/``end``/``speed`` match the recorded values.
+
+    On success the audited values are returned as a :class:`Measurement`.
+    Auditing is a pure check: it touches no verifier state and is no
+    substitute for replay protection or challenge TTLs at verification time.
+    """
+    if not key:
+        raise ValueError("key must not be empty")
+    key = bytes(key)
+    if isinstance(bound, bytes):
+        bound = BoundEvidence.from_bytes(bound)
+    elif not isinstance(bound, BoundEvidence):
+        raise ValueError("bound must be a BoundEvidence instance or bytes")
+    evidence = bound.evidence
+
+    # 1. NPC1 commitment between the bound context, opening and digest.
+    if not hmac.compare_digest(
+        context_digest(bound.context, bound.opening), bound.digest
+    ):
+        raise ValueError("bound evidence digest does not match context and opening")
+
+    # 2. Double MAC: the nested evidence record and the outer NPBE1 wrapper.
+    if not hmac.compare_digest(
+        _evidence_mac(key, _evidence_payload(evidence)), evidence.mac
+    ):
+        raise ValueError("bound evidence nested evidence mac does not match")
+    if not hmac.compare_digest(
+        _bound_evidence_mac(key, _bound_evidence_payload(bound)), bound.mac
+    ):
+        raise ValueError("bound evidence mac does not match")
+
+    # 3. NPR1 bound response for this digest, round and nonce.
+    expected_response = bound_response(
+        key, bound.digest, evidence.round_index, evidence.nonce
+    )
+    if not hmac.compare_digest(expected_response, evidence.response):
+        raise ValueError("bound evidence response does not match the bound challenge")
+
+    # 4. Ranging: recorded elapsed/distance follow from start/end/speed.
+    elapsed = evidence.end - evidence.start
+    if elapsed != evidence.elapsed:
+        raise ValueError("bound evidence elapsed does not match start and end")
+    distance = elapsed * evidence.speed / 2.0
+    if distance != evidence.distance:
+        raise ValueError("bound evidence distance does not match elapsed and speed")
+
     return Measurement(
         round_index=evidence.round_index,
         nonce=evidence.nonce,
