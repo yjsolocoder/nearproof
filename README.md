@@ -91,6 +91,11 @@ python3 -m nearproof
   - `from_bytes(data)` — 仅收 `bytes`（否则 `TypeError`）；缺/多/重复/乱序键、entries 不是数组、某条 entry 不合 `TrustRevocation` 契约、u64/float-u64 等字段违约、编码非规范均抛 `ValueError`；成功返回本类且不验任何 MAC
 - `make_crl(items, seq, time, root) -> TrustRevocationList` — 用与签证书相同的 root bytes 对一批 `TrustRevocation`（可为空；不接受字节）签快照：先按 `(id, target)` 排序、重复对抛 `ValueError`，`mac = HMAC-SHA256(root, b"NPVRL1" + 去mac规范JSON)`，直拼无长度前缀；`root` 非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError`
 - `audit_crl(x, root, now, min=0) -> None` — 收快照对象或字节；恒时复核双层 MAC（列表层 `NPVRL1`、每条 entry 的 `NPVR1`，同一 root），并检查 `issued_at <= now`、`sequence >= min`；对象/root 形状错抛 `TypeError`，其余（含 MAC 不符、未来时间、序号过低）一律抛 `ValueError`
+- `CertifiedConsensusEvidence(version, body, mac)` — 根密钥 MAC 的冻结共识证据（`version=1`；`body` 为 bytes，`mac` 恰 32 字节 bytes，否则 `ValueError`；见下）；按字段序位置构造、冻结且按字段相等
+  - `to_bytes()` — 外层紧凑 UTF-8 JSON：键序固定 `version, body, mac`，`body`/`mac` 为小写十六进制
+  - `from_bytes(data)` — 双层均按紧凑 UTF-8 JSON 校验并重编码逐字节比对；非 bytes 或任一层不合契约一律抛 `ValueError`（不验 MAC）
+- `locate_cert_evidence(records, point, context, trusts, root) -> CertifiedConsensusEvidence` — 跑一次 `locate_cert`（无撤销选项）并把结果与参与项封进证据；参与记录按 id 排序、信任按 id 同序对齐，均为规范字节编码的小写十六进制（见下）
+- `audit_cert_evidence(x, root) -> Consensus` — 收证据对象或字节；恒时验证 `HMAC-SHA256(root, b"NPCCE1" + body)`，再用 body 内的参与项重跑 `locate_cert`，重算 `Consensus` 与 body 所载逐字段相等，否则抛 `ValueError`；成功返回重算的 `Consensus`
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -392,6 +397,32 @@ blob = crl.to_bytes()                                     # 可持久化或分�
 audit_crl(blob, root, now=1_700_000_600.0, min=42)        # 成功返回 None
 # locate_cert(records, point, context, trusts, root,
 #             revocations=blob, now=1_700_000_600.0)
+```
+
+### 认证共识证据 `CertifiedConsensusEvidence`、`locate_cert_evidence` 与 `audit_cert_evidence`
+
+`CertifiedConsensusEvidence(version, body, mac)` 是根密钥 MAC 的冻结**共识证据**，把一次 `locate_cert` 运行的查询、全部参与项与共识结果封装成可长期保存的自证快照：按字段序位置构造、冻结且按字段相等。`version` 固定为 `1`；`body` 必须是 `bytes`（不接受 `bytearray`/`str`，不做隐式转换）；`mac` 必须是恰好 32 字节的 `bytes`；任何违约在构造时抛 `ValueError`。构造时不解释 `body` 的内容——合规 `body` 由 `locate_cert_evidence` 产生、由 `from_bytes` 校验。
+
+**双层紧凑 JSON**。`to_bytes()` 的外层是单个紧凑 UTF-8 JSON 文档，键序固定为 `version, body, mac`，`body` 与 `mac` 均为小写十六进制字符串，无空白、无 NaN/Infinity、无长度前缀。`body` 解码后必须恰为数组 `[point, context, records, trusts, consensus]`：
+
+- `point` 为恰好两个**有限、非布尔**数的裸 JSON 数组（无类型标签、无长度前缀）；
+- `context` 为**非空**字符串；
+- `records`/`trusts` 为**小写规范十六进制字符串数组**，每个元素解码后分别是一条合规的 `BoundAttestedObservation.to_bytes()` / `VerifierTrust.to_bytes()` 编码；两数组按 id 序唯一对应——记录按 id 升序、id 唯一，同索引位置的信任 id 必须相同（缺漏、未知、错序均抛 `ValueError`）；
+- `consensus` 按 `Consensus` 字段序为数组 `[total, support, rejected, accepted]`，`total`/`support` 为非布尔整数，`rejected` 为按字典序排列、非空且不重复的字符串数组，`accepted` 为布尔值。
+
+内层 `body` 本身也必须是规范紧凑 JSON：`from_bytes` 解析并校验全部字段契约后，对内层重编码并与原 `body` 字节逐字节比较，再对整个外层重编码与输入逐字节比较；任何格式化 JSON、空白、非规范数字/字符串写法一律抛 `ValueError`。`from_bytes(data)` 只收 `bytes`（其他类型抛 `ValueError`），**不校验 MAC**——用 `audit_cert_evidence` 配合 root 才验签。
+
+`locate_cert_evidence(records, point, context, trusts, root)` 的参数就是不带撤销选项的 `locate_cert`（可撤销的运行不应被冻结进长期证据）：先按与 `locate_cert` 相同的混输规则物化记录与信任（对象/字节、生成器均可），再原样跑一遍 `locate_cert`，故全部既有契约与异常（`root` 非 bytes 抛 `TypeError`、空 bytes 与其余违约抛 `ValueError`）保持不变。成功后把参与记录按 id 排序、信任按同 id 序对齐，二者取各自规范字节编码的小写十六进制放入 `records`/`trusts`，点、用途与 `Consensus`（`rejected` 转字典序数组）组成 `body`，并计算 `mac = HMAC-SHA256(root, b"NPCCE1" + body)`——前缀与 `body` 直接拼接，无分隔符、无长度前缀；结果与输入顺序无关，函数纯计算。
+
+`audit_cert_evidence(x, root) -> Consensus` 收证据对象或其规范字节（其他类型或不合契约的字节抛 `ValueError`）；`root` 必须是非空 `bytes`（非 bytes 抛 `TypeError`，空 bytes 抛 `ValueError`）。它先用 root **恒时**复核外层 MAC（`HMAC-SHA256(root, b"NPCCE1" + body)`），不符即抛 `ValueError`；MAC 通过后解析 `body`，取出其中的记录、信任、点与用途**重跑一次 `locate_cert`**（每条记录 MAC、每张证书 root MAC 全部重新恒时核验，几何重新聚合），重算的 `Consensus` 必须与 `body` 所载逐字段相等（含字典序 `rejected` 元组），否则抛 `ValueError`——因此即使攻击者持有 root、改写共识或参与项后重新签名，重算不一致仍会被拒。成功返回重算的 `Consensus`。
+
+```python
+from nearproof import locate_cert_evidence, audit_cert_evidence
+
+evidence = locate_cert_evidence(records, (0.0, 0.0), context, trusts, root)
+blob = evidence.to_bytes()                 # 可持久化或分发
+consensus = audit_cert_evidence(blob, root)
+consensus.accepted                         # True
 ```
 
 ### 观察撤销 `ObservationRevocation` 与 `revoke_observation`

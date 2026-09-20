@@ -1,15 +1,15 @@
 """nearproof - verifiable distance measurement and location proofs.
 
 Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
-BoundEvidenceRevocation / Challenge / ChallengeStateError / Consensus /
-ContextRevocation / Evidence / Measurement / Observation /
-ObservationRevocation / Prover / RangeDecision / SPEED_OF_LIGHT_MPS /
-TrustRevocation / TrustRevocationList / Verifier / VerifierTrust / assess /
-attest_observation /
+BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
+ChallengeStateError / Consensus / ContextRevocation / Evidence /
+Measurement / Observation / ObservationRevocation / Prover / RangeDecision
+/ SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList / Verifier /
+VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_bound / audit_bound_policy /
-audit_crl / cert / locate / locate_attested / locate_bound_attested /
-locate_cert / make_crl / revoke_bound / revoke_context /
-revoke_observation / revoke_trust.
+audit_cert_evidence / audit_crl / cert / locate / locate_attested /
+locate_bound_attested / locate_cert / locate_cert_evidence / make_crl /
+revoke_bound / revoke_context / revoke_observation / revoke_trust.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ __all__ = [
     "BoundAttestedObservation",
     "BoundEvidence",
     "BoundEvidenceRevocation",
+    "CertifiedConsensusEvidence",
     "Challenge",
     "ChallengeStateError",
     "Consensus",
@@ -52,12 +53,14 @@ __all__ = [
     "audit",
     "audit_bound",
     "audit_bound_policy",
+    "audit_cert_evidence",
     "audit_crl",
     "cert",
     "locate",
     "locate_attested",
     "locate_bound_attested",
     "locate_cert",
+    "locate_cert_evidence",
     "make_crl",
     "revoke_bound",
     "revoke_context",
@@ -86,6 +89,8 @@ _TRUST_PREFIX = b"NPVT1"
 _TRUST_REVOCATION_PREFIX = b"NPVR1"
 # Domain separation prefix for the trust-revocation-list MAC.
 _TRUST_REVOCATION_LIST_PREFIX = b"NPVRL1"
+# Domain separation prefix for the certified-consensus-evidence MAC.
+_CERT_EVIDENCE_PREFIX = b"NPCCE1"
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -3283,6 +3288,513 @@ def locate_cert(
         )
 
     return locate(verified, point, quorum=3, tolerance=0.0)
+
+
+_CERT_EVIDENCE_FIELDS = ("version", "body", "mac")
+_CERT_EVIDENCE_BODY_FIELDS = (
+    "point",
+    "context",
+    "records",
+    "trusts",
+    "consensus",
+)
+_CONSENSUS_FIELDS = ("total", "support", "rejected", "accepted")
+
+
+def _cert_evidence_mac(root: bytes, body: bytes) -> bytes:
+    """HMAC-SHA256 over ``b"NPCCE1"`` plus the body bytes, directly concatenated.
+
+    The body bytes are exactly the compact UTF-8 JSON array that sits in the
+    ``body`` field of the outer document; the prefix carries no separator or
+    length prefix.
+    """
+    return hmac.new(
+        root, _CERT_EVIDENCE_PREFIX + body, hashlib.sha256
+    ).digest()
+
+
+def _require_body(value: object) -> bytes:
+    """Validate the ``body`` field: ``bytes`` only, never coerced."""
+    if not isinstance(value, bytes):
+        raise ValueError("certified consensus evidence body must be bytes")
+    return value
+
+
+def _require_evidence_mac(value: object) -> bytes:
+    """Validate the ``mac`` field: ``bytes`` of exactly 32 bytes."""
+    if not isinstance(value, bytes):
+        raise ValueError("certified consensus evidence mac must be bytes")
+    if len(value) != 32:
+        raise ValueError(
+            "certified consensus evidence mac must be exactly 32 bytes"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class CertifiedConsensusEvidence:
+    """A root-MAC'd snapshot of one :func:`locate_cert` run and its inputs.
+
+    ``version`` is always ``1``; ``body`` is ``bytes`` holding the compact
+    UTF-8 JSON array ``[point, context, records, trusts, consensus]``;
+    ``mac`` is exactly 32 bytes —
+    ``HMAC-SHA256(root, b"NPCCE1" + body)``, the prefix and the body
+    concatenated directly with no separator or length prefix. ``body`` and
+    ``mac`` that are not ``bytes`` (or a ``mac`` of the wrong length) raise
+    :class:`ValueError` at construction time. Instances are frozen,
+    constructed positionally in field order and compare equal by their
+    fields. No root material is stored.
+
+    Inside the body: ``point`` is a bare two-element JSON array of finite
+    non-bool numbers; ``context`` a non-empty string; ``records`` and
+    ``trusts`` are arrays of canonical lowercase hex strings, one per
+    participating :class:`BoundAttestedObservation` and
+    :class:`VerifierTrust`, corresponding uniquely by id (the records are
+    sorted by id, and each trust is placed at the index of the record with
+    the same id); ``consensus`` is an array in :class:`Consensus` field
+    order ``[total, support, rejected, accepted]`` with ``rejected`` a
+    lexicographically sorted array of ids. The body bytes themselves are
+    opaque to the constructor — :func:`locate_cert_evidence` produces
+    conforming ones and :meth:`from_bytes` enforces the whole contract.
+    """
+
+    version: int
+    body: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("certified consensus evidence version must be 1")
+        _require_body(self.body)
+        _require_evidence_mac(self.mac)
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: outer keys ``version, body, mac`` in
+        that order, ``body`` and ``mac`` as lowercase hex, no whitespace."""
+        return _encode_payload(
+            {
+                "version": self.version,
+                "body": self.body.hex(),
+                "mac": self.mac.hex(),
+            }
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "CertifiedConsensusEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the full field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: an outer object with exactly the keys
+        ``version, body, mac`` once each in that order, ``version == 1``,
+        ``body`` and ``mac`` lowercase hex strings (``mac`` decoding to
+        exactly 32 bytes), a body decoding to exactly the array
+        ``[point, context, records, trusts, consensus]`` with ``point`` a
+        two-element finite-non-bool-number array, ``context`` a non-empty
+        string, ``records``/``trusts`` arrays of canonical lowercase hex
+        strings equal in length and unique one-to-one by the ids parsed out
+        of those encodings (records id-sorted, each trust aligned with the
+        record of the same id), and a ``consensus`` array in
+        ``[total, support, rejected, accepted]`` order with non-bool
+        integers, a lexicographically sorted array of non-empty unique id
+        strings for ``rejected``, and a bool ``accepted``. The body itself
+        must be canonical compact JSON, so its own re-encoding must match
+        byte for byte. After parsing and validation the record is
+        re-encoded with :meth:`to_bytes` and the result must equal the
+        input byte for byte, so formatted JSON, whitespace and any
+        non-canonical spelling are rejected as well. Neither the outer MAC
+        nor anything in the body is verified here — use
+        :func:`audit_cert_evidence` with the root key for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("certified consensus evidence data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedCertEvidenceObject)
+        except ValueError as error:
+            raise ValueError(
+                f"certified consensus evidence is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(_CERT_EVIDENCE_FIELDS):
+            raise ValueError(
+                "certified consensus evidence must be a JSON object with exactly"
+                " the version, body and mac fields in field order"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("certified consensus evidence version must be 1")
+        body = _parse_cert_evidence_hex(obj["body"], "body")
+        mac = _parse_cert_evidence_hex(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "certified consensus evidence mac must decode to exactly 32"
+                " bytes"
+            )
+        _parse_cert_evidence_body(body)
+        record = cls(version=version, body=body, mac=mac)
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError(
+                "certified consensus evidence encoding is not canonical"
+            )
+        return record
+
+
+def _parse_cert_evidence_hex(value: object, name: str) -> bytes:
+    # Same lowercase, round-tripping hex rule as the other records, but both
+    # shape and value failures are ValueErrors for this record.
+    if not isinstance(value, str):
+        raise ValueError(
+            f"certified consensus evidence {name} must be a lowercase hex"
+            " string"
+        )
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"certified consensus evidence {name} must be a lowercase hex"
+            " string"
+        ) from error
+    if raw.hex() != value:
+        # Rejects uppercase digits, separators and odd-length input that
+        # bytes.fromhex would otherwise tolerate.
+        raise ValueError(
+            f"certified consensus evidence {name} must be a lowercase hex"
+            " string"
+        )
+    return raw
+
+
+class _OrderedCertEvidenceObject(json.JSONDecoder):
+    """JSON decoder rejecting duplicate/out-of-order keys at both layers.
+
+    The outer object must carry exactly ``version, body, mac``; the body
+    array carries objects only indirectly (the hex strings inside it decode
+    to records/trusts whose own key order their ``from_bytes`` checks), so
+    the only object key set to enforce at this layer is the outer one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys == list(_CERT_EVIDENCE_FIELDS):
+            return dict(pairs)
+        raise ValueError(
+            "certified consensus evidence JSON keys must be exactly version,"
+            " body and mac in field order"
+        )
+
+
+def _parse_cert_evidence_body(body: bytes) -> list:
+    """Parse and validate the body array, returning the decoded list.
+
+    The body is the inner compact-JSON layer: it must itself be the
+    canonical encoding of the decoded structure (a re-encoding must match
+    byte for byte), and every embedded record/trust hex string must decode
+    through that record's own byte contract.
+    """
+    try:
+        decoded = json.loads(body)
+    except ValueError as error:
+        raise ValueError(
+            "certified consensus evidence body must be compact JSON"
+        ) from error
+    if not isinstance(decoded, list) or len(decoded) != len(
+        _CERT_EVIDENCE_BODY_FIELDS
+    ):
+        raise ValueError(
+            "certified consensus evidence body must be an array of exactly"
+            " point, context, records, trusts and consensus"
+        )
+    raw_point, raw_context, raw_records, raw_trusts, raw_consensus = decoded
+    if (
+        not isinstance(raw_point, list)
+        or len(raw_point) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in raw_point
+        )
+    ):
+        raise ValueError(
+            "certified consensus evidence point must be an array of exactly"
+            " two finite non-bool numbers"
+        )
+    if not isinstance(raw_context, str) or not raw_context:
+        raise ValueError(
+            "certified consensus evidence context must be a non-empty string"
+        )
+    record_blobs = _require_cert_evidence_hex_array(raw_records, "records")
+    trust_blobs = _require_cert_evidence_hex_array(raw_trusts, "trusts")
+    parsed_records = _parse_evidence_hex_items(
+        record_blobs, BoundAttestedObservation, "records"
+    )
+    parsed_trusts = _parse_evidence_hex_items(
+        trust_blobs, VerifierTrust, "trusts"
+    )
+    record_ids = [item.id for item in parsed_records]
+    trust_ids = [item.id for item in parsed_trusts]
+    if len(set(record_ids)) != len(record_ids):
+        raise ValueError(
+            "certified consensus evidence records must have unique ids"
+        )
+    if len(set(trust_ids)) != len(trust_ids):
+        raise ValueError(
+            "certified consensus evidence trusts must have unique ids"
+        )
+    if sorted(record_ids) != record_ids:
+        # The canonical producer orders the records by id and aligns the
+        # trusts at the same index order.
+        raise ValueError(
+            "certified consensus evidence records must be sorted by id"
+        )
+    if trust_ids != record_ids:
+        # The two arrays correspond one-to-one by id at every index: an
+        # unknown, missing or reordered trust is a contract breach rather
+        # than a silent ignore.
+        raise ValueError(
+            "certified consensus evidence records and trusts must correspond"
+            " one-to-one by id in the same order"
+        )
+    _parse_cert_evidence_consensus(raw_consensus)
+    if _encode_payload(decoded) != body:
+        # The inner layer is canonical compact JSON too: no whitespace,
+        # pretty-printing, framing or non-canonical number/string spellings.
+        raise ValueError(
+            "certified consensus evidence body encoding is not canonical"
+        )
+    return decoded
+
+
+def _require_cert_evidence_hex_array(value: object, name: str) -> list:
+    if not isinstance(value, list):
+        raise ValueError(
+            f"certified consensus evidence {name} must be an array of"
+            " lowercase hex strings"
+        )
+    return [_parse_cert_evidence_hex(entry, name) for entry in value]
+
+
+def _parse_evidence_hex_items(raw_items: list, kind: type, name: str) -> list:
+    """Decode each hex body item through the record's own byte contract."""
+    parsed = []
+    for raw in raw_items:
+        try:
+            parsed.append(kind.from_bytes(raw))
+        except ValueError as error:
+            raise ValueError(
+                f"certified consensus evidence {name} must contain only"
+                f" canonical {kind.__name__} encodings"
+            ) from error
+    return parsed
+
+
+def _parse_cert_evidence_consensus(value: object) -> None:
+    if not isinstance(value, list) or len(value) != len(_CONSENSUS_FIELDS):
+        raise ValueError(
+            "certified consensus evidence consensus must be an array of"
+            " exactly total, support, rejected and accepted"
+        )
+    raw_total, raw_support, raw_rejected, raw_accepted = value
+    for field_name, number in (("total", raw_total), ("support", raw_support)):
+        if type(number) is not int:
+            raise ValueError(
+                f"certified consensus evidence consensus {field_name} must be"
+                " a non-bool integer"
+            )
+    if not isinstance(raw_rejected, list) or any(
+        not isinstance(ident, str) or not ident for ident in raw_rejected
+    ):
+        raise ValueError(
+            "certified consensus evidence consensus rejected must be an array"
+            " of non-empty strings"
+        )
+    if list(raw_rejected) != sorted(raw_rejected):
+        raise ValueError(
+            "certified consensus evidence consensus rejected must be sorted"
+            " lexicographically"
+        )
+    if len(set(raw_rejected)) != len(raw_rejected):
+        raise ValueError(
+            "certified consensus evidence consensus rejected must contain no"
+            " duplicates"
+        )
+    if type(raw_accepted) is not bool:
+        raise ValueError(
+            "certified consensus evidence consensus accepted must be a bool"
+        )
+
+
+def _build_cert_evidence_body(
+    point: tuple[float, float],
+    context: str,
+    records: "list[BoundAttestedObservation]",
+    trusts: "dict[str, VerifierTrust]",
+    consensus: "Consensus",
+) -> bytes:
+    """Assemble the canonical body bytes for one locate_cert run.
+
+    Records are sorted by id and the trusts are placed in the same id order,
+    so the two arrays correspond one-to-one at each index; both are encoded
+    through their own canonical byte encodings and carried as lowercase hex
+    strings.
+    """
+    ordered_records = sorted(records, key=lambda item: item.id)
+    body = [
+        [point[0], point[1]],
+        context,
+        [item.to_bytes().hex() for item in ordered_records],
+        [trusts[item.id].to_bytes().hex() for item in ordered_records],
+        [
+            consensus.total,
+            consensus.support,
+            list(consensus.rejected),
+            consensus.accepted,
+        ],
+    ]
+    return _encode_payload(body)
+
+
+def locate_cert_evidence(
+    records: object,
+    point: object,
+    context: object,
+    trusts: object,
+    root: object,
+) -> CertifiedConsensusEvidence:
+    """Run :func:`locate_cert` and package its result with its inputs.
+
+    The arguments are exactly those of :func:`locate_cert` without the
+    revocation options (a revocable run cannot be frozen into a long-lived
+    evidence snapshot); every :func:`locate_cert` contract rule applies
+    unchanged and every violation raises :class:`ValueError` (or
+    :class:`TypeError` for a non-bytes root). On success the verified
+    :class:`Consensus` is returned wrapped in a
+    :class:`CertifiedConsensusEvidence` whose body carries the queried
+    point and context, the participating records and trusts (records sorted
+    by id, trusts aligned one-to-one by id, both as canonical lowercase hex
+    strings), and the consensus as a ``[total, support, rejected,
+    accepted]`` array with ``rejected`` lexicographically sorted; the MAC
+    is ``HMAC-SHA256(root, b"NPCCE1" + body)``. The function is pure.
+    """
+    root = _require_root(root)
+
+    # Materialise the iterables under the same mixing rules as locate_cert
+    # before running it, so a one-shot iterable can be re-used to build the
+    # body and so the body carries exactly the participating records.
+    try:
+        raw_records = list(records)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "records must be an iterable of BoundAttestedObservation or bytes"
+        ) from error
+    parsed_records: list[BoundAttestedObservation] = []
+    for item in raw_records:
+        if isinstance(item, bytes):
+            item = BoundAttestedObservation.from_bytes(item)
+        if not isinstance(item, BoundAttestedObservation):
+            raise ValueError(
+                "records must contain only BoundAttestedObservation"
+                " instances or bytes"
+            )
+        parsed_records.append(item)
+
+    try:
+        raw_trusts = list(trusts)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "trusts must be an iterable of VerifierTrust or bytes"
+        ) from error
+    parsed_trusts: list[VerifierTrust] = []
+    for entry in raw_trusts:
+        if isinstance(entry, bytes):
+            entry = VerifierTrust.from_bytes(entry)
+        if not isinstance(entry, VerifierTrust):
+            raise ValueError(
+                "trusts must contain only VerifierTrust instances or bytes"
+            )
+        parsed_trusts.append(entry)
+
+    consensus = locate_cert(parsed_records, point, context, parsed_trusts, root)
+
+    trust_map = {entry.id: entry for entry in parsed_trusts}
+    body = _build_cert_evidence_body(
+        point,  # type: ignore[arg-type]
+        context,  # type: ignore[arg-type]
+        parsed_records,
+        trust_map,
+        consensus,
+    )
+    return CertifiedConsensusEvidence(
+        version=1,
+        body=body,
+        mac=_cert_evidence_mac(root, body),
+    )
+
+
+def audit_cert_evidence(
+    x: "CertifiedConsensusEvidence | bytes",
+    root: object,
+) -> "Consensus":
+    """Authenticate a :class:`CertifiedConsensusEvidence` and rerun its proof.
+
+    Accepts the evidence itself or its canonical
+    :meth:`CertifiedConsensusEvidence.to_bytes` encoding; anything else, or
+    any encoding that does not satisfy the record contract, raises
+    :class:`ValueError`. ``root`` must be non-empty ``bytes`` (a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`).
+    The outer MAC is recomputed as
+    ``HMAC-SHA256(root, b"NPCCE1" + body)`` and compared in constant time;
+    a mismatch raises :class:`ValueError`. The body is then parsed and
+    :func:`locate_cert` is rerun over exactly the records, trusts, point
+    and context it carries (every record and trust MAC rechecked under the
+    certificates and root); the recomputed :class:`Consensus` must equal
+    the one carried in the body field by field — including the
+    lexicographically sorted ``rejected`` tuple — or :class:`ValueError` is
+    raised. On success the rerun :class:`Consensus` is returned.
+    """
+    root = _require_root(root)
+    if isinstance(x, bytes):
+        evidence = CertifiedConsensusEvidence.from_bytes(x)
+    elif isinstance(x, CertifiedConsensusEvidence):
+        evidence = x
+    else:
+        raise ValueError(
+            "certified consensus evidence must be a"
+            " CertifiedConsensusEvidence instance or bytes"
+        )
+    if not hmac.compare_digest(
+        _cert_evidence_mac(root, evidence.body), evidence.mac
+    ):
+        raise ValueError("certified consensus evidence mac does not match")
+    parsed = _parse_cert_evidence_body(evidence.body)
+    raw_point, raw_context, raw_records, raw_trusts, raw_consensus = parsed
+    record_blobs = [
+        _parse_cert_evidence_hex(entry, "records") for entry in raw_records
+    ]
+    trust_blobs = [
+        _parse_cert_evidence_hex(entry, "trusts") for entry in raw_trusts
+    ]
+    point = (raw_point[0], raw_point[1])
+    consensus = locate_cert(
+        record_blobs, point, raw_context, trust_blobs, root
+    )
+    carried = Consensus(
+        total=raw_consensus[0],
+        support=raw_consensus[1],
+        rejected=tuple(raw_consensus[2]),
+        accepted=raw_consensus[3],
+    )
+    if carried != consensus:
+        raise ValueError(
+            "certified consensus evidence consensus does not match the"
+            " recomputed result"
+        )
+    return consensus
 
 
 def _trust_revocation_payload(revocation: "TrustRevocation") -> dict:
