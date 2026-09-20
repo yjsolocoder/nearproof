@@ -4,9 +4,10 @@ Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / Challenge / ChallengeStateError / Consensus /
 ContextRevocation / Evidence / Measurement / Observation /
 ObservationRevocation / Prover / RangeDecision / SPEED_OF_LIGHT_MPS /
-TrustRevocation / Verifier / VerifierTrust / assess / attest_observation /
-attest_observation_for_point / audit / audit_bound / audit_bound_policy /
-cert / locate / locate_attested / locate_bound_attested / locate_cert /
+TrustRevocation / TrustRevocationList / Verifier / VerifierTrust /
+assess / attest_observation / attest_observation_for_point / audit /
+audit_bound / audit_bound_policy / audit_crl / cert / locate /
+locate_attested / locate_bound_attested / locate_cert / make_crl /
 revoke_bound / revoke_context / revoke_observation / revoke_trust.
 """
 
@@ -41,6 +42,7 @@ __all__ = [
     "RangeDecision",
     "SPEED_OF_LIGHT_MPS",
     "TrustRevocation",
+    "TrustRevocationList",
     "Verifier",
     "VerifierTrust",
     "assess",
@@ -49,11 +51,13 @@ __all__ = [
     "audit",
     "audit_bound",
     "audit_bound_policy",
+    "audit_crl",
     "cert",
     "locate",
     "locate_attested",
     "locate_bound_attested",
     "locate_cert",
+    "make_crl",
     "revoke_bound",
     "revoke_context",
     "revoke_observation",
@@ -79,6 +83,8 @@ _CONTEXT_REVOCATION_PREFIX = b"NPCR1"
 _TRUST_PREFIX = b"NPVT1"
 # Domain separation prefix for the verifier-trust revocation MAC.
 _TRUST_REVOCATION_PREFIX = b"NPVR1"
+# Domain separation prefix for the trust revocation list MAC.
+_TRUST_REVOCATION_LIST_PREFIX = b"NPVRL1"
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -224,6 +230,15 @@ def _parse_int_field(value: object, name: str) -> int:
     # bool is an int subclass but is not a number for the evidence contract.
     if type(value) is not int:
         raise ValueError(f"evidence {name} must be an integer")
+    return value
+
+
+def _parse_u64_field(value: object, name: str) -> int:
+    """Validate a non-bool unsigned 64-bit integer field."""
+    if type(value) is not int:
+        raise ValueError(f"{name} must be a non-bool integer")
+    if not 0 <= value <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(f"{name} must fit in an unsigned 64-bit integer")
     return value
 
 
@@ -1950,13 +1965,22 @@ _TRUST_FIELDS = ("version", "id", "x", "y", "key", "mac")
 
 _TRUST_REVOCATION_FIELDS = ("version", "id", "target", "mac")
 
+_TRUST_REVOCATION_LIST_FIELDS = (
+    "version",
+    "sequence",
+    "issued_at",
+    "entries",
+    "mac",
+)
+
 
 class _OrderedAttestedObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
 
     The outer attested-observation object, the bound attested-observation
-    object, the nested decision object, the observation-revocation object and
-    the verifier-trust object must each contain exactly their own fields, once
+    object, the nested decision object, the observation-revocation object,
+    the verifier-trust object, the trust-revocation object and the trust
+    revocation list object must each contain exactly their own fields, once
     each, in field order; the field sets are distinguishable by their key
     lists, so a single hook can check all of them.
     """
@@ -1974,6 +1998,7 @@ class _OrderedAttestedObject(json.JSONDecoder):
             list(_REVOCATION_FIELDS),
             list(_TRUST_FIELDS),
             list(_TRUST_REVOCATION_FIELDS),
+            list(_TRUST_REVOCATION_LIST_FIELDS),
         ):
             return dict(pairs)
         raise ValueError(
@@ -3037,6 +3062,8 @@ def locate_cert(
     root: object,
     *,
     revocations: object = None,
+    now: object = None,
+    min: object = 0,
 ) -> "Consensus":
     """Like :func:`locate_bound_attested`, but keyed by root-certified
     :class:`VerifierTrust` records instead of a caller-supplied key mapping.
@@ -3057,23 +3084,37 @@ def locate_cert(
 
     With ``revocations=None`` (the default, also for an empty iterable) no
     revocation check is performed and the behaviour is exactly as before.
-    Otherwise ``revocations`` must be an iterable of
-    :class:`TrustRevocation` instances and/or their canonical
-    :meth:`TrustRevocation.to_bytes` encodings (mixing is allowed); an item
-    that is neither, or bytes that do not parse, raises
-    :class:`ValueError`. Every revocation's root MAC is recomputed with the
-    same ``root`` and compared in constant time, so a wrong root or any
-    tampering raises :class:`ValueError`. Two revocations carrying the same
-    ``(id, target)`` pair are rejected as duplicates. A revocation hits a
-    trust when its ``id`` equals the trust's id and its ``target`` equals the
-    trust's ``mac``; a hit permanently revokes that certificate, so any
-    observation whose id uses that trust raises :class:`ValueError` (a
-    revocation can never revoke a certificate it was not issued against,
-    because the target binds the exact certificate MAC). A revocation whose
-    ``(id, target)`` pair does not hit one of the certificates the records
-    actually use — an unknown id, a different certificate with the same id,
-    or a certificate present in ``trusts`` but unused by the records — is
-    likewise rejected with :class:`ValueError`.
+    Otherwise ``revocations`` accepts either a loose iterable or a published
+    CRL snapshot:
+
+    * A loose iterable of :class:`TrustRevocation` instances and/or their
+      canonical :meth:`TrustRevocation.to_bytes` encodings (mixing is
+      allowed); an item that is neither, or bytes that do not parse, raises
+      :class:`ValueError`. Every revocation's root MAC is recomputed with the
+      same ``root`` and compared in constant time, so a wrong root or any
+      tampering raises :class:`ValueError`. Two revocations carrying the same
+      ``(id, target)`` pair are rejected as duplicates. A revocation hits a
+      trust when its ``id`` equals the trust's id and its ``target`` equals
+      the trust's ``mac``; a hit permanently revokes that certificate, so any
+      observation whose id uses that trust raises :class:`ValueError` (a
+      revocation can never revoke a certificate it was not issued against,
+      because the target binds the exact certificate MAC). A revocation whose
+      ``(id, target)`` pair does not hit one of the certificates the records
+      actually use — an unknown id, a different certificate with the same id,
+      or a certificate present in ``trusts`` but unused by the records — is
+      likewise rejected with :class:`ValueError`.
+
+    * A :class:`TrustRevocationList` snapshot (or its canonical
+      :meth:`TrustRevocationList.to_bytes` encoding). The snapshot is audited
+      with :func:`audit_crl` under ``root``, ``now`` and ``min``: ``now`` is
+      then mandatory (a finite non-bool number) and the snapshot's list MAC,
+      every entry MAC, ``sequence >= min`` (``min`` a non-bool u64, default
+      ``0``) and ``issued_at <= now`` are all enforced, so a wrong root, any
+      tampering, a stale snapshot or a missing ``now`` raises
+      :class:`ValueError`. A snapshot is a global publication rather than a
+      query payload, so an entry whose ``(id, target)`` pair does not hit a
+      certificate the records use is simply inapplicable and does not fail
+      the call; an entry that does hit revokes exactly as the loose form.
 
     The remaining rules are exactly those of :func:`locate_bound_attested`
     with ``quorum`` fixed at ``3`` and ``tolerance`` fixed at ``0.0``:
@@ -3148,48 +3189,72 @@ def locate_cert(
         if ident in trust_map
     }
     revoked_pairs: set[tuple[str, bytes]] = set()
+    minimum = _parse_u64_field(min, "min")
     if revocations is not None:
-        try:
-            raw_revocations = list(revocations)  # type: ignore[arg-type]
-        except TypeError as error:
-            raise ValueError(
-                "revocations must be an iterable of TrustRevocation or bytes"
-            ) from error
-        for entry in raw_revocations:
-            if isinstance(entry, bytes):
-                entry = TrustRevocation.from_bytes(entry)
-            if not isinstance(entry, TrustRevocation):
+        if isinstance(revocations, (TrustRevocationList, bytes)):
+            # A published CRL snapshot (object or canonical bytes) is audited
+            # as a whole with audit_crl: the list MAC, every entry's root MAC,
+            # the issue time and the sequence floor are all checked there, so
+            # `now` is mandatory. A snapshot is a global list, not a query
+            # payload: entries that do not hit a certificate the records use
+            # are simply inapplicable, whereas a hit revokes as before.
+            snapshot = revocations
+            if isinstance(snapshot, bytes):
+                snapshot = TrustRevocationList.from_bytes(snapshot)
+            if now is None:
                 raise ValueError(
-                    "revocations must contain only TrustRevocation instances"
-                    " or bytes"
+                    "now is required when revocations is a TrustRevocationList"
+                    " snapshot"
                 )
-            pair = (entry.id, entry.target)
-            if pair in revoked_pairs:
+            current = _finite_non_bool(now)
+            audit_crl(snapshot, root, current, minimum)
+            for entry in snapshot.entries:
+                revoked_pairs.add((entry.id, entry.target))
+        else:
+            try:
+                raw_revocations = list(revocations)  # type: ignore[arg-type]
+            except TypeError as error:
                 raise ValueError(
-                    "revocations contain a duplicate (id, target) pair:"
-                    f" {entry.id!r}"
-                )
-            revoked_pairs.add(pair)
-            if not hmac.compare_digest(
-                _trust_revocation_mac(
-                    root, _trust_revocation_payload(entry)
-                ),
-                entry.mac,
-            ):
-                raise ValueError(
-                    f"trust revocation mac does not match: {entry.id!r}"
-                )
-        for pair in revoked_pairs:
-            # Only after every entry's root MAC has checked out do the
-            # target bindings count: a validly signed revocation must hit
-            # exactly a certificate used by one of the records — an
-            # unrecognized id/target (an unused or unknown certificate
-            # included) is rejected rather than silently ignored.
-            if pair not in used_pairs:
-                raise ValueError(
-                    "trust revocation does not match a certificate used by"
-                    f" the records: {pair[0]!r}"
-                )
+                    "revocations must be a TrustRevocationList snapshot or an"
+                    " iterable of TrustRevocation or bytes"
+                ) from error
+            for entry in raw_revocations:
+                if isinstance(entry, bytes):
+                    entry = TrustRevocation.from_bytes(entry)
+                if not isinstance(entry, TrustRevocation):
+                    raise ValueError(
+                        "revocations must contain only TrustRevocation instances"
+                        " or bytes"
+                    )
+                pair = (entry.id, entry.target)
+                if pair in revoked_pairs:
+                    raise ValueError(
+                        "revocations contain a duplicate (id, target) pair:"
+                        f" {entry.id!r}"
+                    )
+                revoked_pairs.add(pair)
+                if not hmac.compare_digest(
+                    _trust_revocation_mac(
+                        root, _trust_revocation_payload(entry)
+                    ),
+                    entry.mac,
+                ):
+                    raise ValueError(
+                        f"trust revocation mac does not match: {entry.id!r}"
+                    )
+            for pair in revoked_pairs:
+                # Only after every entry's root MAC has checked out do the
+                # target bindings count: a validly signed loose revocation
+                # must hit exactly a certificate used by one of the records
+                # — an unrecognized id/target (an unused or unknown
+                # certificate included) is rejected rather than silently
+                # ignored. (Snapshot entries follow CRL membership semantics
+                # instead: non-hitting entries are simply inapplicable.)
+                if pair not in used_pairs:
+                    raise ValueError(
+                        "trust revocation does not match a certificate used by"
+                        f" the records: {pair[0]!r}"
+                    )
 
     verified: list[Observation] = []
     seen_ids: set[str] = set()
@@ -3395,3 +3460,330 @@ def revoke_trust(trust: object, root: object) -> TrustRevocation:
         record,
         mac=_trust_revocation_mac(root, _trust_revocation_payload(record)),
     )
+
+
+def _trust_revocation_list_payload(crl: "TrustRevocationList") -> dict:
+    """The JSON-ready CRL fields except ``mac``, in field order.
+
+    ``entries`` serializes as an array of full trust-revocation objects
+    (each entry's own ``mac`` included), ordered by ``(id, target)``.
+    """
+    return {
+        "version": crl.version,
+        "sequence": crl.sequence,
+        "issued_at": crl.issued_at,
+        "entries": [
+            {**_trust_revocation_payload(entry), "mac": entry.mac.hex()}
+            for entry in crl.entries
+        ],
+    }
+
+
+def _trust_revocation_list_mac(root: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPVRL1"`` plus the canonical encoding without ``mac``.
+
+    The prefix and the encoding are concatenated directly, with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        root,
+        _TRUST_REVOCATION_LIST_PREFIX + _encode_payload(payload),
+        hashlib.sha256,
+    ).digest()
+
+
+@dataclass(frozen=True)
+class TrustRevocationList:
+    """A root-MAC'd, sequence-numbered snapshot of trust revocations (a CRL).
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer (the list version, expected to increase with every fresh
+    publication); ``issued_at`` a finite non-bool non-negative number,
+    normalized to ``float`` at construction; ``entries`` a tuple of
+    :class:`TrustRevocation` instances, strictly ascending by ``(id,
+    target)`` with no duplicate pair; ``mac`` exactly 32 bytes —
+    ``HMAC-SHA256(root, b"NPVRL1" + encoding)`` over the canonical encoding
+    of every field except ``mac`` itself (the entries' own MACs included in
+    that encoding), the prefix and the encoding concatenated directly with
+    no length prefix. A violation of the ``sequence``/``issued_at``/
+    ``entries`` contract raises :class:`ValueError`; the ``version`` and
+    ``mac`` shape rules follow :class:`TrustRevocation` (a wrong field
+    shape raises :class:`TypeError`, a value-contract breach
+    :class:`ValueError`). Instances are frozen, constructed positionally in
+    field order and compare equal by their fields. No root material is
+    stored.
+    """
+
+    version: int
+    sequence: int
+    issued_at: float
+    entries: tuple
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("trust revocation list version must be an integer")
+        if self.version != 1:
+            raise ValueError("trust revocation list version must be 1")
+        if (
+            type(self.sequence) is not int
+            or not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF
+        ):
+            # bool, non-integer and out-of-range sequence values are all
+            # field-contract breaches of the "non-bool u64" rule.
+            raise ValueError(
+                "trust revocation list sequence must be a non-bool unsigned"
+                " 64-bit integer"
+            )
+        value = self.issued_at
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                "trust revocation list issued_at must be a finite non-negative"
+                " number"
+            )
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                "trust revocation list issued_at must be a finite non-negative"
+                " number"
+            )
+        if not isinstance(self.entries, tuple):
+            raise ValueError("trust revocation list entries must be a tuple")
+        seen_pairs: set[tuple[str, bytes]] = set()
+        previous: Optional[tuple[str, bytes]] = None
+        for entry in self.entries:
+            if not isinstance(entry, TrustRevocation):
+                raise ValueError(
+                    "trust revocation list entries must contain only"
+                    " TrustRevocation instances"
+                )
+            pair = (entry.id, entry.target)
+            if pair in seen_pairs:
+                raise ValueError(
+                    "trust revocation list entries contain a duplicate"
+                    f" (id, target) pair: {entry.id!r}"
+                )
+            if previous is not None and pair <= previous:
+                raise ValueError(
+                    "trust revocation list entries must be ascending by"
+                    " (id, target)"
+                )
+            seen_pairs.add(pair)
+            previous = pair
+        if not isinstance(self.mac, bytes):
+            raise TypeError("trust revocation list mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("trust revocation list mac must be exactly 32 bytes")
+        # issued_at is normalized to float, so the JSON spelling is always a
+        # float and constructors agree regardless of int/float input.
+        object.__setattr__(self, "issued_at", float(value))
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``entries`` as
+        an array of full trust-revocation objects, byte fields as lowercase
+        hex, no whitespace, no NaN/Infinity."""
+        payload = _trust_revocation_list_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "TrustRevocationList":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes``; raises
+        :class:`ValueError` for anything that does not satisfy the contract:
+        exactly the list fields appearing once each in field order (missing,
+        extra, duplicated or out-of-order keys are rejected, likewise inside
+        every nested entry object, which must satisfy the full
+        :meth:`TrustRevocation.from_bytes` contract), ``version == 1``, a
+        non-bool u64 ``sequence``, a finite non-bool non-negative
+        ``issued_at`` (spelled as the canonical float), an ``entries`` array
+        strictly ascending by ``(id, target)`` with no duplicates, and a
+        ``mac`` lowercase hex string decoding to exactly 32 bytes. After
+        parsing and field validation the list is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for byte,
+        so formatted JSON, whitespace and any non-canonical spelling are
+        rejected as well. Neither MAC layer is verified here — use
+        :func:`audit_crl` with the root key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("trust revocation list data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedAttestedObject)
+        except ValueError as error:
+            raise ValueError(
+                f"trust revocation list is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _TRUST_REVOCATION_LIST_FIELDS
+        ):
+            raise ValueError(
+                "trust revocation list must be a JSON object with exactly the"
+                " trust revocation list fields"
+            )
+        sequence = _parse_u64_field(obj["sequence"], "sequence")
+        issued_at = obj["issued_at"]
+        if isinstance(issued_at, bool) or not isinstance(
+            issued_at, (int, float)
+        ):
+            raise ValueError(
+                "trust revocation list issued_at must be a finite non-negative"
+                " number"
+            )
+        if not math.isfinite(issued_at) or issued_at < 0:
+            raise ValueError(
+                "trust revocation list issued_at must be a finite non-negative"
+                " number"
+            )
+        raw_entries = obj["entries"]
+        if not isinstance(raw_entries, list):
+            raise ValueError(
+                "trust revocation list entries must be a JSON array"
+            )
+        # Every nested object is already known to carry exactly the
+        # revocation keys in field order, so its canonical re-encoding goes
+        # straight through the TrustRevocation contract.
+        entries = tuple(
+            TrustRevocation.from_bytes(_encode_payload(raw_entry))
+            for raw_entry in raw_entries
+        )
+        mac = _parse_trust_revocation_hex(obj["mac"], "list mac")
+        if len(mac) != 32:
+            raise ValueError("trust revocation list mac must decode to 32 bytes")
+        # The version rule is enforced by the constructor (a non-int raises
+        # TypeError, a value other than 1 ValueError), matching
+        # TrustRevocation.from_bytes.
+        record = cls(
+            version=obj["version"],
+            sequence=sequence,
+            issued_at=float(issued_at),
+            entries=entries,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings (an integer issued_at included).
+            raise ValueError("trust revocation list encoding is not canonical")
+        return record
+
+
+def make_crl(
+    items: object,
+    seq: object,
+    time: object,
+    root: object,
+) -> TrustRevocationList:
+    """Publish a :class:`TrustRevocationList` snapshot signed under ``root``.
+
+    ``items`` is an iterable of :class:`TrustRevocation` instances and/or
+    their canonical :meth:`TrustRevocation.to_bytes` encodings (mixing is
+    allowed); an item that is neither, or bytes that do not parse, raises
+    :class:`ValueError`. The entries are stored ascending by ``(id,
+    target)`` and a duplicate pair raises :class:`ValueError`. ``seq`` must
+    be a non-bool unsigned 64-bit integer and ``time`` a finite non-bool
+    non-negative number (stored as ``float``); a violation raises
+    :class:`ValueError`. ``root`` must be non-empty ``bytes`` (a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`).
+    The list ``version`` is set to ``1`` and its ``mac`` is
+    ``HMAC-SHA256(root, b"NPVRL1" + encoding)`` over the canonical encoding
+    of every field except ``mac`` itself (the entries' own MACs included),
+    the prefix and the encoding concatenated directly with no length
+    prefix. The entries' individual MACs are not re-verified here — the same
+    root checks both layers in :func:`audit_crl`. Signing is pure data: it
+    reads and mutates no verifier state.
+    """
+    root = _require_root(root)
+    sequence = _parse_u64_field(seq, "sequence")
+    if isinstance(time, bool) or not isinstance(time, (int, float)):
+        raise ValueError(
+            "trust revocation list issued_at must be a finite non-negative number"
+        )
+    issued_at = float(time)
+    if not math.isfinite(issued_at) or issued_at < 0:
+        raise ValueError(
+            "trust revocation list issued_at must be a finite non-negative number"
+        )
+    try:
+        raw_items = list(items)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "items must be an iterable of TrustRevocation or bytes"
+        ) from error
+    entries: list[TrustRevocation] = []
+    for item in raw_items:
+        if isinstance(item, bytes):
+            item = TrustRevocation.from_bytes(item)
+        if not isinstance(item, TrustRevocation):
+            raise ValueError(
+                "items must contain only TrustRevocation instances or bytes"
+            )
+        entries.append(item)
+    entries.sort(key=lambda entry: (entry.id, entry.target))
+    record = TrustRevocationList(
+        version=1,
+        sequence=sequence,
+        issued_at=issued_at,
+        entries=tuple(entries),
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record,
+        mac=_trust_revocation_list_mac(root, _trust_revocation_list_payload(record)),
+    )
+
+
+def audit_crl(
+    x: object,
+    root: object,
+    now: object,
+    min: object = 0,
+) -> None:
+    """Verify a :class:`TrustRevocationList` snapshot against ``root``.
+
+    ``x`` is a :class:`TrustRevocationList` instance or its canonical
+    :meth:`TrustRevocationList.to_bytes` encoding (anything that is not
+    bytes raises :class:`TypeError`; bytes that do not parse canonically
+    raise :class:`ValueError`). ``root`` must be non-empty ``bytes`` (a
+    non-bytes value raises :class:`TypeError`, an empty value
+    :class:`ValueError`); ``now`` must be a finite non-bool number and
+    ``min`` a non-bool unsigned 64-bit integer (default ``0``).
+
+    Both MAC layers are recomputed with the same ``root`` and compared in
+    constant time: the list MAC over ``b"NPVRL1"`` and every entry's MAC
+    over ``b"NPVR1"`` — a wrong root or any tampering at either layer
+    raises :class:`ValueError`. A snapshot dated in the future
+    (``issued_at > now``) or behind the sequence floor (``sequence < min``)
+    raises :class:`ValueError`. On success the function returns ``None``;
+    it is pure and reads no verifier state.
+    """
+    if isinstance(x, bytes):
+        crl = TrustRevocationList.from_bytes(x)
+    elif isinstance(x, TrustRevocationList):
+        crl = x
+    else:
+        raise TypeError(
+            "x must be a TrustRevocationList instance or canonical bytes"
+        )
+    root = _require_root(root)
+    current = _finite_non_bool(now)
+    minimum = _parse_u64_field(min, "min")
+    if crl.sequence < minimum:
+        raise ValueError(
+            f"trust revocation list sequence {crl.sequence} is below the"
+            f" minimum {minimum}"
+        )
+    if crl.issued_at > current:
+        raise ValueError("trust revocation list is dated in the future")
+    if not hmac.compare_digest(
+        _trust_revocation_list_mac(root, _trust_revocation_list_payload(crl)),
+        crl.mac,
+    ):
+        raise ValueError("trust revocation list mac does not match")
+    for entry in crl.entries:
+        if not hmac.compare_digest(
+            _trust_revocation_mac(root, _trust_revocation_payload(entry)),
+            entry.mac,
+        ):
+            raise ValueError(
+                f"trust revocation mac does not match: {entry.id!r}"
+            )
