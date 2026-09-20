@@ -77,6 +77,11 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
 - `revoke_observation(id, revoked_at, key) -> ObservationRevocation` — 用非空 key 签发撤销记录（见下）
+- `VerifierTrust(version, id, x, y, key, mac)` — 根密钥 MAC 的冻结信任记录，把验证者 id 绑定到其坐标与共享密钥（`version=1`，`key`/`mac` 各恰 32 字节，不含根密钥；见下）
+  - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`key`/`mac` 为小写十六进制
+  - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
+- `cert(id, x, y, key, root) -> VerifierTrust` — 用非空 root 签发信任记录：`mac = HMAC-SHA256(root, b"NPVT1" + 去mac编码)`，两段直接拼接、无长度前缀（见下）
+- `locate_cert(records, point, context, trusts, root) -> Consensus` — 以根证书信任链验签既有绑定观察，`quorum` 固定 3、`tolerance` 固定 0.0（见下）
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -316,6 +321,27 @@ consensus = locate_bound_attested(records, (0.0, 0.0), context, keys, max_age=60
 consensus.accepted                     # True
 # locate_bound_attested(records, (1.0, 0.0), context, keys) -> ValueError（点不逐项相等）
 # locate_bound_attested(records, (0.0, 0.0), "room-8", keys) -> ValueError（用途不符）
+```
+
+### 根证书信任 `VerifierTrust`、`cert` 与 `locate_cert`
+
+`VerifierTrust(version, id, x, y, key, mac)` 是根密钥 MAC 的冻结信任记录，把一个验证者 id 绑定到其坐标与共享密钥：按字段序位置构造、冻结且按字段相等；`version` 固定为 `1`；`id` 为非空字符串；`x`/`y` 为非布尔、有限、非负的数；`key` 与 `mac` 各为恰好 32 字节的 `bytes`；任何字段违约在构造时抛 `ValueError`。`mac` 是根密钥对 `b"NPVT1" + 去mac规范编码` 的 HMAC-SHA256——前缀与编码两段直接拼接，无分隔符、无长度前缀；记录本身不含根密钥。
+
+`to_bytes()` 按无空白 UTF-8 JSON 编码：键依字段顺序（`version, id, x, y, key, mac`），`key`/`mac` 为小写十六进制。`from_bytes(data)` 只收 `bytes`：键必须恰好是六个字段、各出现一次且依字段顺序，解析与字段校验后按规范重编码并与输入逐字节相等，否则抛 `ValueError`；它不校验 MAC。
+
+`cert(id, x, y, key, root)` 用非空 `root` 签发一条信任记录（`version` 固定为 1），字段违约或空 root 均抛 `ValueError`；纯计算，不触碰任何验证者状态。
+
+`locate_cert(records, point, context, trusts, root) -> Consensus` 以根证书信任链复核既有绑定观察（`BoundAttestedObservation` 或其字节编码，混输允许）：`trusts` 同样是对象/字节混输，每个 id 恰有一条，重复 id 抛 `ValueError`；`root` 必须非空，每条 trust 的根 MAC 用 `root` 恒时重算比对。随后每条观察记录以其 id 对应证书的 `key` 恒时验 MAC，且证书的 `id`/`x`/`y` 必须与记录相等；缺证书、MAC 不符或坐标不等均抛 `ValueError`。其余规则与 `locate_bound_attested` 相同（点逐项相等、用途精确相等、几何聚合），但 `quorum` 固定为 `3`、`tolerance` 固定为 `0.0`，且不做时效与撤销检查；未达 quorum 只体现在结果中，不抛异常。
+
+```python
+from nearproof import cert, locate_cert
+
+root = b"\x09" * 32
+trusts = [cert("alpha", 0.0, 0.0, keys["alpha"], root),
+          cert("bravo", 3.0, 0.0, keys["bravo"], root),
+          cert("charlie", 0.0, 4.0, keys["charlie"], root)]
+consensus = locate_cert(records, (0.0, 0.0), context, trusts, root)
+consensus.accepted                     # True
 ```
 
 ### 观察撤销 `ObservationRevocation` 与 `revoke_observation`
