@@ -47,6 +47,13 @@ __all__ = [
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
 NONCE_BYTES = 16
+# Context, opening and their bound digest are all fixed at 32 bytes.
+CONTEXT_BYTES = 32
+OPENING_BYTES = 32
+DIGEST_BYTES = 32
+# Domain separation prefixes for the commitment hash and the bound response.
+_DIGEST_PREFIX = b"NPC1"
+_RESPONSE_PREFIX = b"NPR1"
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -322,6 +329,33 @@ def keyed_response(key: bytes, nonce: bytes) -> bytes:
     return hmac.new(key, nonce, hashlib.sha256).digest()
 
 
+def context_digest(context: bytes, opening: bytes) -> bytes:
+    """The commitment ``SHA256(b"NPC1" + context + opening)``.
+
+    ``context`` and ``opening`` are concatenated with no separator or length
+    prefix; both are fixed-width 32-byte values so the concatenation is
+    unambiguous.
+    """
+    return hashlib.sha256(_DIGEST_PREFIX + context + opening).digest()
+
+
+def bound_response(
+    key: bytes, digest: bytes, round_index: int, nonce: bytes
+) -> bytes:
+    """The bound response for one context-attested round.
+
+    ``HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) + nonce)`` with
+    ``round_index`` encoded as a fixed 8-byte unsigned big-endian integer.
+    """
+    message = (
+        _RESPONSE_PREFIX
+        + digest
+        + int(round_index).to_bytes(8, byteorder="big", signed=False)
+        + nonce
+    )
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+
 class Prover:
     """Answers challenges with a keyed response."""
 
@@ -334,6 +368,40 @@ class Prover:
         if not isinstance(challenge, Challenge):
             raise TypeError("challenge must be a Challenge")
         return keyed_response(self._key, challenge.nonce)
+
+    def reveal(
+        self, challenge: Challenge, context: bytes, opening: bytes
+    ) -> bytes:
+        """Answer a context-bound challenge by revealing the opening.
+
+        Returns the response a holder of the shared key must produce for a
+        challenge bound to ``digest = SHA256(b"NPC1" + context + opening)``:
+        ``HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) + nonce)``.
+        ``context`` and ``opening`` must each be exactly 32 bytes; the
+        challenge's ``round_index`` must be a non-bool unsigned 64-bit integer
+        and its ``nonce`` exactly 16 bytes.
+        """
+        if not isinstance(challenge, Challenge):
+            raise TypeError("challenge must be a Challenge")
+        if not isinstance(context, bytes):
+            raise TypeError("context must be bytes")
+        if not isinstance(opening, bytes):
+            raise TypeError("opening must be bytes")
+        if len(context) != CONTEXT_BYTES:
+            raise ValueError(f"context must be exactly {CONTEXT_BYTES} bytes")
+        if len(opening) != OPENING_BYTES:
+            raise ValueError(f"opening must be exactly {OPENING_BYTES} bytes")
+        round_index = challenge.round_index
+        if isinstance(round_index, bool) or type(round_index) is not int:
+            raise ValueError("round_index must be a non-bool integer")
+        if not 0 <= round_index <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("round_index must fit in an unsigned 64-bit integer")
+        if not isinstance(challenge.nonce, bytes):
+            raise TypeError("nonce must be bytes")
+        if len(challenge.nonce) != NONCE_BYTES:
+            raise ValueError(f"nonce must be exactly {NONCE_BYTES} bytes")
+        digest = context_digest(context, opening)
+        return bound_response(self._key, digest, round_index, challenge.nonce)
 
 
 class Verifier:
@@ -399,7 +467,25 @@ class Verifier:
     def round_count(self) -> int:
         return self._round
 
-    def new_challenge(self) -> Challenge:
+    def new_challenge(
+        self, *, context: Optional[bytes] = None, digest: Optional[bytes] = None
+    ) -> Challenge:
+        """Issue a challenge.
+
+        With both ``context`` and ``digest`` left as ``None`` this is the
+        original behaviour. A context-bound challenge is requested by passing
+        the two together (passing only one raises :class:`ValueError`): each
+        must be exactly 32 bytes and bound issuance requires
+        ``replay_protection=True`` so the binding is registered with the
+        challenge. The issued challenge object is unchanged; the verifier
+        remembers the ``(context, digest)`` pair and :meth:`verify` only
+        accepts a matching opening for it.
+        """
+        bound_context, bound_digest = self._check_binding_args(context, digest)
+        if bound_context is not None and not self._replay_protection:
+            raise ValueError(
+                "context-bound challenges require replay_protection=True"
+            )
         challenge = Challenge(round_index=self._round + 1, nonce=os.urandom(NONCE_BYTES))
         if self._replay_protection:
             with self._lock:
@@ -407,10 +493,33 @@ class Verifier:
                 deadline = None
                 if self._challenge_ttl is not None:
                     deadline = self._clock() + self._challenge_ttl
-                self._challenges[id(challenge)] = [challenge, _PENDING, deadline]
+                # Entries always carry the bound context/digest in slots 3/4;
+                # both are None for an unbound challenge.
+                self._challenges[id(challenge)] = [
+                    challenge, _PENDING, deadline, bound_context, bound_digest
+                ]
         else:
             self._round += 1
         return challenge
+
+    @staticmethod
+    def _check_binding_args(
+        context: Optional[bytes], digest: Optional[bytes]
+    ) -> tuple[Optional[bytes], Optional[bytes]]:
+        """Validate the ``new_challenge`` context/digest keyword pair."""
+        if context is None and digest is None:
+            return None, None
+        if context is None or digest is None:
+            raise ValueError("context and digest must be provided together")
+        if not isinstance(context, bytes):
+            raise TypeError("context must be bytes")
+        if not isinstance(digest, bytes):
+            raise TypeError("digest must be bytes")
+        if len(context) != CONTEXT_BYTES:
+            raise ValueError(f"context must be exactly {CONTEXT_BYTES} bytes")
+        if len(digest) != DIGEST_BYTES:
+            raise ValueError(f"digest must be exactly {DIGEST_BYTES} bytes")
+        return context, digest
 
     def _entry_for(self, challenge: Challenge) -> list | None:
         """Return the registry entry for the exact issued challenge object."""
@@ -452,7 +561,14 @@ class Verifier:
             entry[1] = _REVOKED
             return
 
-    def verify(self, challenge: Challenge, response: bytes, started_at: float) -> Measurement:
+    def verify(
+        self,
+        challenge: Challenge,
+        response: bytes,
+        started_at: float,
+        *,
+        opening: Optional[bytes] = None,
+    ) -> Measurement:
         """Validate the response and turn the elapsed round trip into a distance.
 
         When replay protection is enabled, ``challenge`` must be the exact
@@ -466,9 +582,19 @@ class Verifier:
         expired challenge (current time at or past its deadline) raises
         :class:`ChallengeStateError` and can never be verified, even if the
         rest of the response is valid.
+
+        With ``opening=None`` the response is the original keyed response over
+        the nonce. Passing ``opening`` selects the context-bound protocol: it
+        must be exactly 32 bytes and the challenge must be the exact object
+        issued bound to ``(context, digest)`` by :meth:`new_challenge`, with
+        ``SHA256(b"NPC1" + context + opening) == digest``; the response must
+        then be ``HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) +
+        nonce)`` (as produced by :meth:`Prover.reveal`). A wrong-length opening
+        or a digest/opening mismatch raises :class:`ValueError` and leaves the
+        challenge pending.
         """
         measurement, _end, _start = self._verify_round(
-            challenge, response, started_at, require_finite=False
+            challenge, response, started_at, require_finite=False, opening=opening
         )
         return measurement
 
@@ -524,18 +650,22 @@ class Verifier:
         started_at: float,
         *,
         require_finite: bool,
+        opening: Optional[bytes] = None,
     ) -> tuple[Measurement, float, float]:
         """Shared core of :meth:`verify` and :meth:`verify_evidence`.
 
         Returns ``(measurement, end, start)`` where ``end`` is the single
         clock reading of the call and ``start`` is ``float(started_at)``.
         With ``require_finite`` every recorded number is checked for
-        finiteness before anything is consumed.
+        finiteness before anything is consumed. ``opening`` selects the
+        context-bound response protocol (``None`` is the legacy protocol).
         """
         if not isinstance(challenge, Challenge):
             raise TypeError("challenge must be a Challenge")
         if not self._replay_protection:
-            return self._verify_legacy(challenge, response, started_at, require_finite)
+            return self._verify_legacy(
+                challenge, response, started_at, require_finite, opening
+            )
 
         with self._lock:
             entry = self._entry_for(challenge)
@@ -568,8 +698,14 @@ class Verifier:
                 _require_finite(start, now, elapsed, self._speed, distance)
             if elapsed < 0:
                 raise ValueError("elapsed time must not be negative")
+            # Opening/binding validation is part of response validation, so
+            # it runs after state, expiry and ranging checks and leaves the
+            # challenge pending on failure.
+            expected = self._expected_response(
+                challenge, entry[3], entry[4], opening
+            )
             response_bytes = bytes(response)
-            if not hmac.compare_digest(keyed_response(self._key, challenge.nonce), response_bytes):
+            if not hmac.compare_digest(expected, response_bytes):
                 raise ValueError("response does not match the challenge")
             entry[1] = _CONSUMED
 
@@ -582,12 +718,54 @@ class Verifier:
         )
         return measurement, now, start
 
+    def _expected_response(
+        self,
+        challenge: Challenge,
+        bound_context: Optional[bytes],
+        bound_digest: Optional[bytes],
+        opening: Optional[bytes],
+    ) -> bytes:
+        """The response bytes expected for a round under the selected protocol.
+
+        ``bound_context``/``bound_digest`` are the binding registered with the
+        challenge (both ``None`` when it is unbound or, in legacy mode, when no
+        registry exists). ``opening=None`` selects the nonce-only response; an
+        opening that is not 32-byte ``bytes`` raises :class:`TypeError` for the
+        shape error and :class:`ValueError` for every other mismatch.
+        """
+        if opening is None:
+            if bound_context is None:
+                return keyed_response(self._key, challenge.nonce)
+            # The challenge was issued bound to a context, so it can only be
+            # answered by revealing the matching opening; the legacy nonce
+            # response (and the absence of an opening) never satisfies it.
+            raise ValueError(
+                "challenge was issued with a context binding; an opening is"
+                " required"
+            )
+        if not isinstance(opening, bytes):
+            raise TypeError("opening must be bytes")
+        if len(opening) != OPENING_BYTES:
+            raise ValueError(f"opening must be exactly {OPENING_BYTES} bytes")
+        if bound_context is None:
+            raise ValueError(
+                "challenge was not issued with a context binding"
+            )
+        if not hmac.compare_digest(
+            context_digest(bound_context, opening), bound_digest
+        ):
+            raise ValueError("opening does not match the challenge context binding")
+        return bound_response(
+            self._key, bound_digest, challenge.round_index, challenge.nonce
+        )
+
     def _verify_legacy(
         self,
         challenge: Challenge,
         response: bytes,
         started_at: float,
         require_finite: bool = False,
+        opening: Optional[bytes] = None,
     ) -> tuple[Measurement, float, float]:
         """Original single-round behaviour, unchanged when protection is off."""
         end = self._clock()
@@ -598,8 +776,11 @@ class Verifier:
             _require_finite(start, end, elapsed, self._speed, distance)
         if elapsed < 0:
             raise ValueError("elapsed time must not be negative")
+        # Without a registry no binding can exist, so reveal-style verification
+        # can never match here; opening=None keeps the original behaviour.
+        expected = self._expected_response(challenge, None, None, opening)
         response_bytes = bytes(response)
-        if not hmac.compare_digest(keyed_response(self._key, challenge.nonce), response_bytes):
+        if not hmac.compare_digest(expected, response_bytes):
             raise ValueError("response does not match the challenge")
         # The signal travels to the prover and back, so halve the round trip.
         measurement = Measurement(

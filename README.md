@@ -37,11 +37,11 @@ python3 -m nearproof
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：JSON 对象的键必须恰好是十一个字段且各出现一次、顺序与字段顺序一致（重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
 - `Measurement(round_index, nonce, response, elapsed_seconds, distance_meters)`
 - `Observation(id, x, y, decision)` — 二维共识中一个验证者的冻结观察：`id` 为非空字符串，`(x, y)` 为非布尔有限数坐标，`decision` 为 `RangeDecision`（仅其有限非负的 `upper_bound` 参与共识，`accepted` 不参与）
-- `Prover(shared_key)` — `respond(challenge) -> bytes`，HMAC-SHA256 应答
+- `Prover(shared_key)` — `respond(challenge) -> bytes`（HMAC-SHA256 应答）；`reveal(challenge, context, opening) -> bytes` 用于上下文绑定轮次（见下）
 - `RangeDecision(sample_count, upper_bound, accepted)` — `assess` 的冻结结果：`sample_count` 统计全部输入样本（含离群点），`upper_bound` 为内点最大距离，`accepted` 表示其不超过 limit
 - `Verifier(shared_key, *, speed_mps=SPEED_OF_LIGHT_MPS, clock=time.perf_counter, replay_protection=False, challenge_ttl_seconds=None)`
-  - `new_challenge()` — 生成 16 字节随机 nonce；配置有效期时按 `clock()` 记录签发时刻
-  - `verify(challenge, response, started_at)` — 校验应答并把往返时间折半换算为距离
+  - `new_challenge(*, context=None, digest=None)` — 默认（均为 `None`）生成 16 字节随机 nonce，行为与旧版一致；成对传入 32 字节 `context`/`digest` 则签发上下文绑定挑战（要求 `replay_protection=True`，只传一个抛 `ValueError`）；配置有效期时按 `clock()` 记录签发时刻
+  - `verify(challenge, response, started_at, *, opening=None) -> Measurement` — 校验应答并把往返时间折半换算为距离；`opening=None` 为旧行为，传入 32 字节 `opening` 则走上下文绑定协议（见下）
   - `verify_evidence(challenge, response, started_at)` — 同 `verify` 的参数与语义，成功时返回 `Evidence`
   - `measure(prover)` — 一次完整往返
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
@@ -94,6 +94,34 @@ verifier = Verifier(key, replay_protection=True, challenge_ttl_seconds=0.05)
 challenge = verifier.new_challenge()          # 签发时刻 t，截止时刻 t + 0.05
 verifier.verify(challenge, prover.respond(challenge), verifier.clock())  # 截止前成功
 # 另一个挑战在 t + 0.05 或之后验证 -> ChallengeStateError("challenge has expired")
+```
+
+### 上下文绑定的挑战 / 应答（context commitment）
+
+在普通往返之外，协议支持把一轮挑战绑定到一个 32 字节的用途上下文 `context` 与一个由证明者持有的 32 字节秘密 `opening` 上：
+
+- 承诺 `digest = SHA256(b"NPC1" + context + opening)`，三者（`context`、`opening`、`digest`）均为 32 字节，拼接时**无任何分隔符或长度前缀**。
+- 验证者调用 `new_challenge(context=context, digest=digest)` 签发绑定挑战：`context` 与 `digest` 必须**同时给出**（只给一个抛 `ValueError`），各自必须恰好 32 字节（长度不对抛 `ValueError`，非 bytes 抛 `TypeError`），并且必须开启 `replay_protection=True`（否则抛 `ValueError`），以便把该绑定连同挑战一起登记。返回的 `Challenge` 对象形状不变，仍是 `(round_index, nonce)`；`round_index` 为 u64 语义的非布尔整数，`nonce` 为 16 字节。
+- 两参数均为 `None`（默认，且不允许按位置传入）时完全保持旧行为：普通 nonce 挑战，无需重放防护。
+- 证明者用 `Prover.reveal(challenge, context, opening) -> bytes` 应答。它先校验 `context`/`opening` 均为恰好 32 字节的 bytes（形状错抛 `TypeError`，长度错抛 `ValueError`），再计算应答：
+  `HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) + nonce)`，其中 `u64be` 为固定 **8 字节无符号大端**编码（`round_index` 必须是非布尔、取值在 `0..2^64-1` 的整数，`nonce` 恰好 16 字节，否则抛 `ValueError`/`TypeError`）。
+- 验证者用 `verify(challenge, response, started_at, *, opening=opening)` 完成绑定轮次：`opening` 仅限关键字传入且必须恰好 32 字节；验证者用登记的 `context`/`digest` 检查 `SHA256(b"NPC1" + context + opening) == digest`（恒时比较），不匹配或长度不对抛 `ValueError`，`opening` 非 bytes 抛 `TypeError`，随后用同一 `NPR1` 公式恒时复核应答。状态、有效期、测距与原子消费语义与普通 `verify` 完全一致：状态/到期/负耗时等检查先于绑定与应答校验，绑定或应答失败不消费挑战、可在原截止时刻前重试。
+- 协议模式不能混用：对**绑定**挑战用 `opening=None`（普通应答）、或对**普通**挑战传入 `opening`，一律抛 `ValueError`。`opening=None` 时普通挑战的旧行为不变；`verify_evidence`、`measure` 等其余接口不受影响。
+
+```python
+import hashlib
+import os
+
+from nearproof import Prover, Verifier
+
+context = os.urandom(32)
+opening = os.urandom(32)
+digest = hashlib.sha256(b"NPC1" + context + opening).digest()
+
+prover, verifier = Prover(key), Verifier(key, replay_protection=True)
+challenge = verifier.new_challenge(context=context, digest=digest)
+response = prover.reveal(challenge, context, opening)
+measurement = verifier.verify(challenge, response, verifier.clock(), opening=opening)
 ```
 
 ### 证据记录与审计
