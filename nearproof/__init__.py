@@ -4,9 +4,10 @@ Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / Challenge / ChallengeStateError / Consensus /
 ContextRevocation / Evidence / Measurement / Observation /
 ObservationRevocation / Prover / RangeDecision / SPEED_OF_LIGHT_MPS /
-Verifier / assess / attest_observation / attest_observation_for_point /
-audit / audit_bound / audit_bound_policy / locate / locate_attested /
-locate_bound_attested / revoke_bound / revoke_context / revoke_observation.
+Verifier / VerifierTrust / assess / attest_observation /
+attest_observation_for_point / audit / audit_bound / audit_bound_policy /
+cert / locate / locate_attested / locate_bound_attested / locate_cert /
+revoke_bound / revoke_context / revoke_observation.
 """
 
 from __future__ import annotations
@@ -40,15 +41,18 @@ __all__ = [
     "RangeDecision",
     "SPEED_OF_LIGHT_MPS",
     "Verifier",
+    "VerifierTrust",
     "assess",
     "attest_observation",
     "attest_observation_for_point",
     "audit",
     "audit_bound",
     "audit_bound_policy",
+    "cert",
     "locate",
     "locate_attested",
     "locate_bound_attested",
+    "locate_cert",
     "revoke_bound",
     "revoke_context",
     "revoke_observation",
@@ -69,6 +73,8 @@ _BOUND_EVIDENCE_PREFIX = b"NPBE1"
 _BOUND_REVOCATION_PREFIX = b"NPBR1"
 # Domain separation prefix for the context revocation MAC.
 _CONTEXT_REVOCATION_PREFIX = b"NPCR1"
+# Domain separation prefix for the verifier-trust MAC.
+_VERIFIER_TRUST_PREFIX = b"NPVT1"
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -1936,6 +1942,8 @@ _DECISION_FIELDS = ("sample_count", "upper_bound", "accepted")
 
 _REVOCATION_FIELDS = ("version", "id", "revoked_at", "mac")
 
+_VERIFIER_TRUST_FIELDS = ("version", "id", "x", "y", "key", "mac")
+
 
 class _OrderedAttestedObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
@@ -1958,6 +1966,7 @@ class _OrderedAttestedObject(json.JSONDecoder):
             list(_BOUND_ATTESTED_FIELDS),
             list(_DECISION_FIELDS),
             list(_REVOCATION_FIELDS),
+            list(_VERIFIER_TRUST_FIELDS),
         ):
             return dict(pairs)
         raise ValueError(
@@ -2851,3 +2860,261 @@ def locate_bound_attested(
         )
 
     return locate(verified, point, quorum=quorum, tolerance=tolerance)
+
+
+def _verifier_trust_payload(trust: "VerifierTrust") -> dict:
+    """The JSON-ready verifier-trust fields except ``mac``, in field order."""
+    return {
+        "version": trust.version,
+        "id": trust.id,
+        "x": trust.x,
+        "y": trust.y,
+        "key": trust.key.hex(),
+    }
+
+
+def _verifier_trust_mac(root: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPVT1"`` plus the canonical encoding without ``mac``.
+
+    The prefix and the encoding are concatenated directly, with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        root, _VERIFIER_TRUST_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+@dataclass(frozen=True)
+class VerifierTrust:
+    """A root-MAC'd trust record binding a verifier id to its position and key.
+
+    ``version`` is always ``1``; ``id`` a non-empty string; ``x`` and ``y``
+    finite non-bool non-negative numbers; ``key`` exactly 32 bytes — the
+    verifier's shared observation key; ``mac`` exactly 32 bytes —
+    ``HMAC-SHA256(root, b"NPVT1" + encoding)`` over the canonical encoding of
+    every field except ``mac`` itself. Any contract violation raises
+    :class:`ValueError` at construction time. Instances are frozen and
+    compare equal by field values.
+    """
+
+    version: int
+    id: str
+    x: float
+    y: float
+    key: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("verifier trust version must be 1")
+        if not isinstance(self.id, str) or not self.id:
+            raise ValueError("verifier trust id must be a non-empty string")
+        for name in ("x", "y"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"verifier trust {name} must be a finite non-negative number"
+                )
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"verifier trust {name} must be a finite non-negative number"
+                )
+        for name in ("key", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes) or len(value) != 32:
+                raise ValueError(f"verifier trust {name} must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``key`` and
+        ``mac`` as lowercase hex, no whitespace, no NaN/Infinity."""
+        payload = _verifier_trust_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "VerifierTrust":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: exactly the verifier-trust fields appearing
+        once each in field order (missing, extra, duplicated or out-of-order
+        keys are rejected), ``version == 1``, and the same per-field rules as
+        the constructor, with ``key`` and ``mac`` lowercase hex strings
+        decoding to exactly 32 bytes each. After parsing and field validation
+        the record is re-encoded with :meth:`to_bytes` and the result must
+        equal the input byte for byte, so formatted JSON, whitespace and any
+        non-canonical number or string spelling are rejected as well. The MAC
+        is not verified here — use :func:`locate_cert` with the root key for
+        that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("verifier trust data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedAttestedObject)
+        except ValueError as error:
+            raise ValueError(
+                f"verifier trust is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(_VERIFIER_TRUST_FIELDS):
+            raise ValueError(
+                "verifier trust must be a JSON object with exactly the"
+                " verifier trust fields"
+            )
+        record = cls(
+            version=obj["version"],
+            id=obj["id"],
+            x=obj["x"],
+            y=obj["y"],
+            key=_parse_hex_field(obj["key"], "key"),
+            mac=_parse_hex_field(obj["mac"], "mac"),
+        )
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError("verifier trust encoding is not canonical")
+        return record
+
+
+def cert(
+    id: object,
+    x: object,
+    y: object,
+    key: object,
+    root: object,
+) -> VerifierTrust:
+    """Sign a verifier trust record, returning a :class:`VerifierTrust`.
+
+    ``root`` must be non-empty; every other argument must satisfy the
+    :class:`VerifierTrust` field contract (``version`` is set to ``1``), and
+    any violation raises :class:`ValueError`. The MAC is
+    ``HMAC-SHA256(root, b"NPVT1" + encoding)`` over the canonical encoding of
+    every field except ``mac`` itself, the prefix and the encoding
+    concatenated directly with no length prefix. The record is pure data:
+    signing reads and mutates no verifier state.
+    """
+    if not root:
+        raise ValueError("root must not be empty")
+    root = bytes(root)
+    record = VerifierTrust(
+        version=1,
+        id=id,  # type: ignore[arg-type]
+        x=x,  # type: ignore[arg-type]
+        y=y,  # type: ignore[arg-type]
+        key=key,  # type: ignore[arg-type]
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record, mac=_verifier_trust_mac(root, _verifier_trust_payload(record))
+    )
+
+
+def locate_cert(
+    records: object,
+    point: object,
+    context: object,
+    trusts: object,
+    root: object,
+) -> "Consensus":
+    """Like :func:`locate_bound_attested`, but with per-verifier keys carried
+    by root-certified :class:`VerifierTrust` records.
+
+    ``records`` is an iterable of :class:`BoundAttestedObservation` instances
+    and/or their :meth:`BoundAttestedObservation.to_bytes` encodings (mixing
+    is allowed). ``trusts`` is an iterable of :class:`VerifierTrust`
+    instances and/or their :meth:`VerifierTrust.to_bytes` encodings (mixing
+    is allowed); every record id must be carried by exactly one trust, and a
+    duplicated trust id raises :class:`ValueError`. ``root`` must be
+    non-empty. Every trust's MAC is recomputed with ``root`` and compared in
+    constant time; every record's MAC is recomputed with the matching
+    trust's ``key`` and compared in constant time; and the trust's ``id``,
+    ``x`` and ``y`` must equal the record's. The point/context binding and
+    every other rule are exactly those of :func:`locate_bound_attested`,
+    with the quorum fixed at ``3`` and the tolerance at ``0.0``; any
+    contract violation raises :class:`ValueError`.
+
+    The function is pure: it reads no verifier state and has no side
+    effects.
+    """
+    if not root:
+        raise ValueError("root must not be empty")
+    root = bytes(root)
+
+    # The query binding is needed while examining every record, so enforce
+    # the point/context contract up front under the same rules as locate().
+    if not isinstance(point, tuple) or len(point) != 2:
+        raise ValueError("point must be a tuple of exactly two finite numbers")
+    px = _finite_non_bool(point[0])
+    py = _finite_non_bool(point[1])
+    if not isinstance(context, str) or not context:
+        raise ValueError("context must be a non-empty string")
+
+    try:
+        raw_trusts = list(trusts)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "trusts must be an iterable of VerifierTrust or bytes"
+        ) from error
+    trust_by_id: dict[str, VerifierTrust] = {}
+    for entry in raw_trusts:
+        if isinstance(entry, bytes):
+            entry = VerifierTrust.from_bytes(entry)
+        if not isinstance(entry, VerifierTrust):
+            raise ValueError(
+                "trusts must contain only VerifierTrust instances or bytes"
+            )
+        if entry.id in trust_by_id:
+            raise ValueError(f"duplicate trust id: {entry.id!r}")
+        if not hmac.compare_digest(
+            _verifier_trust_mac(root, _verifier_trust_payload(entry)), entry.mac
+        ):
+            raise ValueError(f"verifier trust mac does not match: {entry.id!r}")
+        trust_by_id[entry.id] = entry
+
+    try:
+        raw_records = list(records)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "records must be an iterable of BoundAttestedObservation or bytes"
+        ) from error
+
+    verified: list[Observation] = []
+    seen_ids: set[str] = set()
+    for item in raw_records:
+        if isinstance(item, bytes):
+            item = BoundAttestedObservation.from_bytes(item)
+        if not isinstance(item, BoundAttestedObservation):
+            raise ValueError(
+                "records must contain only BoundAttestedObservation instances"
+                " or bytes"
+            )
+        ident = item.id
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        trust = trust_by_id.get(ident)
+        if trust is None:
+            raise ValueError(f"no verifier trust for observation id: {ident!r}")
+        if not hmac.compare_digest(
+            _bound_attested_mac(trust.key, _bound_attested_payload(item)), item.mac
+        ):
+            raise ValueError(
+                f"bound attested observation mac does not match: {ident!r}"
+            )
+        if trust.x != item.x or trust.y != item.y:
+            raise ValueError(
+                f"verifier trust position does not match the observation:"
+                f" {ident!r}"
+            )
+        # Only after the MAC verifies does the point/context binding count,
+        # exactly as in locate_bound_attested.
+        if item.point[0] != px or item.point[1] != py or item.context != context:
+            raise ValueError(
+                "bound attested observation is not bound to the queried"
+                f" point and context: {ident!r}"
+            )
+        verified.append(
+            Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
+        )
+
+    return locate(verified, point, quorum=3, tolerance=0.0)
