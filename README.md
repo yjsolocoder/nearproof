@@ -92,10 +92,15 @@ python3 -m nearproof
 - `make_crl(items, seq, time, root) -> TrustRevocationList` — 用与签证书相同的 root bytes 对一批 `TrustRevocation`（可为空；不接受字节）签快照：先按 `(id, target)` 排序、重复对抛 `ValueError`，`mac = HMAC-SHA256(root, b"NPVRL1" + 去mac规范JSON)`，直拼无长度前缀；`root` 非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError`
 - `audit_crl(x, root, now, min=0) -> None` — 收快照对象或字节；恒时复核双层 MAC（列表层 `NPVRL1`、每条 entry 的 `NPVR1`，同一 root），并检查 `issued_at <= now`、`sequence >= min`；对象/root 形状错抛 `TypeError`，其余（含 MAC 不符、未来时间、序号过低）一律抛 `ValueError`
 - `CertifiedConsensusEvidence(version, body, mac)` — 根密钥 MAC 的冻结共识证据（`version=1`；`body` 为 bytes，`mac` 恰 32 字节 bytes，否则 `ValueError`；见下）；按字段序位置构造、冻结且按字段相等
-  - `to_bytes()` — 外层紧凑 UTF-8 JSON：键序固定 `version, body, mac`，`body`/`mac` 为小写十六进制
+  - `to_bytes()` — 外层紧凑 UTF-8 JSON：键序固定 `version, body, mac`，`body`/`mac` 为小写十六进制；构造器对 `body` 内容不透明，但 `to_bytes()` 会把 `body` 解码后用规范编码器重编码并与原字节逐字节比对，不一致（非 JSON、空白、非规范拼写）抛 `ValueError`，且不改写已冻结的 `body`
   - `from_bytes(data)` — 双层均按紧凑 UTF-8 JSON 校验并重编码逐字节比对；非 bytes 或任一层不合契约一律抛 `ValueError`（不验 MAC）
 - `locate_cert_evidence(records, point, context, trusts, root) -> CertifiedConsensusEvidence` — 跑一次 `locate_cert`（无撤销选项）并把结果与参与项封进证据；参与记录按 id 排序、信任按 id 同序对齐，均为规范字节编码的小写十六进制（见下）
 - `audit_cert_evidence(x, root) -> Consensus` — 收证据对象或字节；恒时验证 `HMAC-SHA256(root, b"NPCCE1" + body)`，再用 body 内的参与项重跑 `locate_cert`，重算 `Consensus` 与 body 所载逐字段相等，否则抛 `ValueError`；成功返回重算的 `Consensus`
+- `CrlProof(version, body, mac)` — 根密钥 MAC 的冻结 CRL 快照证明（`version=1`；`body` 为 bytes，`mac` 恰 32 字节 bytes，否则 `ValueError`；按字段序位置构造、冻结且按字段相等）
+  - `to_bytes()` — 外层键序固定 `version, body, mac`，`body`/`mac` 为小写十六进制，双层紧凑 UTF-8 JSON 无空白；与 `CertifiedConsensusEvidence` 一样，`body` 规范重编码须与原字节逐字节相等，否则抛 `ValueError` 且不改写
+  - `from_bytes(data)` — 非 bytes 或任一层不合契约一律抛 `ValueError`（不验 MAC）；外层须恰为 `version, body, mac`；body 解码为数组 `[point, context, records, trusts, crl, now, min, consensus]`：`point` 为两个有限非布尔数的数组、`context` 为非空字符串、`records`/`trusts` 为规范小写 hex 数组（参与项 id 升序、按 id 一一对应）、`crl` 为规范 `TrustRevocationList` 字节的小写 hex、`now` 为有限非布尔数、`min` 为非布尔整数、`consensus` 为 `[total, support, rejected, accepted]`（`rejected` 按字典序）
+- `prove_crl(records, point, context, trusts, root, crl, *, now, min=0) -> CrlProof` — 按 `locate_cert` 的签名快照路径（`revocations=crl`、`now` 必填、`min` 默认 `0`，均仅限关键字）求共识并把参与项封进证明；`crl` 收 `TrustRevocationList` 对象或规范字节；参与记录按 id 升序、信任按 id 同序对齐，`crl`/记录/信任均为规范字节的小写 hex；`mac = HMAC-SHA256(root, b"NPCCE2" + body)`，直拼无定界/长度前缀；`root` 非 bytes 抛 `TypeError`、空 bytes 及其他违约抛 `ValueError`
+- `audit_proof(x, root) -> Consensus` — 收 `CrlProof` 对象或规范字节；恒时验证 `HMAC-SHA256(root, b"NPCCE2" + body)`，再按 body 重放 `audit_crl`（双层 MAC、`issued_at <= now`、`sequence >= min`）和 `locate_cert` 快照路径，重算 `Consensus` 与 body 所载逐字段相等；`root` 类型错抛 `TypeError`（空 bytes 抛 `ValueError`），其余错误（含重放中冒出的 `TypeError`）一律抛 `ValueError`；成功返回重算的 `Consensus`
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -410,7 +415,7 @@ audit_crl(blob, root, now=1_700_000_600.0, min=42)        # 成功返回 None
 - `records`/`trusts` 为**小写规范十六进制字符串数组**，每个元素解码后分别是一条合规的 `BoundAttestedObservation.to_bytes()` / `VerifierTrust.to_bytes()` 编码；两数组按 id 序唯一对应——记录按 id 升序、id 唯一，同索引位置的信任 id 必须相同（缺漏、未知、错序均抛 `ValueError`）；
 - `consensus` 按 `Consensus` 字段序为数组 `[total, support, rejected, accepted]`，`total`/`support` 为非布尔整数，`rejected` 为按字典序排列、非空且不重复的字符串数组，`accepted` 为布尔值。
 
-内层 `body` 本身也必须是规范紧凑 JSON：`from_bytes` 解析并校验全部字段契约后，对内层重编码并与原 `body` 字节逐字节比较，再对整个外层重编码与输入逐字节比较；任何格式化 JSON、空白、非规范数字/字符串写法一律抛 `ValueError`。`from_bytes(data)` 只收 `bytes`（其他类型抛 `ValueError`），**不校验 MAC**——用 `audit_cert_evidence` 配合 root 才验签。
+内层 `body` 本身也必须是规范紧凑 JSON：`from_bytes` 解析并校验全部字段契约后，对内层重编码并与原 `body` 字节逐字节比较，再对整个外层重编码与输入逐字节比较；任何格式化 JSON、空白、非规范数字/字符串写法一律抛 `ValueError`。`to_bytes()` 同样执行该内层规范重编码比对——构造器对 `body` 不透明，但序列化时若 `body` 不是规范紧凑 JSON（非 JSON、带空白或非规范拼写）则抛 `ValueError`，且实例已冻结、绝不以重编码结果改写 `body`。`from_bytes(data)` 只收 `bytes`（其他类型抛 `ValueError`），**不校验 MAC**——用 `audit_cert_evidence` 配合 root 才验签。
 
 `locate_cert_evidence(records, point, context, trusts, root)` 的参数就是不带撤销选项的 `locate_cert`（可撤销的运行不应被冻结进长期证据）：先按与 `locate_cert` 相同的混输规则物化记录与信任（对象/字节、生成器均可），再原样跑一遍 `locate_cert`，故全部既有契约与异常（`root` 非 bytes 抛 `TypeError`、空 bytes 与其余违约抛 `ValueError`）保持不变。成功后把参与记录按 id 排序、信任按同 id 序对齐，二者取各自规范字节编码的小写十六进制放入 `records`/`trusts`，点、用途与 `Consensus`（`rejected` 转字典序数组）组成 `body`，并计算 `mac = HMAC-SHA256(root, b"NPCCE1" + body)`——前缀与 `body` 直接拼接，无分隔符、无长度前缀；结果与输入顺序无关，函数纯计算。
 
@@ -423,6 +428,36 @@ evidence = locate_cert_evidence(records, (0.0, 0.0), context, trusts, root)
 blob = evidence.to_bytes()                 # 可持久化或分发
 consensus = audit_cert_evidence(blob, root)
 consensus.accepted                         # True
+```
+
+### CRL 快照证明 `CrlProof`、`prove_crl` 与 `audit_proof`
+
+`CrlProof(version, body, mac)` 是根密钥 MAC 的冻结 **CRL 快照证明**，把一次带签名撤销快照的 `locate_cert` 运行的查询、全部参与项、快照本体、`now`/`min` 与共识结果封装成可长期保存的自证快照：字段契约、冻结/相等/位置构造语义与 `CertifiedConsensusEvidence` 完全相同（`version=1`；`body` 为 `bytes`；`mac` 恰 32 字节 `bytes`；违约抛 `ValueError`）。
+
+**双层紧凑 JSON**。外层与共识证据相同：单个紧凑 UTF-8 JSON 文档，键序固定 `version, body, mac`，`body`/`mac` 为小写十六进制，无空白、无长度前缀。`body` 解码后必须恰为数组 `[point, context, records, trusts, crl, now, min, consensus]`：
+
+- `point` 同共识证据：恰好两个有限、非布尔数的裸 JSON 数组；
+- `context` 为非空字符串；
+- `records`/`trusts` 同共识证据：参与记录/信任的规范小写 hex 数组，按参与项 id 升序、同索引按 id 一一对应；
+- `crl` 为一个小写规范十六进制字符串，解码后是合规的 `TrustRevocationList.to_bytes()` 编码；
+- `now` 为有限、非布尔数（生产时以 `float(now)` 写入），`min` 为非布尔整数；
+- `consensus` 为 `[total, support, rejected, accepted]`，规则同共识证据。
+
+内层 `body` 的规范重编码逐字节比对、`to_bytes()` 不改写非规范 `body`、`from_bytes()` 只收 `bytes` 且不验 MAC 等规则均与 `CertifiedConsensusEvidence` 一致。
+
+`prove_crl(records, point, context, trusts, root, crl, *, now, min=0)` 按 `locate_cert` 的**签名快照路径**（`revocations=crl`、`now` 必填、`min` 默认 `0`，二者仅限关键字）求共识：`crl` 收 `TrustRevocationList` 对象或其规范字节；快照先经 `audit_crl` 整体审核（双层 MAC、`issued_at <= now`、`sequence >= min`），命中项永久撤销参与证书，无关条目不影响共识。记录与信任按与 `locate_cert` 相同的混输规则物化后再运行，故结果与输入顺序无关、函数纯计算。成功后参与记录按 id 升序、信任按同 id 序对齐，连同 `crl` 取各自规范字节编码的小写十六进制，与点、用途、`now`（float）、`min`、`Consensus`（`rejected` 转字典序数组）组成 `body`，并计算 `mac = HMAC-SHA256(root, b"NPCCE2" + body)`——前缀与 `body` 直接拼接，无定界符、无长度前缀。`root` 的契约与 `locate_cert` 相同：非 bytes 抛 `TypeError`，空 bytes 及其他违约抛 `ValueError`。
+
+`audit_proof(x, root) -> Consensus` 收证明对象或其规范字节（其他类型或不合契约的字节抛 `ValueError`）；`root` 必须是非空 `bytes`——类型错误抛 `TypeError`，空值抛 `ValueError`。它先用 root 恒时复核外层 MAC（`HMAC-SHA256(root, b"NPCCE2" + body)`），再按 `body` **重放快照路径**：先对所载 `crl`、`now`、`min` 跑一遍 `audit_crl`（列表层 `NPVRL1` 与每条 entry 的 `NPVR1` 双层 MAC、未来时间与序号下限全检），再以该快照对所载记录、信任、点、用途重跑 `locate_cert`；重算的 `Consensus` 必须与 `body` 所载逐字段相等，否则抛 `ValueError`。除 `root` 类型外的一切失败（包括重放过程中冒出的 `TypeError`）一律报为 `ValueError`。成功返回重算的 `Consensus`。
+
+```python
+from nearproof import make_crl, prove_crl, audit_proof
+
+crl = make_crl(revocations, 3, 100.0, root)
+proof = prove_crl(records, (0.0, 0.0), context, trusts, root, crl,
+                  now=100.0, min=3)
+blob = proof.to_bytes()                  # 可持久化或分发
+consensus = audit_proof(blob, root)
+consensus.accepted                       # True
 ```
 
 ### 观察撤销 `ObservationRevocation` 与 `revoke_observation`
