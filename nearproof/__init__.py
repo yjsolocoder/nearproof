@@ -2,7 +2,8 @@
 
 Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
 BitGuard / BitMap / BitMapHistoryAuditor / BitMapHistoryEvidence /
-BitMapHistoryEvidenceAuditor / BitMapUpdate / BitRound /
+BitMapHistoryEvidenceAuditor / BitMapHistoryJournalAuditor /
+BitMapHistoryJournalState / BitMapUpdate / BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
@@ -28,6 +29,7 @@ import hmac
 import json
 import math
 import os
+import struct
 import threading
 import time
 from collections.abc import Mapping
@@ -45,6 +47,8 @@ __all__ = [
     "BitMapHistoryAuditor",
     "BitMapHistoryEvidence",
     "BitMapHistoryEvidenceAuditor",
+    "BitMapHistoryJournalAuditor",
+    "BitMapHistoryJournalState",
     "BitMapUpdate",
     "BitRound",
     "BitSession",
@@ -141,6 +145,10 @@ _BIT_MAP_PREFIX = b"NPBL1"
 _BIT_MAP_UPDATE_PREFIX = b"NPBU1"
 # Domain separation prefix for the table-history evidence MAC.
 _BIT_MAP_HISTORY_PREFIX = b"NPBH1"
+# Domain separation prefix for the history-journal state MAC.
+_BIT_MAP_JOURNAL_PREFIX = b"NPBJ1"
+# Domain separation prefix for the history-journal digest chain.
+_BIT_MAP_JOURNAL_DIGEST_PREFIX = b"NPBJ2"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -4458,6 +4466,373 @@ class BitMapHistoryEvidenceAuditor:
                 )
             self._table = final
             return final
+
+
+_U64_BE = struct.Struct(">Q")
+
+
+def _u64be(value: int) -> bytes:
+    """Encode a non-bool u64 as a fixed 8-byte big-endian byte string."""
+    return _U64_BE.pack(value)
+
+
+def _bit_map_journal_state_content(
+    version: int, sequence: int, checkpoint: bytes, digest: bytes
+) -> bytes:
+    """The first four state fields in field order, concatenated directly with
+    no separator or length prefix: the 4-byte version word, the 8-byte
+    big-endian sequence word, the canonical :class:`BitMap` bytes and the
+    32-byte digest."""
+    return (
+        struct.pack(">I", version)
+        + _u64be(sequence)
+        + checkpoint
+        + digest
+    )
+
+
+def _bit_map_journal_state_mac(key: bytes, content: bytes) -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ1" + C)`` over the first four fields'
+    encoding ``C``; the prefix and ``C`` are concatenated directly with no
+    separator or length prefix."""
+    return hmac.new(
+        key, _BIT_MAP_JOURNAL_PREFIX + content, hashlib.sha256
+    ).digest()
+
+
+def _bit_map_journal_digest(
+    previous: bytes, sequence: int, evidence: bytes
+) -> bytes:
+    """``SHA256(b"NPBJ2" + d + u64be(n) + E)``: the prior 32-byte digest
+    (32 zero bytes before the first audited segment), the new sequence as
+    fixed 8-byte big-endian and the canonical
+    :meth:`BitMapHistoryEvidence.to_bytes` encoding of the segment, all
+    concatenated directly with no separator or length prefix."""
+    return hashlib.sha256(
+        _BIT_MAP_JOURNAL_DIGEST_PREFIX
+        + previous
+        + _u64be(sequence)
+        + evidence
+    ).digest()
+
+
+@dataclass(frozen=True)
+class BitMapHistoryJournalState:
+    """A key-MAC'd, digest-chained checkpoint of an audited
+    :class:`BitMapHistoryEvidence` stream.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer (the number of segments committed, so the first audited segment
+    advances it to ``1``); ``checkpoint`` the non-empty canonical
+    :meth:`BitMap.to_bytes` encoding of the stream's current frontier table;
+    ``digest`` exactly 32 bytes — the running
+    ``SHA256(b"NPBJ2" + d + u64be(n) + E)`` chain over the audited segments,
+    starting from 32 zero bytes; ``mac`` exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPBJ1" + C)`` where ``C`` is the direct
+    concatenation, in field order, of the first four fields: the 4-byte
+    big-endian version word, the fixed 8-byte big-endian sequence word, the
+    canonical checkpoint bytes and the digest, the prefix and ``C``
+    concatenated directly with no separator or length prefix.
+
+    The wire encoding of :meth:`to_bytes` is the same five fields in field
+    order, concatenated directly with no framing or length prefix: 4-byte
+    big-endian ``version``, fixed 8-byte big-endian ``sequence``, the
+    canonical :class:`BitMap` bytes (self-delimiting), and the fixed 32-byte
+    ``digest`` and ``mac``. Instances are frozen, constructed positionally in
+    field order and compare equal by their fields. A field of the wrong type
+    raises :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. The MAC is not verified at parse time. No key
+    material is stored.
+    """
+
+    version: int
+    sequence: int
+    checkpoint: bytes
+    digest: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "bit map history journal state version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError("bit map history journal state version must be 1")
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "bit map history journal state sequence must be a non-bool"
+                " integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "bit map history journal state sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        if not isinstance(self.checkpoint, bytes):
+            raise TypeError(
+                "bit map history journal state checkpoint must be bytes"
+            )
+        try:
+            BitMap.from_bytes(self.checkpoint)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "bit map history journal state checkpoint must be the"
+                " canonical BitMap encoding"
+            ) from error
+        for name in ("digest", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(
+                    f"bit map history journal state {name} must be bytes"
+                )
+            if len(value) != 32:
+                raise ValueError(
+                    f"bit map history journal state {name} must be exactly 32"
+                    " bytes"
+                )
+
+    def to_bytes(self) -> bytes:
+        """Encode the five fields directly in field order: 4-byte big-endian
+        version, fixed 8-byte big-endian sequence, the canonical
+        :class:`BitMap` checkpoint bytes, and the 32-byte digest and MAC — no
+        framing, no length prefix."""
+        return (
+            _bit_map_journal_state_content(
+                self.version, self.sequence, self.checkpoint, self.digest
+            )
+            + self.mac
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BitMapHistoryJournalState":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` only for input that is not ``bytes``;
+        raises :class:`ValueError` for everything else: a buffer shorter than
+        the fixed 4-byte version, 8-byte sequence and 32-byte digest/MAC
+        words, trailing bytes, ``version != 1``, a sequence outside the
+        non-bool u64 range, or a checkpoint that is not the canonical
+        :class:`BitMap` encoding. The MAC is not verified here — pass the
+        encoding to :class:`BitMapHistoryJournalAuditor` (or recompute
+        :func:`_bit_map_journal_state_mac` with the shared key) for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "bit map history journal state data must be bytes"
+            )
+        if len(data) < 4 + 8 + 32 + 32:
+            raise ValueError(
+                "bit map history journal state encoding is truncated"
+            )
+        version = int.from_bytes(data[:4], "big")
+        sequence = int.from_bytes(data[4:12], "big")
+        # The variable-length canonical BitMap checkpoint sits in the middle
+        # of the field sequence; the fixed 32-byte digest and MAC always
+        # trail it, so split them off the end and let BitMap.from_bytes
+        # delimit and validate the checkpoint.
+        checkpoint = data[12:-64]
+        digest = data[-64:-32]
+        mac = data[-32:]
+        if version != 1:
+            raise ValueError(
+                "bit map history journal state version must be 1"
+            )
+        if not 0 <= sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "bit map history journal state sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        # Construct through the full field contract; the checkpoint parse and
+        # the digest/MAC length checks happen there.
+        return cls(
+            version=version,
+            sequence=sequence,
+            checkpoint=checkpoint,
+            digest=digest,
+            mac=mac,
+        )
+
+
+def _coerce_bit_map_history_journal_state(
+    state: object,
+) -> "Optional[BitMapHistoryJournalState]":
+    """Coerce a journal-state argument of :class:`BitMapHistoryJournalState`,
+    its canonical :meth:`BitMapHistoryJournalState.to_bytes` encoding, or
+    ``None``. The argument has the right *kind* (state/bytes/None), so any
+    field-shape failure surfacing while parsing its byte content is a value
+    error, exactly as the other checkpoint coercions do."""
+    if state is None:
+        return None
+    if isinstance(state, BitMapHistoryJournalState):
+        return state
+    if isinstance(state, bytes):
+        try:
+            return BitMapHistoryJournalState.from_bytes(state)
+        except TypeError as error:
+            raise ValueError(
+                "state does not satisfy the bit map history journal state"
+                " field contract"
+            ) from error
+    raise TypeError(
+        "state must be a BitMapHistoryJournalState instance, its canonical"
+        " bytes, or None"
+    )
+
+
+class BitMapHistoryJournalAuditor:
+    """Stateful auditor chaining attested :class:`BitMapHistoryEvidence`
+    segments into one MAC'd, digest-chained, restartable audit stream.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    shared key the tables, transition proofs, history evidence and journal
+    states are MAC'd with. ``state`` is keyword-only: ``None`` (the default)
+    starts a fresh stream — sequence ``0``, no checkpoint and a digest of 32
+    zero bytes; otherwise it must be a :class:`BitMapHistoryJournalState` or
+    its canonical :meth:`BitMapHistoryJournalState.to_bytes` encoding (any
+    other type raises :class:`TypeError`). A carried state is checked in
+    constant time at two layers: its checkpoint is re-audited as a
+    :class:`BitMap` against ``key`` (the ``NPBL1`` table MAC) and its own
+    ``NPBJ1`` state MAC is recomputed over the first four fields and
+    compared; a malformed or non-canonical encoding or either MAC mismatch
+    raises :class:`ValueError`. Across a restart the caller must pass the
+    value previously exported at :attr:`state`; nothing is persisted by the
+    auditor itself.
+
+    Each :meth:`audit` accepts a :class:`BitMapHistoryEvidence` or its
+    canonical :meth:`BitMapHistoryEvidence.to_bytes` encoding and, under the
+    auditor lock, re-verifies it with
+    :func:`audit_map_history_evidence` and demands its chain start exactly
+    where the stream currently stands: the empty string for a fresh stream,
+    else the current checkpoint's canonical :meth:`BitMap.to_bytes` output
+    byte for byte. On success the stream advances to ``n = sequence + 1``,
+    the checkpoint becomes the segment's final table and the digest becomes
+    ``SHA256(b"NPBJ2" + d + u64be(n) + E)`` over the segment's canonical
+    bytes ``E``; the new :class:`BitMapHistoryJournalState` is sealed with
+    ``HMAC-SHA256(key, b"NPBJ1" + C)``. Any parse, canonicity, MAC, chain,
+    start-match or sequence-overflow failure raises :class:`ValueError` and
+    leaves :attr:`state` untouched. Concurrent audits linearize in
+    lock-acquisition order: of competing segments chaining from the same
+    starting point only the first to commit succeeds, and a committed
+    segment is never lost.
+    """
+
+    def __init__(self, key: object, *, state: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        carried = _coerce_bit_map_history_journal_state(state)
+        if carried is None:
+            self._state: "Optional[BitMapHistoryJournalState]" = None
+            return
+        # The two MAC layers are both recomputed and compared in constant
+        # time: the carried checkpoint table under NPBL1, then the journal
+        # state itself under NPBJ1 over its first four fields.
+        table = BitMap.from_bytes(carried.checkpoint)
+        if not hmac.compare_digest(
+            _bit_map_mac(self._key, _bit_map_payload(table.entries)),
+            table.mac,
+        ):
+            raise ValueError(
+                "journal state checkpoint mac does not match the key"
+            )
+        content = _bit_map_journal_state_content(
+            carried.version,
+            carried.sequence,
+            carried.checkpoint,
+            carried.digest,
+        )
+        if not hmac.compare_digest(
+            _bit_map_journal_state_mac(self._key, content), carried.mac
+        ):
+            raise ValueError("journal state mac does not match the key")
+        self._state = carried
+
+    @property
+    def state(self) -> "Optional[BitMapHistoryJournalState]":
+        """The current :class:`BitMapHistoryJournalState`, or ``None`` before
+        the first successfully audited segment. The returned object is
+        frozen and the property read-only; persist its
+        :meth:`BitMapHistoryJournalState.to_bytes` output and pass it back to
+        a new auditor to survive a restart."""
+        return self._state
+
+    def audit(self, x: object) -> "BitMapHistoryJournalAuditor":
+        """Audit one :class:`BitMapHistoryEvidence` segment and advance.
+
+        ``x`` must be a :class:`BitMapHistoryEvidence` or its canonical
+        :meth:`BitMapHistoryEvidence.to_bytes` encoding — any other type
+        raises :class:`TypeError`; a malformed or non-canonical encoding, a
+        MAC mismatch, a failed carried update, an ``end`` that does not match
+        the audited chain, or a ``start`` that does not equal the current
+        checkpoint (the empty string for a fresh stream) raises
+        :class:`ValueError`. Verification, the start match and the state
+        advance run atomically under the auditor lock: a failed segment
+        changes nothing, concurrent segments serialize in lock-acquisition
+        order, and the sequence cannot overflow u64. On success the state is
+        replaced with sequence ``n = old + 1``, the segment's final table as
+        checkpoint, the chained ``NPBJ2`` digest and a fresh ``NPBJ1`` MAC,
+        and this auditor is returned.
+        """
+        # Parse outside the lock: a wrong-typed argument is a TypeError and a
+        # malformed encoding a ValueError, either way without touching state
+        # or serializing against another audit.
+        evidence = _coerce_bit_map_history_evidence(x, "x")
+        evidence_bytes = evidence.to_bytes()
+        with self._lock:
+            # The cryptographic re-verification runs inside the same lock as
+            # the start match and the advance, so verification and the state
+            # transition are one atomic step.
+            final = audit_map_history_evidence(evidence, self._key)
+            start, _, _ = _bit_map_history_body_parts(evidence.body)
+            current = (
+                b""
+                if self._state is None
+                else self._state.checkpoint
+            )
+            if start != current:
+                raise ValueError(
+                    "bit map history evidence start does not match the"
+                    " current journal checkpoint"
+                )
+            if self._state is None:
+                sequence = 1
+                previous = b"\x00" * 32
+            else:
+                sequence = self._state.sequence + 1
+                previous = self._state.digest
+            if sequence > 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    "bit map history journal sequence must fit in an unsigned"
+                    " 64-bit integer"
+                )
+            checkpoint = final.to_bytes()
+            digest = _bit_map_journal_digest(
+                previous, sequence, evidence_bytes
+            )
+            candidate = BitMapHistoryJournalState(
+                version=1,
+                sequence=sequence,
+                checkpoint=checkpoint,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._state = replace(
+                candidate,
+                mac=_bit_map_journal_state_mac(
+                    self._key,
+                    _bit_map_journal_state_content(
+                        candidate.version,
+                        candidate.sequence,
+                        candidate.checkpoint,
+                        candidate.digest,
+                    ),
+                ),
+            )
+            return self
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
