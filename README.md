@@ -73,6 +73,10 @@ python3 -m nearproof
 - `BitMapHistoryJournalAuditor(key, *, state=None)` — 把 `BitMapHistoryEvidence` 段链接成带序号与摘要链的单调日志的带状态审计器；`key` 为非空 `bytes`（错型抛 `TypeError`，空值抛 `ValueError`）；`state` 收 `BitMapHistoryJournalState` 或其规范字节或 `None`，非空时恒时复核双层 MAC（checkpoint 的 `NPBL1` 与状态自身的 `NPBJ1`，见下）
   - `audit(x) -> 本类` 收历史证据对象或其规范字节（余类型抛 `TypeError`）；锁内先按 `audit_map_history_evidence` 完整验链，再要求证据 `start` 与当前 checkpoint 逐字节相等（空状态须为 `""`），然后令 `n = 旧sequence+1`、新 checkpoint 为证据 `end`、新摘要 `d' = SHA256(b"NPBJ2"+d+u64be(n)+E)`（`d0` 为 32 个零字节，`u64be(n)` 为固定 8 字节大端，`E` 为证据规范字节，直拼无长度前缀），并对前四项重新 MAC 为 `NPBJ1`；任何失败抛 `ValueError` 且不改状态，并发按取锁顺序线性化
   - 只读 `state` 属性导出当前 `BitMapHistoryJournalState | None`（首次成功审计前为 `None`），重启时调用方须自行落盘并传回
+- `BitMapHistoryJournalBundle(version, start, evidences, end, mac)` — 把一段连续历史证据链连同其日志起止状态封进一条记录的防篡改冻结包（`version=1`；`start` 为规范 `BitMapHistoryJournalState` 字节或 `b""`（空起点）；`evidences` 为非空有序规范证据字节元组；`end` 为规范非空 `BitMapHistoryJournalState` 字节；`mac` 恰 32 字节，`mac=HMAC-SHA256(key, b"NPBJ3"+C)`，`C` 为前 4 项的字段序规范编码，直拼无长度前缀；位置构造、冻结、按字段相等；字段错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
+  - `to_bytes()` / `from_bytes(data)` — 字段序五元素紧凑 UTF-8 JSON 数组 `[1, start, E, end, mac]`，bytes 字段小写 hex（空起点为 `""`），`E` 为证据 hex 数组，无空白；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），其余不合契约（含非规范拼写）抛 `ValueError`，重编码须逐字节相等；不验 MAC（无论包的 `NPBJ3` 还是起止状态的 `NPBJ1`/`NPBL1` 都不验）
+- `seal_map_history_journal_bundle(evidences, key, *, state=None) -> BitMapHistoryJournalBundle` — 先按日志语义完整验链再封包；`state=None` 为空起点；错型抛 `TypeError`，余错抛 `ValueError`（见下）
+- `audit_map_history_journal_bundle(x, key) -> BitMapHistoryJournalState` — 恒时复核包的 `NPBJ3` MAC 与起止状态的双层 MAC，再逐段重放至 `end`（见下）
 - `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮已接受**上下文绑定**验证的防篡改记录（`version=1`，四个 bytes 字段均恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -437,6 +441,35 @@ auditor = BitMapHistoryJournalAuditor(key, state=saved)   # 恒时复核 NPBL1 �
 auditor.audit(evidence2)                    # sequence=2，d2=链(d1,2,E2)
 auditor.audit(evidence2)                    # 起点是 evidence1 的 end：ValueError，状态不变
 auditor.audit(old_fork)                     # 从旧起点分叉：ValueError，状态不变
+```
+
+### 历史证据日志打包 `BitMapHistoryJournalBundle`、`seal_map_history_journal_bundle` 与 `audit_map_history_journal_bundle`
+
+`BitMapHistoryJournalAuditor` 把证据段逐条链接进单调日志；而调用方常常需要把"从某个日志状态出发、连续若干段证据、到达某个新日志状态"这一整段旅程作为**一条可传输、可独立复核的记录**交给第三方。`BitMapHistoryJournalBundle` 就是这样的冻结包：`seal_map_history_journal_bundle` 验链并造包，`audit_map_history_journal_bundle` 验包并重放。
+
+`BitMapHistoryJournalBundle(version, start, evidences, end, mac)` 是冻结的共享密钥 MAC **日志打包记录**：位置构造、按字段相等，字段契约、编码规则与其余记录一致——`version=1`；`start` 为 `b""`（从空日志出发：sequence 0、无表、摘要链根为 `d0`）或**规范 `BitMapHistoryJournalState` 字节**（`BitMapHistoryJournalState.to_bytes()` 的输出）；`evidences` 为**非空有序**的规范 `BitMapHistoryEvidence` 字节元组，即要依次重放的段；`end` 为规范非空 `BitMapHistoryJournalState` 字节，即整段链重放完毕后的日志状态；`mac` 恰 32 字节。包 MAC 的定义为：
+
+- `mac = HMAC-SHA256(key, b"NPBJ3" + C)`，`C` 是**前 4 项**（`[1, start, E, end]`，bytes 字段小写 hex，`E` 为证据 hex 数组，去掉 `mac`）的字段序紧凑 UTF-8 编码；前缀与 `C` 直接拼接、无定界符、无长度前缀。记录本身不含密钥。
+
+`to_bytes()` 输出字段序五元素紧凑 UTF-8 JSON **数组** `[1, start, E, end, mac]`：`start`/`end`/`mac` 为小写 hex（空起点为 `""`），`E` 为各段证据的小写 hex 数组，无空白、无长度前缀。`from_bytes(data)` **仅收 `bytes`**（其他类型或字段错型抛 `TypeError`）：外层必须恰为五元数组且字段序如上，`version == 1`，`start` 须为空或解码为规范状态字节，`E` 须为非空数组且每项解码为规范证据字节，`end` 须解码为规范状态字节，`mac` 须解码为恰好 32 字节；解析后重编码须与输入逐字节相等，故格式化 JSON、空白与任何非规范拼写一律抛 `ValueError`。它**不验任何 MAC**——既不验包的 `NPBJ3`，也不验起止状态的 `NPBJ1`/`NPBL1`。
+
+`seal_map_history_journal_bundle(evidences, key, *, state=None)` 先验链再封包：
+
+- `evidences` 必须是非空可迭代对象，每项为 `BitMapHistoryEvidence` 或其规范字节；`key` 为非空 `bytes`；`state` 仅限关键字，`None`（默认）为空起点，否则收 `BitMapHistoryJournalState` 或其规范字节。不可迭代的 `evidences`、非 bytes 的 `key`、错型项或错型 `state` 抛 `TypeError`；空序列、空 key、编码不合规范、MAC 不符、段审计失败、序号溢出或链断裂抛 `ValueError`。
+- 整条链先按 `BitMapHistoryJournalAuditor` 的语义从给定状态完整审计一遍，全部通过才产出包：`start` 为起点（`state=None` 时 `b""`，否则为其规范字节），`evidences` 为各段规范字节（按序），`end` 为最终日志状态的规范字节，再以前四项算出 `NPBJ3` 包 MAC。封包不触碰任何审计器状态。
+
+`audit_map_history_journal_bundle(x, key)` 验包：`x` 收 `BitMapHistoryJournalBundle` 或其规范字节（其余类型抛 `TypeError`），`key` 为非空 `bytes`。先以 `key` 恒时复核包的 `NPBJ3` MAC，再对**起止两个状态各做双层 MAC 复核**（checkpoint 表的 `NPBL1` 与状态自身的 `NPBJ1`，两层都会重算且各用 `hmac.compare_digest` 比较后才统一判定），最后把携带的段**逐段重放**——`start` 为空时从空日志出发，否则从携带的起始状态出发，完全按 `BitMapHistoryJournalAuditor` 的语义审计每一段——重放的最终状态必须与包的 `end` **逐字节相等**。任何一步失败抛 `ValueError`；验包是纯检查，不触碰任何审计器状态、不返回部分结果，成功时返回重放到达的冻结 `BitMapHistoryJournalState`。
+
+```python
+bundle = seal_map_history_journal_bundle([evidence1, evidence2], key)
+blob = bundle.to_bytes()                     # 调用方自行传输/持久化
+
+# 接收方：
+final = audit_map_history_journal_bundle(blob, key)   # 返回末端 BitMapHistoryJournalState
+
+# 从既有日志状态出发的一段：
+bundle2 = seal_map_history_journal_bundle([evidence3], key, state=final)
+audit_map_history_journal_bundle(bundle2, key)        # 起止双层 MAC + 逐段重放
 ```
 
 ### 批量判定 `assess`
