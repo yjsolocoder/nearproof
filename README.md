@@ -37,7 +37,7 @@ python3 -m nearproof
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：JSON 对象的键必须恰好是十一个字段且各出现一次、顺序与字段顺序一致（重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
 - `Measurement(round_index, nonce, response, elapsed_seconds, distance_meters)`
 - `Observation(id, x, y, decision)` — 二维共识中一个验证者的冻结观察：`id` 为非空字符串，`(x, y)` 为非布尔有限数坐标，`decision` 为 `RangeDecision`（仅其有限非负的 `upper_bound` 参与共识，`accepted` 不参与）
-- `Prover(shared_key)` — `respond(challenge) -> bytes`（HMAC-SHA256 应答）；`reveal(challenge, context, opening) -> bytes` 用于上下文绑定轮次（见下）
+- `Prover(shared_key)` — `respond(challenge) -> bytes`（HMAC-SHA256 应答）；`reveal(challenge, context, opening) -> bytes` 用于上下文绑定轮次（见下）；`bit(t, d, i, b) -> bytes` 用于位挑战轮次（`t` 16 字节、`d` 32 字节、`i` 非布尔 u32、`b` 仅 0/1；见下）
 - `RangeDecision(sample_count, upper_bound, accepted)` — `assess` 的冻结结果：`sample_count` 统计全部输入样本（含离群点），`upper_bound` 为内点最大距离，`accepted` 表示其不超过 limit
 - `Verifier(shared_key, *, speed_mps=SPEED_OF_LIGHT_MPS, clock=time.perf_counter, replay_protection=False, challenge_ttl_seconds=None)`
   - `new_challenge(*, context=None, digest=None)` — 默认（均为 `None`）生成 16 字节随机 nonce，行为与旧版一致；成对传入 32 字节 `context`/`digest` 则签发上下文绑定挑战（要求 `replay_protection=True`，只传一个抛 `ValueError`）；配置有效期时按 `clock()` 记录签发时刻
@@ -45,10 +45,15 @@ python3 -m nearproof
   - `verify_evidence(challenge, response, started_at)` — 同 `verify` 的参数与语义，成功时返回 `Evidence`
   - `verify_bound(challenge, response, started_at, *, opening) -> BoundEvidence` — 仅限上下文绑定挑战的 `verify_evidence`（见下）
   - `measure(prover)` — 一次完整往返
+  - `bits(prover, context, opening, *, rounds=32, timeout=0.001) -> bytes` — 跑一场位挑战会话，返回 `BitEvidence.to_bytes()` 的字节证据；`context`/`opening` 各 32 字节（见下）
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
   - `clock` — 只读属性，暴露计时函数
 - `assess(samples, limit, *, key=None, min_samples=5) -> RangeDecision` — 基于一批轮次的稳健距离判定（见下）
 - `audit(evidence, key)` — 用共享密钥复核 `Evidence`（或其字节编码），返回对应的 `Measurement`
+- `BitEvidence(version, t, context, digest, opening, queries, speed, timeout, limit, mac)` — 一场已接受**位挑战**会话的防篡改记录（`version=1`；`t` 恰 16 字节，`context`/`opening`/`digest`/`mac` 各恰 32 字节，`queries` 非空、每项为 `(b, r, s, e)`；不含密钥；见下）
+  - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, t, C, D, O, Q, V, T, L, M]`，bytes 字段小写 hex
+  - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
+- `audit_b(x, k) -> float` — **仅收非空 bytes** 的证据字节与非空 bytes 密钥；恒时复核 `NPFB1` MAC，重算 `D`、逐位应答（按下标 i）、`0 <= e-s <= T` 与 `L = max(e-s)*V/2`，任何不符抛 `ValueError`，成功返回复算的 `L`（见下）
 - `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮已接受**上下文绑定**验证的防篡改记录（`version=1`，四个 bytes 字段均恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -240,6 +245,47 @@ from nearproof import revoke_context
 revocation = revoke_context(context, time.time(), key)
 blob = revocation.to_bytes()                     # 可持久化或传输
 # audit_bound_policy(bound, key, now=time.time(), revocations=[blob])
+```
+
+### 位挑战会话 `Prover.bit`、`Verifier.bits` 与 `audit_b`
+
+位挑战把一次距离边界证明冻结成一份自证字节记录。证明者侧只有一个新应答：`Prover.bit(t, d, i, b) -> bytes`，其中 `t` 必须恰 16 字节、`d` 恰 32 字节、`i` 为非布尔无符号 32 位整数（`0 .. 2^32-1`）、`b` 只能是整数 `0` 或 `1`（`bool`、浮点、其他取值一律 `ValueError`），返回
+
+```
+r = HMAC-SHA256(key, b"NPFR1" + t + u32be(i) + bytes([b]) + d)
+```
+
+`u32be` 为 4 字节大端无符号整数，各段直拼无长度前缀。
+
+`Verifier.bits(prover, context, opening, *, rounds=32, timeout=0.001) -> bytes` 跑一场会话并直接返回证据字节，**旧接口不变**：
+
+- `context`/`opening` 各须恰 32 字节 bytes；`rounds` 为 `1 .. 2^32` 的非布尔整数；`timeout` 为有限正的非布尔数（`bool`、0、负数、`inf`、`nan` 均拒）；
+- 会话开始生成随机 16 字节 `t`，计算 `D = SHA256(b"NPFC1" + C + O)`（C/O 即 context/opening）；
+- 每轮 `j` 随机抽取一个挑战位 `b`，先读时钟得 `s`，调用 `prover.bit(t, D, j, b)`（调用参数中的下标就是轮次下标，从 0 起），再读时钟得 `e`；对返回值恒时比对
+  `HMAC-SHA256(key, b"NPFR1" + t + u32be(j) + bytes([b]) + D)`，非恰 32 字节或不符即 `ValueError`；
+- 每轮往返 `R = e - s` 必须满足闭区间 `0 <= R <= T`（`T = float(timeout)`，两端边界相等均有效）；负耗时、超时、非有限时钟读数均 `ValueError`；
+- 距离上界 `L = max(R) * V / 2`，`V` 为该验证者的传播速度；`V`/`s`/`e`/`L` 均为有限 float，`L >= 0`。
+
+`prover` 只需提供可调用的 `bit(t, d, i, b)`（鸭子类型）；无可调用 `bit`、调用签名不符或应答错误一律 `ValueError`。
+
+证据为紧凑 UTF-8 JSON **数组**（沿用 Evidence 编码规范：无空白、bytes 为小写 hex、不允许 NaN/Infinity）：
+
+```
+A = [1, t, C, D, O, Q, V, T, L, M]
+Q = [[b, r, s, e], ...]          # 第 j 项的下标即 i = j，r 为小写 hex
+M = HMAC-SHA256(k, b"NPFB1" + E) # E = 去掉 M 的同一数组
+```
+
+`BitEvidence` 是该数组的冻结记录（按字段序位置构造、按字段相等），`to_bytes()` 产出现范字节；`from_bytes(data)` 仅收 bytes，要求恰为十个元素的数组、键位字段契约全部满足（`version==1`、各 bytes 字段长度、`b∈{0,1}` 且非 bool、数值有限非布尔、`T>0`、`L>=0`、`Q` 非空），并把解析结果重编码与输入**逐字节**比对——格式化 JSON、空白、整数时钟字面量等非规范写法一律 `ValueError`；它不校验 MAC。
+
+`audit_b(x, k) -> float` 的 `x`（证据）与 `k`（密钥）**都只收非空 bytes**：对象、`bytearray`、`str`、空值或其他类型一律 `ValueError`。它用 `k` 恒时复核 `NPFB1` MAC，再由原始字段重算全部各式：`D = SHA256(b"NPFC1"+C+O)`、每项在其下标 `i` 处的应答 `r`、闭区间 `0 <= e-s <= T`，以及 `L = max(e-s)*V/2`；任一处不符抛 `ValueError`，全部通过则返回复算的 `L`。审计是纯函数，不触碰任何验证者状态。
+
+```python
+from nearproof import Prover, Verifier, audit_b
+
+prover, verifier = Prover(key), Verifier(key)
+blob = verifier.bits(prover, context, opening, rounds=32, timeout=0.001)
+upper_bound = audit_b(blob, key)          # 复算通过则返回 L（米）
 ```
 
 ### 批量判定 `assess`

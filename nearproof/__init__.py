@@ -1,13 +1,15 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: AttestedObservation / BoundAttestedObservation / BoundEvidence /
+Public API: AttestedObservation / BitEvidence / BoundAttestedObservation /
+BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
 Evidence /
 Measurement / Observation / ObservationRevocation / Prover / RangeDecision
 / SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList / Verifier /
 VerifierTrust / assess / attest_observation /
-attest_observation_for_point / audit / audit_bound / audit_bound_policy /
+attest_observation_for_point / audit / audit_b / audit_bound /
+audit_bound_policy /
 audit_cert_evidence / audit_crl / audit_proof / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
@@ -30,6 +32,7 @@ from typing import Callable, Optional
 
 __all__ = [
     "AttestedObservation",
+    "BitEvidence",
     "BoundAttestedObservation",
     "BoundEvidence",
     "BoundEvidenceRevocation",
@@ -56,6 +59,7 @@ __all__ = [
     "attest_observation",
     "attest_observation_for_point",
     "audit",
+    "audit_b",
     "audit_bound",
     "audit_bound_policy",
     "audit_cert_evidence",
@@ -102,6 +106,14 @@ _CERT_EVIDENCE_PREFIX = b"NPCCE1"
 _CRL_PROOF_PREFIX = b"NPCCE2"
 # Domain separation prefix for the rollback-protection CRL-state MAC.
 _CRL_STATE_PREFIX = b"NPCK1"
+# Domain separation prefixes for the bit-challenge protocol: the transcript
+# digest, the per-bit response and the bit-evidence MAC respectively.
+_BIT_TRANSCRIPT_PREFIX = b"NPFC1"
+_BIT_RESPONSE_PREFIX = b"NPFR1"
+_BIT_EVIDENCE_PREFIX = b"NPFB1"
+# A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
+BIT_T_BYTES = 16
+BIT_R_BYTES = 32
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -955,6 +967,34 @@ def bound_response(
     return hmac.new(key, message, hashlib.sha256).digest()
 
 
+def bit_transcript_digest(context: bytes, opening: bytes) -> bytes:
+    """The bit-round transcript digest ``D = SHA256(b"NPFC1" + C + O)``.
+
+    ``C``/``O`` are fixed-width 32-byte values, concatenated directly after
+    the domain prefix with no separator or length prefix.
+    """
+    return hashlib.sha256(_BIT_TRANSCRIPT_PREFIX + context + opening).digest()
+
+
+def bit_response(
+    key: bytes, t: bytes, digest: bytes, index: int, bit: int
+) -> bytes:
+    """The response for one bit challenge.
+
+    ``r = HMAC-SHA256(key, b"NPFR1" + t + u32be(i) + bytes([b]) + d)`` with
+    ``i`` encoded as a fixed 4-byte unsigned big-endian integer, ``b`` a
+    single zero/one byte and ``d`` the 32-byte transcript digest ``D``.
+    """
+    message = (
+        _BIT_RESPONSE_PREFIX
+        + t
+        + int(index).to_bytes(4, byteorder="big", signed=False)
+        + bytes([bit])
+        + digest
+    )
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+
 class Prover:
     """Answers challenges with a keyed response."""
 
@@ -1001,6 +1041,29 @@ class Prover:
             raise ValueError(f"nonce must be exactly {NONCE_BYTES} bytes")
         digest = context_digest(context, opening)
         return bound_response(self._key, digest, round_index, challenge.nonce)
+
+    def bit(self, t: bytes, d: bytes, i: int, b: int) -> bytes:
+        """Answer one bit challenge as used by :meth:`Verifier.bits`.
+
+        Returns ``r = HMAC-SHA256(key, b"NPFR1" + t + u32be(i) +
+        bytes([b]) + d)``: ``t`` must be exactly 16 bytes, ``d`` exactly 32
+        bytes, ``i`` a non-bool unsigned 32-bit integer and ``b`` exactly
+        ``0`` or ``1`` (a bool is not accepted for either integer). Any
+        contract violation raises :class:`ValueError`.
+        """
+        if not isinstance(t, bytes) or len(t) != BIT_T_BYTES:
+            raise ValueError(f"t must be exactly {BIT_T_BYTES} bytes")
+        if not isinstance(d, bytes) or len(d) != DIGEST_BYTES:
+            raise ValueError(f"d must be exactly {DIGEST_BYTES} bytes")
+        if isinstance(i, bool) or type(i) is not int:
+            raise ValueError("i must be a non-bool integer")
+        if not 0 <= i <= 0xFFFFFFFF:
+            raise ValueError("i must fit in an unsigned 32-bit integer")
+        if type(b) is not int or b not in (0, 1):
+            # ``type`` excludes bools and floats (1.0 == 1 would otherwise
+            # satisfy the membership test); only the exact ints 0 and 1.
+            raise ValueError("b must be exactly 0 or 1")
+        return bit_response(self._key, t, d, i, b)
 
 
 class Verifier:
@@ -1489,6 +1552,392 @@ class Verifier:
         started_at = self._clock()
         response = prover.respond(challenge)
         return self.verify(challenge, response, started_at)
+
+    def bits(
+        self,
+        prover: object,
+        context: object,
+        opening: object,
+        *,
+        rounds: object = 32,
+        timeout: object = 0.001,
+    ) -> bytes:
+        """Run a bit-challenge session and return MAC'd :class:`BitEvidence`.
+
+        For each of ``rounds`` rounds the verifier draws a random challenge
+        bit, reads the clock (``s``), calls ``prover.bit(t, D, i, b)`` and
+        reads the clock again (``e``), then verifies the returned ``r`` in
+        constant time against
+        ``HMAC-SHA256(key, b"NPFR1" + t + u32be(i) + bytes([b]) + D)`` with
+        ``i`` equal to the round index. ``t`` is a fresh random 16-byte
+        transcript and ``D = SHA256(b"NPFC1" + context + opening)``;
+        ``context`` and ``opening`` must each be exactly 32 bytes.
+
+        Every round must satisfy ``0 <= e - s <= float(timeout)``; the
+        session's distance bound is ``L = max(e - s) * V / 2`` for the
+        verifier's propagation speed ``V``. The returned bytes are the
+        canonical :meth:`BitEvidence.to_bytes` encoding of
+        ``[1, t, C, D, O, Q, V, T, L, M]`` with
+        ``M = HMAC-SHA256(key, b"NPFB1" + E)`` over the same array without
+        ``M``.
+
+        ``rounds`` must be a non-bool integer in ``1 .. 2**32`` and
+        ``timeout`` a finite positive non-bool number. Every contract
+        violation — including a prover ``bit`` that is not callable or
+        returns anything other than the correct 32 bytes — raises
+        :class:`ValueError`.
+        """
+        if not isinstance(context, bytes) or len(context) != CONTEXT_BYTES:
+            raise ValueError(f"context must be exactly {CONTEXT_BYTES} bytes")
+        if not isinstance(opening, bytes) or len(opening) != OPENING_BYTES:
+            raise ValueError(f"opening must be exactly {OPENING_BYTES} bytes")
+        if isinstance(rounds, bool) or type(rounds) is not int:
+            raise ValueError("rounds must be a non-bool integer")
+        # The range is closed at 2**32; round indices still fit a u32
+        # because they run 0 .. rounds-1.
+        if not 1 <= rounds <= 2**32:
+            raise ValueError("rounds must be in the range 1 .. 2**32")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise ValueError("timeout must be a finite positive number")
+        limit_time = float(timeout)
+        if not math.isfinite(limit_time) or limit_time <= 0:
+            raise ValueError("timeout must be a finite positive number")
+        if not math.isfinite(self._speed):
+            raise ValueError("speed_mps must be finite to record bit evidence")
+        answer = getattr(prover, "bit", None)
+        if not callable(answer):
+            raise ValueError("prover must provide a callable bit(t, d, i, b)")
+
+        transcript = os.urandom(BIT_T_BYTES)
+        digest = bit_transcript_digest(context, opening)
+        queries: list[tuple[int, bytes, float, float]] = []
+        durations: list[float] = []
+        for index in range(rounds):
+            bit_value = os.urandom(1)[0] & 1
+            start = self._clock()
+            try:
+                response = answer(transcript, digest, index, bit_value)
+            except TypeError as error:
+                # The prover interface is bit(t, d, i, b); a callable that
+                # cannot be invoked with those four arguments violates the
+                # entry contract like any other malformed prover.
+                raise ValueError("prover bit must be callable as bit(t, d, i, b)") from error
+            end = self._clock()
+            for label, reading in (("s", start), ("e", end)):
+                if isinstance(reading, bool) or not isinstance(
+                    reading, (int, float)
+                ):
+                    raise ValueError("clock readings must be finite numbers")
+            if not isinstance(response, bytes) or len(response) != BIT_R_BYTES:
+                raise ValueError("prover bit response must be exactly 32 bytes")
+            expected = bit_response(
+                self._key, transcript, digest, index, bit_value
+            )
+            if not hmac.compare_digest(expected, response):
+                raise ValueError("prover bit response does not match the challenge")
+            start_f = float(start)
+            end_f = float(end)
+            if not math.isfinite(start_f) or not math.isfinite(end_f):
+                raise ValueError("clock readings must be finite numbers")
+            duration = end_f - start_f
+            if not 0.0 <= duration <= limit_time:
+                raise ValueError("bit round trip must satisfy 0 <= e - s <= timeout")
+            queries.append((bit_value, response, start_f, end_f))
+            durations.append(duration)
+        bound = max(durations) * self._speed / 2.0
+        if not math.isfinite(bound) or bound < 0:
+            raise ValueError("computed distance bound must be finite and non-negative")
+
+        record = BitEvidence(
+            version=1,
+            t=transcript,
+            context=context,
+            digest=digest,
+            opening=opening,
+            queries=tuple(queries),
+            speed=self._speed,
+            timeout=limit_time,
+            limit=bound,
+            mac=b"\x00" * 32,
+        )
+        return replace(
+            record, mac=_bit_evidence_mac(self._key, _bit_evidence_payload(record))
+        ).to_bytes()
+
+
+def _bit_evidence_payload(record: "BitEvidence") -> list:
+    """The JSON-ready bit-evidence array ``E``: ``A`` without its MAC ``M``.
+
+    Each query is encoded as ``[b, r, s, e]`` with ``r`` a lowercase hex
+    string and the clock readings JSON numbers.
+    """
+    return [
+        record.version,
+        record.t.hex(),
+        record.context.hex(),
+        record.digest.hex(),
+        record.opening.hex(),
+        [[b, r.hex(), s, e] for b, r, s, e in record.queries],
+        record.speed,
+        record.timeout,
+        record.limit,
+    ]
+
+
+def _bit_evidence_mac(key: bytes, payload: list) -> bytes:
+    """``HMAC-SHA256(key, b"NPFB1" + E)`` over the canonical array ``E``."""
+    return hmac.new(
+        key, _BIT_EVIDENCE_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+@dataclass(frozen=True)
+class BitEvidence:
+    """A tamper-evident record of one accepted :meth:`Verifier.bits` session.
+
+    The canonical encoding is a compact UTF-8 JSON array in field order::
+
+        [1, t, C, D, O, Q, V, T, L, M]
+
+    ``version`` is always ``1``; ``t`` is 16 bytes; ``context`` (``C``),
+    ``opening`` (``O``), ``digest`` (``D``) and ``mac`` (``M``) are each
+    exactly 32 bytes with
+    ``D = SHA256(b"NPFC1" + C + O)``; ``Q`` is a tuple of
+    ``(b, r, s, e)`` query records (challenge bit, 32-byte response and the
+    two clock readings) whose round index is their tuple position;
+    ``V``/``T``/``L`` are finite non-bool floats (the speed, the timeout and
+    ``L = max(e - s) * V / 2``, always non-negative). ``M`` is
+    ``HMAC-SHA256(key, b"NPFB1" + E)`` over the same array without ``M``.
+    Any contract violation raises :class:`ValueError` at construction time.
+    No key material is stored.
+    """
+
+    version: int
+    t: bytes
+    context: bytes
+    digest: bytes
+    opening: bytes
+    queries: tuple
+    speed: float
+    timeout: float
+    limit: float
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("bit evidence version must be 1")
+        if not isinstance(self.t, bytes) or len(self.t) != BIT_T_BYTES:
+            raise ValueError(f"bit evidence t must be exactly {BIT_T_BYTES} bytes")
+        for name in ("context", "opening", "digest", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes) or len(value) != 32:
+                raise ValueError(f"bit evidence {name} must be exactly 32 bytes")
+        if not isinstance(self.queries, tuple) or not self.queries:
+            raise ValueError("bit evidence queries must be a non-empty tuple")
+        for position, query in enumerate(self.queries):
+            if not isinstance(query, tuple) or len(query) != 4:
+                raise ValueError(
+                    "bit evidence each query must be a (b, r, s, e) tuple"
+                )
+            bit_value, response, start, end = query
+            if type(bit_value) is not int or bit_value not in (0, 1):
+                raise ValueError("bit evidence challenge bits must be 0 or 1")
+            if not isinstance(response, bytes) or len(response) != BIT_R_BYTES:
+                raise ValueError("bit evidence response must be exactly 32 bytes")
+            for label, reading in (("s", start), ("e", end)):
+                if isinstance(reading, bool) or not isinstance(
+                    reading, (int, float)
+                ) or not math.isfinite(reading):
+                    raise ValueError(
+                        f"bit evidence clock reading {label} must be a finite"
+                        " non-bool number"
+                    )
+        for name in ("speed", "timeout", "limit"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"bit evidence {name} must be a finite number")
+            if not math.isfinite(value):
+                raise ValueError(f"bit evidence {name} must be a finite number")
+        if self.timeout <= 0:
+            raise ValueError("bit evidence timeout must be positive")
+        if self.limit < 0:
+            raise ValueError("bit evidence limit must be non-negative")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the array
+        ``[1, t, C, D, O, Q, V, T, L, M]``, byte fields as lowercase hex,
+        no whitespace, no NaN/Infinity."""
+        payload = _bit_evidence_payload(self)
+        payload.append(self.mac.hex())
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BitEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: an array of exactly ten elements in field
+        order, ``version == 1``, lowercase hex for the byte fields (``t``
+        decoding to 16 bytes, the other four to 32 each), a non-empty array
+        of ``[b, r, s, e]`` queries with ``b`` in ``{0, 1}``, ``r`` a
+        32-byte lowercase hex string and ``s``/``e`` finite non-bool
+        numbers, and finite non-bool numbers for ``V``/``T``/``L`` with a
+        positive ``T`` and non-negative ``L``. After parsing and validation
+        the record is re-encoded and the result must equal the input byte
+        for byte. The MAC is not verified here — use :func:`audit_b` with
+        the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("bit evidence data must be bytes")
+        try:
+            decoded = json.loads(data)
+        except ValueError as error:
+            raise ValueError(f"bit evidence is not valid JSON: {error}") from error
+        record = _parse_bit_evidence(decoded)
+        if record.to_bytes() != data:
+            raise ValueError("bit evidence encoding is not canonical")
+        return record
+
+
+def _parse_bit_evidence_hex(value: object, name: str, length: int) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"bit evidence {name} must be a lowercase hex string")
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"bit evidence {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value or len(raw) != length:
+        raise ValueError(
+            f"bit evidence {name} must be a lowercase hex string of exactly"
+            f" {length} bytes"
+        )
+    return raw
+
+
+def _parse_bit_evidence_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"bit evidence {name} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"bit evidence {name} must be a finite number")
+    return number
+
+
+def _parse_bit_evidence(decoded: object) -> "BitEvidence":
+    if not isinstance(decoded, list) or len(decoded) != 10:
+        raise ValueError(
+            "bit evidence must be a JSON array of exactly version, t, C, D,"
+            " O, Q, V, T, L and M"
+        )
+    (
+        raw_version,
+        raw_t,
+        raw_context,
+        raw_digest,
+        raw_opening,
+        raw_queries,
+        raw_speed,
+        raw_timeout,
+        raw_limit,
+        raw_mac,
+    ) = decoded
+    version = _parse_int_field(raw_version, "version")
+    if version != 1:
+        raise ValueError("bit evidence version must be 1")
+    t = _parse_bit_evidence_hex(raw_t, "t", BIT_T_BYTES)
+    context = _parse_bit_evidence_hex(raw_context, "C", CONTEXT_BYTES)
+    digest = _parse_bit_evidence_hex(raw_digest, "D", DIGEST_BYTES)
+    opening = _parse_bit_evidence_hex(raw_opening, "O", OPENING_BYTES)
+    mac = _parse_bit_evidence_hex(raw_mac, "M", 32)
+    if not isinstance(raw_queries, list) or not raw_queries:
+        raise ValueError("bit evidence Q must be a non-empty array")
+    queries: list[tuple[int, bytes, float, float]] = []
+    for raw_query in raw_queries:
+        if not isinstance(raw_query, list) or len(raw_query) != 4:
+            raise ValueError(
+                "bit evidence each query must be an array of exactly b, r, s"
+                " and e"
+            )
+        raw_bit, raw_response, raw_start, raw_end = raw_query
+        # JSON booleans must be distinguished from the integer challenge bit
+        # 0/1; true/false are shape violations here.
+        if isinstance(raw_bit, bool) or type(raw_bit) is not int:
+            raise ValueError("bit evidence b must be 0 or 1")
+        if raw_bit not in (0, 1):
+            raise ValueError("bit evidence b must be 0 or 1")
+        response = _parse_bit_evidence_hex(raw_response, "r", BIT_R_BYTES)
+        start = _parse_bit_evidence_number(raw_start, "s")
+        end = _parse_bit_evidence_number(raw_end, "e")
+        queries.append((raw_bit, response, start, end))
+    speed = _parse_bit_evidence_number(raw_speed, "V")
+    timeout = _parse_bit_evidence_number(raw_timeout, "T")
+    limit = _parse_bit_evidence_number(raw_limit, "L")
+    return BitEvidence(
+        version=version,
+        t=t,
+        context=context,
+        digest=digest,
+        opening=opening,
+        queries=tuple(queries),
+        speed=speed,
+        timeout=timeout,
+        limit=limit,
+        mac=mac,
+    )
+
+
+def audit_b(x: object, k: object) -> float:
+    """Re-verify a :class:`BitEvidence` byte record against the shared key.
+
+    ``x`` is the canonical :meth:`BitEvidence.to_bytes` encoding and ``k``
+    the shared key; both must be non-empty ``bytes`` and nothing else — a
+    :class:`BitEvidence` instance, ``bytearray``, ``str`` or empty value
+    all raise :class:`ValueError`, as does every other contract violation.
+    Every cryptographic and ranging check is recomputed from scratch and
+    compared in constant time:
+
+    - the MAC: ``M == HMAC-SHA256(k, b"NPFB1" + E)``;
+    - the transcript digest: ``D == SHA256(b"NPFC1" + C + O)``;
+    - each response, at its tuple index ``i``:
+      ``r == HMAC-SHA256(k, b"NPFR1" + t + u32be(i) + bytes([b]) + D)``;
+    - each round trip ``R = e - s`` must satisfy ``0 <= R <= T``;
+    - the bound: ``L == max(R) * V / 2``.
+
+    On success the recomputed bound ``L`` is returned. Auditing is a pure
+    check: it touches no verifier state.
+    """
+    if not isinstance(x, bytes) or not x:
+        raise ValueError("x must be non-empty bytes")
+    if not isinstance(k, bytes) or not k:
+        raise ValueError("k must be non-empty bytes")
+    record = BitEvidence.from_bytes(x)
+
+    if not hmac.compare_digest(
+        _bit_evidence_mac(k, _bit_evidence_payload(record)), record.mac
+    ):
+        raise ValueError("bit evidence mac does not match")
+    if not hmac.compare_digest(
+        bit_transcript_digest(record.context, record.opening), record.digest
+    ):
+        raise ValueError("bit evidence digest does not match context and opening")
+    durations = []
+    for index, (bit_value, response, start, end) in enumerate(record.queries):
+        if not hmac.compare_digest(
+            bit_response(k, record.t, record.digest, index, bit_value), response
+        ):
+            raise ValueError("bit evidence response does not match the challenge")
+        duration = end - start
+        if not 0.0 <= duration <= record.timeout:
+            raise ValueError(
+                "bit evidence round trip must satisfy 0 <= e - s <= timeout"
+            )
+        durations.append(duration)
+    bound = max(durations) * record.speed / 2.0
+    if bound != record.limit:
+        raise ValueError("bit evidence limit does not match the round trips and speed")
+    return bound
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
