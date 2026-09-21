@@ -11,7 +11,8 @@ Measurement / Observation / ObservationRevocation / Prover / RangeDecision
 VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_b / audit_bound /
 audit_bound_policy /
-audit_cert_evidence / audit_crl / audit_map_update / audit_proof / cert / locate /
+audit_cert_evidence / audit_crl / audit_map_history / audit_map_update /
+audit_proof / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
 revoke_context / revoke_observation / revoke_trust.
@@ -73,6 +74,7 @@ __all__ = [
     "audit_bound_policy",
     "audit_cert_evidence",
     "audit_crl",
+    "audit_map_history",
     "audit_map_update",
     "audit_proof",
     "cert",
@@ -3743,6 +3745,28 @@ class BitGate:
         )
 
 
+def _coerce_bit_map_update(x: object, name: str) -> "BitMapUpdate":
+    """Coerce a :class:`BitMapUpdate` or its canonical bytes, splitting the
+    TypeError/ValueError contract exactly as the public auditors do: the
+    wrong kind of argument raises :class:`TypeError`, a field-shape failure
+    surfacing while parsing byte content of the right kind is a value
+    error."""
+    if isinstance(x, BitMapUpdate):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return BitMapUpdate.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the bit map update field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a BitMapUpdate instance or its canonical bytes"
+    )
+
+
 def audit_map_update(x: object, key: object) -> None:
     """Re-verify a :class:`BitMapUpdate` transition proof against ``key``.
 
@@ -3757,24 +3781,13 @@ def audit_map_update(x: object, key: object) -> None:
     table unchanged: the table is identical before and after (an accepted
     replay), exactly one entry is added, or exactly one entry keeps its
     ``sid`` while its ``seq`` strictly increases and its ``hash`` changes.
+    When ``before`` is ``b""`` — no table existed yet — the transition
+    creates the very first partition, so the ``after`` table must hold
+    exactly one entry; an empty or multi-entry initial table is rejected.
     Auditing is a pure check: it touches no gate state and returns
     ``None``.
     """
-    if isinstance(x, BitMapUpdate):
-        update = x
-    elif isinstance(x, bytes):
-        try:
-            update = BitMapUpdate.from_bytes(x)
-        except TypeError as error:
-            # The argument had the right kind; a field-shape failure
-            # surfacing while parsing its byte content is a value error.
-            raise ValueError(
-                "x does not satisfy the bit map update field contract"
-            ) from error
-    else:
-        raise TypeError(
-            "x must be a BitMapUpdate instance or its canonical bytes"
-        )
+    update = _coerce_bit_map_update(x, "x")
     if not isinstance(key, bytes):
         raise TypeError("key must be bytes")
     if not key:
@@ -3799,6 +3812,14 @@ def audit_map_update(x: object, key: object) -> None:
     ):
         raise ValueError("bit map update after table mac does not match")
     after_entries = after_table.entries
+    if not update.before and len(after_entries) != 1:
+        # No table existed before: the transition creates the very first
+        # partition, so the after table must hold exactly one entry — an
+        # empty or multi-entry initial table is not a valid start.
+        raise ValueError(
+            "bit map update with no before table must create exactly one"
+            " entry"
+        )
     if after_entries == before_entries:
         # The identical table: an accepted replay attested as a no-op.
         return None
@@ -3838,6 +3859,86 @@ def audit_map_update(x: object, key: object) -> None:
         "bit map update must keep the table, add exactly one entry or"
         " advance exactly one entry"
     )
+
+
+def audit_map_history(
+    updates: object, key: object, *, checkpoint: object = None
+) -> "BitMap":
+    """Re-verify a contiguous chain of :class:`BitMapUpdate` proofs.
+
+    ``updates`` must be a non-empty iterable whose items are each a
+    :class:`BitMapUpdate` or its canonical :meth:`BitMapUpdate.to_bytes`
+    encoding, and ``key`` the non-empty shared ``bytes`` key.
+    ``checkpoint`` is keyword-only: ``None`` (the default) starts the chain
+    from no table at all, otherwise it must be a :class:`BitMap` or its
+    canonical :meth:`BitMap.to_bytes` encoding. A non-iterable ``updates``,
+    a non-``bytes`` ``key``, a wrong-typed item or a wrong-kind
+    ``checkpoint`` raises :class:`TypeError`; an empty sequence, an empty
+    key, a malformed or non-canonical encoding, a MAC mismatch or any
+    failed per-update audit raises :class:`ValueError`.
+
+    When a checkpoint is given, its ``NPBL1`` MAC is recomputed with
+    ``key`` and compared in constant time and its canonical
+    :meth:`BitMap.to_bytes` encoding is the starting point of the chain;
+    with ``checkpoint=None`` the starting point is ``b""`` and the first
+    update must attest the creation of the first partition. Every update
+    is audited with :func:`audit_map_update` and must chain byte for byte:
+    the first ``before`` must equal the starting point and every later
+    ``before`` must equal the previous ``after``, so a gap or a reordered
+    proof is rejected. Auditing is a pure check: it touches no gate state
+    and returns no partial result — on success the frozen :class:`BitMap`
+    of the final ``after`` is returned.
+    """
+    try:
+        items = list(updates)  # type: ignore[arg-type]
+    except TypeError:
+        raise TypeError(
+            "updates must be an iterable of BitMapUpdate instances or"
+            " their canonical bytes"
+        ) from None
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if isinstance(checkpoint, BitMap):
+        start_table = checkpoint
+    elif isinstance(checkpoint, bytes):
+        try:
+            start_table = BitMap.from_bytes(checkpoint)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                "checkpoint does not satisfy the bit map field contract"
+            ) from error
+    elif checkpoint is not None:
+        raise TypeError(
+            "checkpoint must be a BitMap instance, its canonical bytes,"
+            " or None"
+        )
+    else:
+        start_table = None
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not items:
+        raise ValueError("updates must be a non-empty sequence")
+    if start_table is None:
+        current = b""
+    else:
+        if not hmac.compare_digest(
+            _bit_map_mac(key, _bit_map_payload(start_table.entries)),
+            start_table.mac,
+        ):
+            raise ValueError("checkpoint mac does not match the key")
+        current = start_table.to_bytes()
+    for item in items:
+        update = _coerce_bit_map_update(item, "updates items")
+        audit_map_update(update, key)
+        if update.before != current:
+            raise ValueError(
+                "bit map history is not contiguous: each update before"
+                " must equal the previous after"
+            )
+        current = update.after
+    return BitMap.from_bytes(current)
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:

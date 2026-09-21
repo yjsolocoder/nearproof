@@ -22,6 +22,7 @@ from nearproof import (
     _bit_state_mac,
     _bit_state_sid,
     _encode_payload,
+    audit_map_history,
     audit_map_update,
 )
 
@@ -436,6 +437,144 @@ class AuditMapUpdateTest(unittest.TestCase):
             audit_map_update(
                 update_for(ONE_MAP, EMPTY_MAP).to_bytes(), KEY
             )
+
+    def test_no_before_table_requires_exactly_one_entry(self):
+        # The initial transition creates the first partition: exactly one
+        # entry in the after table.
+        self.assertIsNone(audit_map_update(update_for(b"", ONE_MAP), KEY))
+        # An empty initial table is not a valid start, even though the
+        # no-op shape would otherwise read as an accepted replay.
+        with self.assertRaises(ValueError):
+            audit_map_update(update_for(b"", EMPTY_MAP), KEY)
+        # Two partitions cannot be created by a single initial transition.
+        with self.assertRaises(ValueError):
+            audit_map_update(update_for(b"", TWO_MAP), KEY)
+        # The boundary is b"" (no table yet), not the empty-table encoding:
+        # a replay of the empty table stays a valid no-op.
+        self.assertIsNone(
+            audit_map_update(update_for(EMPTY_MAP, EMPTY_MAP), KEY)
+        )
+
+
+class AuditMapHistoryTest(unittest.TestCase):
+    def chain(self):
+        """A valid three-transition history: create, insert, advance."""
+        first = update_for(b"", ONE_MAP)
+        second = update_for(ONE_MAP, TWO_MAP)
+        advanced = map_bytes_for(((SID_A, 1, HASH_1), (SID_B, 5, HASH_3)))
+        third = update_for(TWO_MAP, advanced)
+        return [first, second, third], BitMap.from_bytes(advanced)
+
+    def test_valid_chain_returns_final_table(self):
+        updates, final = self.chain()
+        result = audit_map_history(updates, KEY)
+        self.assertIsInstance(result, BitMap)
+        self.assertEqual(result, final)
+        self.assertEqual(result.to_bytes(), updates[-1].after)
+
+    def test_items_may_mix_objects_and_bytes(self):
+        updates, final = self.chain()
+        mixed = [updates[0].to_bytes(), updates[1], updates[2].to_bytes()]
+        self.assertEqual(audit_map_history(mixed, KEY), final)
+        # Any iterable works, not just a list.
+        self.assertEqual(audit_map_history(iter(mixed), KEY), final)
+
+    def test_single_update_chain(self):
+        result = audit_map_history([update_for(b"", ONE_MAP)], KEY)
+        self.assertEqual(result, BitMap.from_bytes(ONE_MAP))
+
+    def test_replay_links_are_accepted(self):
+        updates, _ = self.chain()
+        replayed = update_for(ONE_MAP, ONE_MAP)
+        result = audit_map_history([updates[0], replayed, updates[1]], KEY)
+        self.assertEqual(result, BitMap.from_bytes(TWO_MAP))
+
+    def test_checkpoint_object_and_bytes_start_the_chain(self):
+        updates, final = self.chain()
+        tail = updates[1:]
+        checkpoint = BitMap.from_bytes(ONE_MAP)
+        self.assertEqual(
+            audit_map_history(tail, KEY, checkpoint=checkpoint), final
+        )
+        self.assertEqual(
+            audit_map_history(tail, KEY, checkpoint=ONE_MAP), final
+        )
+
+    def test_checkpoint_mac_verified(self):
+        updates, _ = self.chain()
+        with self.assertRaises(ValueError):
+            audit_map_history(
+                updates[1:], KEY,
+                checkpoint=map_for_entries(
+                    ((SID_A, 1, HASH_1),), key=OTHER_KEY
+                ),
+            )
+        with self.assertRaises(ValueError):
+            audit_map_history(updates, KEY, checkpoint=ONE_MAP)
+
+    def test_wrong_types_raise_type_error(self):
+        updates, _ = self.chain()
+        for bad in ("x", 1, None, object(), updates[0]):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                audit_map_history(bad, KEY)
+        for bad in ("x", 1, None, [], {}, bytearray(KEY)):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                audit_map_history(updates, bad)
+        for bad in ("x", 1, [], {}, bytearray(ONE_MAP)):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                audit_map_history(updates, KEY, checkpoint=bad)
+        for bad_item in ("x", 1, None, [], {}, object()):
+            with self.assertRaises(TypeError, msg=repr(bad_item)):
+                audit_map_history([updates[0], bad_item], KEY)
+
+    def test_empty_sequence_and_empty_key_raise_value_error(self):
+        updates, _ = self.chain()
+        with self.assertRaises(ValueError):
+            audit_map_history([], KEY)
+        with self.assertRaises(ValueError):
+            audit_map_history(updates, b"")
+
+    def test_malformed_bytes_raise_value_error(self):
+        updates, _ = self.chain()
+        with self.assertRaises(ValueError):
+            audit_map_history([updates[0], b"not json"], KEY)
+        with self.assertRaises(ValueError):
+            audit_map_history(updates[1:], KEY, checkpoint=b"not json")
+        # A well-formed update signed under the wrong key.
+        with self.assertRaises(ValueError):
+            audit_map_history(
+                [update_for(b"", ONE_MAP, key=OTHER_KEY)], KEY
+            )
+
+    def test_broken_or_reordered_chain_rejected(self):
+        updates, _ = self.chain()
+        # A gap: the second update does not chain from the first after.
+        with self.assertRaises(ValueError):
+            audit_map_history([updates[0], updates[2]], KEY)
+        # Reordered links.
+        with self.assertRaises(ValueError):
+            audit_map_history([updates[1], updates[0]], KEY)
+        with self.assertRaises(ValueError):
+            audit_map_history(list(reversed(updates)), KEY)
+        # The first update must start from no table without a checkpoint.
+        with self.assertRaises(ValueError):
+            audit_map_history(updates[1:], KEY)
+        # A first update not chaining from the checkpoint.
+        with self.assertRaises(ValueError):
+            audit_map_history(
+                updates[1:], KEY, checkpoint=BitMap.from_bytes(TWO_MAP)
+            )
+
+    def test_failed_link_audit_rejects_the_whole_history(self):
+        updates, _ = self.chain()
+        # The last link is individually invalid (seq down), so the whole
+        # history is rejected even though the earlier links are fine.
+        stale = update_for(TWO_MAP, ONE_MAP)
+        with self.assertRaises(ValueError):
+            audit_map_history(updates[:2] + [stale], KEY)
+        # The initial-boundary rule applies inside a history too.
+        with self.assertRaises(ValueError):
+            audit_map_history([update_for(b"", EMPTY_MAP)], KEY)
 
 
 class BitGateResumeTxTest(unittest.TestCase):
