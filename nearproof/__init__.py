@@ -1,7 +1,7 @@
 """nearproof - verifiable distance measurement and location proofs.
 
 Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
-BitGuard / BitMap / BitRound / BitSession /
+BitGuard / BitMap / BitMapUpdate / BitRound / BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
@@ -11,7 +11,7 @@ Measurement / Observation / ObservationRevocation / Prover / RangeDecision
 VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_b / audit_bound /
 audit_bound_policy /
-audit_cert_evidence / audit_crl / audit_proof / cert / locate /
+audit_cert_evidence / audit_crl / audit_map_update / audit_proof / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
 revoke_context / revoke_observation / revoke_trust.
@@ -38,6 +38,7 @@ __all__ = [
     "BitGate",
     "BitGuard",
     "BitMap",
+    "BitMapUpdate",
     "BitRound",
     "BitSession",
     "BitState",
@@ -72,6 +73,7 @@ __all__ = [
     "audit_bound_policy",
     "audit_cert_evidence",
     "audit_crl",
+    "audit_map_update",
     "audit_proof",
     "cert",
     "locate",
@@ -125,6 +127,8 @@ _BIT_STATE_PREFIX = b"NPBS1"
 _BIT_FRONTIER_PREFIX = b"NPBF1"
 # Domain separation prefix for the partitioned rollback-protection table MAC.
 _BIT_MAP_PREFIX = b"NPBL1"
+# Domain separation prefix for the table-transition proof MAC.
+_BIT_MAP_UPDATE_PREFIX = b"NPBU1"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -3249,6 +3253,22 @@ def _bit_map_mac(key: bytes, payload: list) -> bytes:
     ).digest()
 
 
+def _bit_map_update_payload(update: "BitMapUpdate") -> list:
+    """The JSON-ready ``[1, B, A]`` array without ``mac``, in field order."""
+    return [1, update.before.hex(), update.after.hex()]
+
+
+def _bit_map_update_mac(key: bytes, payload: list) -> bytes:
+    """HMAC-SHA256 over ``b"NPBU1"`` plus the canonical ``[1, B, A]`` encoding.
+
+    The prefix and the encoding are concatenated directly with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        key, _BIT_MAP_UPDATE_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
 def _parse_bit_map_hex(value: object, name: str) -> bytes:
     """Lowercase round-tripping hex for the table byte fields.
 
@@ -3454,6 +3474,116 @@ class BitMap:
         return record
 
 
+def _require_bit_map_encoding(value: bytes, name: str, allow_empty: bool) -> None:
+    """Enforce the canonical-:class:`BitMap`-bytes contract of a proof field.
+
+    ``value`` is already known to be ``bytes``; when ``allow_empty`` holds,
+    ``b""`` (no table existed yet) is also accepted. Every violation raises
+    :class:`ValueError`, including the field-shape :class:`TypeError` a
+    malformed inner document would otherwise surface.
+    """
+    if allow_empty and value == b"":
+        return
+    try:
+        BitMap.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"bit map update {name} must be the canonical BitMap encoding"
+        ) from error
+
+
+@dataclass(frozen=True)
+class BitMapUpdate:
+    """A key-MAC'd attestation of one atomic :class:`BitMap` transition.
+
+    ``version`` is always ``1``. ``before`` is ``b""`` — no table existed
+    yet — or the canonical :meth:`BitMap.to_bytes` encoding of the table
+    before the transition; ``after`` is the canonical
+    :meth:`BitMap.to_bytes` encoding of the table after it. ``mac`` is
+    exactly 32 bytes — ``HMAC-SHA256(key, b"NPBU1" + C)`` where ``C`` is
+    the canonical compact encoding of ``[1, B, A]`` (the version and the
+    lowercase hex of both table encodings, without ``mac``), the prefix
+    and ``C`` concatenated directly with no separator or length prefix.
+    Instances are frozen, constructed positionally in field order and
+    compare equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    before: bytes
+    after: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("bit map update version must be an integer")
+        if self.version != 1:
+            raise ValueError("bit map update version must be 1")
+        if not isinstance(self.before, bytes):
+            raise TypeError("bit map update before must be bytes")
+        _require_bit_map_encoding(self.before, "before", allow_empty=True)
+        if not isinstance(self.after, bytes):
+            raise TypeError("bit map update after must be bytes")
+        _require_bit_map_encoding(self.after, "after", allow_empty=False)
+        if not isinstance(self.mac, bytes):
+            raise TypeError("bit map update mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("bit map update mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the array ``[1, B, A, M]`` where
+        ``B``/``A``/``M`` are the lowercase hex of the ``before``/``after``
+        table encodings and the MAC, no whitespace, no length prefix."""
+        return _encode_payload(
+            _bit_map_update_payload(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BitMapUpdate":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, before, after, mac]``, ``version == 1``,
+        ``before`` a lowercase hex string decoding to ``b""`` or the
+        canonical :class:`BitMap` encoding, ``after`` a lowercase hex
+        string decoding to the canonical :class:`BitMap` encoding, and
+        ``mac`` a lowercase hex string decoding to exactly 32 bytes. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical spelling
+        are rejected too. The MAC is not verified here — pass the record
+        to :func:`audit_map_update` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("bit map update data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"bit map update is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 4:
+            raise ValueError(
+                "bit map update must be a JSON array of exactly version,"
+                " before, after and mac"
+            )
+        raw_version, raw_before, raw_after, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError("bit map update version must be an integer")
+        if raw_version != 1:
+            raise ValueError("bit map update version must be 1")
+        before = _parse_bit_map_hex(raw_before, "before")
+        after = _parse_bit_map_hex(raw_after, "after")
+        mac = _parse_bit_map_hex(raw_mac, "mac")
+        record = cls(version=1, before=before, after=after, mac=mac)
+        if record.to_bytes() != data:
+            raise ValueError("bit map update encoding is not canonical")
+        return record
+
+
 class BitGate:
     """Stateful bit-session resumption gate partitioning the anti-rollback
     frontier by session.
@@ -3540,6 +3670,22 @@ class BitGate:
         :class:`ValueError` and changes no state. On success the restored
         active :class:`BitSession` is returned.
         """
+        return self.resume_tx(x)[0]
+
+    def resume_tx(self, x: object) -> "tuple[BitSession, BitMapUpdate]":
+        """Verify and resume ``x`` like :meth:`resume`, also issuing a proof.
+
+        The recovery, the seq/hash gate and the table update run exactly as
+        :meth:`resume`, atomically under the gate lock; on success a
+        :class:`BitMapUpdate` attesting the transition is returned together
+        with the restored active :class:`BitSession`. The proof carries the
+        canonical encoding of the table before the transition (``b""``
+        when no table existed yet) and after it, MAC'd as
+        ``HMAC-SHA256(key, b"NPBU1" + C)``; an accepted replay leaves the
+        table untouched and attests the identical before/after encoding.
+        Every failure raises the same exception :meth:`resume` would raise
+        and changes no state — no proof is issued for a rejected state.
+        """
         state = BitGuard._coerce_state(x)
         # The cryptographic recovery is a pure check, but it runs inside
         # the same lock as the gate and the update so that verification,
@@ -3550,6 +3696,7 @@ class BitGate:
             sid = _bit_state_sid(state)
             digest = hashlib.sha256(state.body).digest()
             current = self._table
+            before = b"" if current is None else current.to_bytes()
             entries = () if current is None else current.entries
             index = 0
             while index < len(entries) and entries[index][0] < sid:
@@ -3568,7 +3715,7 @@ class BitGate:
                             " frontier seq"
                         )
                     # Identical body: an accepted replay, nothing to advance.
-                    return session
+                    return session, self._issue_update(before, before)
                 entries = entries[:index] + entries[index + 1 :]
             updated = (
                 entries[:index] + ((sid, state.seq, digest),)
@@ -3581,7 +3728,116 @@ class BitGate:
                     self._key, _bit_map_payload(candidate.entries)
                 ),
             )
-            return session
+            return session, self._issue_update(before, self._table.to_bytes())
+
+    def _issue_update(self, before: bytes, after: bytes) -> "BitMapUpdate":
+        """MAC the ``before``/``after`` transition with the gate key."""
+        candidate = BitMapUpdate(
+            version=1, before=before, after=after, mac=b"\x00" * 32
+        )
+        return replace(
+            candidate,
+            mac=_bit_map_update_mac(
+                self._key, _bit_map_update_payload(candidate)
+            ),
+        )
+
+
+def audit_map_update(x: object, key: object) -> None:
+    """Re-verify a :class:`BitMapUpdate` transition proof against ``key``.
+
+    ``x`` must be a :class:`BitMapUpdate` or its canonical
+    :meth:`BitMapUpdate.to_bytes` encoding and ``key`` the non-empty shared
+    key — a wrong-typed argument raises :class:`TypeError`, every other
+    contract violation raises :class:`ValueError`. The proof's own MAC is
+    recomputed as ``HMAC-SHA256(key, b"NPBU1" + C)`` and compared in
+    constant time, and the ``NPBL1`` MAC of every table the proof carries
+    is verified against ``key`` the same way. The transition itself must
+    then be one of exactly three shapes, with every other entry of the
+    table unchanged: the table is identical before and after (an accepted
+    replay), exactly one entry is added, or exactly one entry keeps its
+    ``sid`` while its ``seq`` strictly increases and its ``hash`` changes.
+    Auditing is a pure check: it touches no gate state and returns
+    ``None``.
+    """
+    if isinstance(x, BitMapUpdate):
+        update = x
+    elif isinstance(x, bytes):
+        try:
+            update = BitMapUpdate.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                "x does not satisfy the bit map update field contract"
+            ) from error
+    else:
+        raise TypeError(
+            "x must be a BitMapUpdate instance or its canonical bytes"
+        )
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _bit_map_update_mac(key, _bit_map_update_payload(update)), update.mac
+    ):
+        raise ValueError("bit map update mac does not match")
+    before_entries: "tuple[tuple[bytes, int, bytes], ...]" = ()
+    if update.before:
+        before_table = BitMap.from_bytes(update.before)
+        if not hmac.compare_digest(
+            _bit_map_mac(key, _bit_map_payload(before_table.entries)),
+            before_table.mac,
+        ):
+            raise ValueError("bit map update before table mac does not match")
+        before_entries = before_table.entries
+    after_table = BitMap.from_bytes(update.after)
+    if not hmac.compare_digest(
+        _bit_map_mac(key, _bit_map_payload(after_table.entries)),
+        after_table.mac,
+    ):
+        raise ValueError("bit map update after table mac does not match")
+    after_entries = after_table.entries
+    if after_entries == before_entries:
+        # The identical table: an accepted replay attested as a no-op.
+        return None
+    if len(after_entries) == len(before_entries) + 1:
+        # Exactly one added entry; every other entry unchanged.
+        for index in range(len(after_entries)):
+            if (
+                after_entries[:index] + after_entries[index + 1 :]
+                == before_entries
+            ):
+                return None
+        raise ValueError(
+            "bit map update adds an entry but changes other entries"
+        )
+    if len(after_entries) == len(before_entries):
+        # Exactly one entry advancing: same sid, higher seq, changed hash.
+        changed = [
+            index
+            for index in range(len(after_entries))
+            if after_entries[index] != before_entries[index]
+        ]
+        if len(changed) == 1:
+            index = changed[0]
+            before_sid, before_seq, before_hash = before_entries[index]
+            after_sid, after_seq, after_hash = after_entries[index]
+            if (
+                after_sid == before_sid
+                and after_seq > before_seq
+                and after_hash != before_hash
+            ):
+                return None
+        raise ValueError(
+            "bit map update must advance exactly one entry to a higher seq"
+            " with a changed hash"
+        )
+    raise ValueError(
+        "bit map update must keep the table, add exactly one entry or"
+        " advance exactly one entry"
+    )
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
