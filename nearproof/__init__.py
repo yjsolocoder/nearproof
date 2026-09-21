@@ -1,7 +1,8 @@
 """nearproof - verifiable distance measurement and location proofs.
 
 Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
-BitGuard / BitMap / BitMapHistoryAuditor / BitMapUpdate / BitRound /
+BitGuard / BitMap / BitMapHistoryAuditor / BitMapHistoryEvidence /
+BitMapUpdate / BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
@@ -12,11 +13,12 @@ Measurement / Observation / ObservationRevocation / Prover / RangeDecision
 VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_b / audit_bound /
 audit_bound_policy /
-audit_cert_evidence / audit_crl / audit_map_history / audit_map_update /
+audit_cert_evidence / audit_crl / audit_map_history /
+audit_map_history_evidence / audit_map_update /
 audit_proof / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
-revoke_context / revoke_observation / revoke_trust.
+revoke_context / revoke_observation / revoke_trust / seal_map_history.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ __all__ = [
     "BitGuard",
     "BitMap",
     "BitMapHistoryAuditor",
+    "BitMapHistoryEvidence",
     "BitMapUpdate",
     "BitRound",
     "BitSession",
@@ -77,6 +80,7 @@ __all__ = [
     "audit_cert_evidence",
     "audit_crl",
     "audit_map_history",
+    "audit_map_history_evidence",
     "audit_map_update",
     "audit_proof",
     "cert",
@@ -91,6 +95,7 @@ __all__ = [
     "revoke_context",
     "revoke_observation",
     "revoke_trust",
+    "seal_map_history",
 ]
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
@@ -133,6 +138,8 @@ _BIT_FRONTIER_PREFIX = b"NPBF1"
 _BIT_MAP_PREFIX = b"NPBL1"
 # Domain separation prefix for the table-transition proof MAC.
 _BIT_MAP_UPDATE_PREFIX = b"NPBU1"
+# Domain separation prefix for the table-history evidence MAC.
+_BIT_MAP_HISTORY_PREFIX = b"NPBH1"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -4034,6 +4041,316 @@ class BitMapHistoryAuditor:
             )
             self._table = result
             return result
+
+
+def _parse_bit_map_history_hex(value: object, name: str) -> bytes:
+    """Lowercase round-tripping hex inside a history body.
+
+    The body is opaque byte content, so — exactly like
+    :func:`_require_bit_map_encoding` — every violation surfaces as
+    :class:`ValueError`, including the field-shape :class:`TypeError` a
+    wrong-typed item would otherwise raise.
+    """
+    try:
+        return _parse_bit_map_hex(value, name)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"bit map history body {name} must be a lowercase hex string"
+        ) from error
+
+
+def _require_bit_map_history_encoding(
+    value: bytes, name: str, allow_empty: bool
+) -> None:
+    """Enforce the canonical-:class:`BitMap`-bytes contract of a body item.
+
+    ``value`` is already known to be ``bytes``; when ``allow_empty`` holds,
+    ``b""`` (no table existed yet) is also accepted. Every violation raises
+    :class:`ValueError`.
+    """
+    if allow_empty and value == b"":
+        return
+    try:
+        BitMap.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"bit map history body {name} must be the canonical BitMap"
+            " encoding"
+        ) from error
+
+
+def _require_bit_map_history_body(body: bytes) -> None:
+    """Enforce the canonical-body contract of a :class:`BitMapHistoryEvidence`.
+
+    ``body`` is already known to be ``bytes`` and must be the canonical
+    compact UTF-8 JSON encoding of ``[start, updates, end]``: ``start`` the
+    empty string (no table existed yet) or the lowercase hex of the
+    canonical starting :class:`BitMap` encoding, ``updates`` a non-empty
+    array of lowercase hex strings each decoding to the canonical
+    :class:`BitMapUpdate` encoding, and ``end`` the lowercase hex of the
+    canonical final :class:`BitMap` encoding. Every violation raises
+    :class:`ValueError`, including the field-shape :class:`TypeError` a
+    malformed inner document would otherwise surface. The chain itself —
+    contiguity, per-update validity and that ``end`` is the final ``after``
+    — is not checked here; :func:`audit_map_history_evidence` recomputes it.
+    """
+    try:
+        outer = json.loads(body)
+    except ValueError as error:
+        raise ValueError(
+            f"bit map history body is not valid JSON: {error}"
+        ) from error
+    if not isinstance(outer, list) or len(outer) != 3:
+        raise ValueError(
+            "bit map history body must be an array of exactly start,"
+            " updates and end"
+        )
+    raw_start, raw_updates, raw_end = outer
+    start = _parse_bit_map_history_hex(raw_start, "start")
+    _require_bit_map_history_encoding(start, "start", allow_empty=True)
+    if not isinstance(raw_updates, list):
+        raise ValueError("bit map history body updates must be an array")
+    if not raw_updates:
+        raise ValueError("bit map history body updates must be non-empty")
+    for raw_update in raw_updates:
+        encoding = _parse_bit_map_history_hex(raw_update, "update")
+        try:
+            BitMapUpdate.from_bytes(encoding)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "bit map history body update must be the canonical"
+                " BitMapUpdate encoding"
+            ) from error
+    end = _parse_bit_map_history_hex(raw_end, "end")
+    _require_bit_map_history_encoding(end, "end", allow_empty=False)
+    if _encode_payload(outer) != body:
+        raise ValueError("bit map history body encoding is not canonical")
+
+
+def _bit_map_history_body_parts(
+    body: bytes,
+) -> "tuple[bytes, list[bytes], bytes]":
+    """Split an already-validated history body into start, updates and end."""
+    raw_start, raw_updates, raw_end = json.loads(body)
+    return (
+        bytes.fromhex(raw_start),
+        [bytes.fromhex(raw_update) for raw_update in raw_updates],
+        bytes.fromhex(raw_end),
+    )
+
+
+def _bit_map_history_evidence_mac(key: bytes, body: bytes) -> bytes:
+    """HMAC-SHA256 over ``b"NPBH1"`` plus the body, concatenated directly
+    with no separator or length prefix."""
+    return hmac.new(
+        key, _BIT_MAP_HISTORY_PREFIX + body, hashlib.sha256
+    ).digest()
+
+
+@dataclass(frozen=True)
+class BitMapHistoryEvidence:
+    """A key-MAC'd attestation of one contiguous :class:`BitMapUpdate` chain.
+
+    ``version`` is always ``1``. ``body`` is the canonical compact UTF-8
+    JSON encoding of ``[start, updates, end]``: ``start`` the empty string
+    — no table existed yet — or the lowercase hex of the canonical
+    :class:`BitMap` encoding the chain starts from, ``updates`` a non-empty
+    array of lowercase hex strings each decoding to the canonical
+    :class:`BitMapUpdate` encoding, and ``end`` the lowercase hex of the
+    canonical :class:`BitMap` encoding of the final table. ``mac`` is
+    exactly 32 bytes — ``HMAC-SHA256(key, b"NPBH1" + body)``, the prefix
+    and the body concatenated directly with no separator or length prefix.
+    Instances are frozen, constructed positionally in field order and
+    compare equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    body: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("bit map history evidence version must be an integer")
+        if self.version != 1:
+            raise ValueError("bit map history evidence version must be 1")
+        if not isinstance(self.body, bytes):
+            raise TypeError("bit map history evidence body must be bytes")
+        _require_bit_map_history_body(self.body)
+        if not isinstance(self.mac, bytes):
+            raise TypeError("bit map history evidence mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError(
+                "bit map history evidence mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the array ``[1, B, M]`` where
+        ``B``/``M`` are the lowercase hex of the body and the MAC, no
+        whitespace, no length prefix."""
+        return _encode_payload([1, self.body.hex(), self.mac.hex()])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BitMapHistoryEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, body, mac]``, ``version == 1``, ``body`` a
+        lowercase hex string decoding to the canonical history body and
+        ``mac`` a lowercase hex string decoding to exactly 32 bytes. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical spelling
+        are rejected too. The MAC is not verified here — pass the record
+        to :func:`audit_map_history_evidence` with the shared key for
+        that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("bit map history evidence data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"bit map history evidence is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 3:
+            raise ValueError(
+                "bit map history evidence must be a JSON array of exactly"
+                " version, body and mac"
+            )
+        raw_version, raw_body, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError("bit map history evidence version must be an integer")
+        if raw_version != 1:
+            raise ValueError("bit map history evidence version must be 1")
+        body = _parse_bit_map_hex(raw_body, "history body")
+        mac = _parse_bit_map_hex(raw_mac, "history mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "bit map history evidence mac must decode to exactly 32 bytes"
+            )
+        record = cls(version=1, body=body, mac=mac)
+        if record.to_bytes() != data:
+            raise ValueError("bit map history evidence encoding is not canonical")
+        return record
+
+
+def _coerce_bit_map_history_evidence(
+    x: object, name: str
+) -> "BitMapHistoryEvidence":
+    """Coerce a :class:`BitMapHistoryEvidence` or its canonical bytes,
+    splitting the TypeError/ValueError contract exactly as the public
+    auditors do: the wrong kind of argument raises :class:`TypeError`, a
+    field-shape failure surfacing while parsing byte content of the right
+    kind is a value error."""
+    if isinstance(x, BitMapHistoryEvidence):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return BitMapHistoryEvidence.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the bit map history evidence"
+                " field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a BitMapHistoryEvidence instance or its canonical"
+        " bytes"
+    )
+
+
+def seal_map_history(
+    updates: object, key: object, *, checkpoint: object = None
+) -> "BitMapHistoryEvidence":
+    """Audit a contiguous :class:`BitMapUpdate` chain and seal it as evidence.
+
+    ``updates``, ``key`` and the keyword-only ``checkpoint`` are validated
+    exactly as :func:`audit_map_history` validates them — a non-iterable
+    ``updates``, a non-``bytes`` ``key``, a wrong-typed item or a
+    wrong-kind ``checkpoint`` raises :class:`TypeError`; an empty sequence,
+    an empty key, a malformed or non-canonical encoding, a MAC mismatch, a
+    failed per-update audit or a broken chain raises :class:`ValueError`.
+    The whole chain is verified with :func:`audit_map_history` first and
+    only on success is the evidence produced: the body carries the
+    starting point (``""`` when ``checkpoint`` is ``None``, else the hex
+    of its canonical :class:`BitMap` encoding), the canonical encoding of
+    every update in order and the canonical encoding of the final table,
+    MAC'd as ``HMAC-SHA256(key, b"NPBH1" + body)``. Sealing touches no
+    gate or auditor state.
+    """
+    try:
+        items = list(updates)  # type: ignore[arg-type]
+    except TypeError:
+        raise TypeError(
+            "updates must be an iterable of BitMapUpdate instances or"
+            " their canonical bytes"
+        ) from None
+    final = audit_map_history(items, key, checkpoint=checkpoint)
+    coerced = [_coerce_bit_map_update(item, "updates items") for item in items]
+    if checkpoint is None:
+        start = b""
+    elif isinstance(checkpoint, BitMap):
+        start = checkpoint.to_bytes()
+    else:
+        # Canonical BitMap bytes, already validated by audit_map_history.
+        start = checkpoint  # type: ignore[assignment]
+    body = _encode_payload(
+        [
+            start.hex(),
+            [update.to_bytes().hex() for update in coerced],
+            final.to_bytes().hex(),
+        ]
+    )
+    return BitMapHistoryEvidence(
+        version=1,
+        body=body,
+        mac=_bit_map_history_evidence_mac(key, body),
+    )
+
+
+def audit_map_history_evidence(x: object, key: object) -> "BitMap":
+    """Re-verify a :class:`BitMapHistoryEvidence` against ``key``.
+
+    ``x`` must be a :class:`BitMapHistoryEvidence` or its canonical
+    :meth:`BitMapHistoryEvidence.to_bytes` encoding and ``key`` the
+    non-empty shared ``bytes`` key — a wrong-typed argument raises
+    :class:`TypeError`, every other contract violation raises
+    :class:`ValueError`. The evidence MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPBH1" + body)`` and compared in constant time,
+    then the carried chain is re-audited from scratch with
+    :func:`audit_map_history` — starting from no table when the body's
+    ``start`` is empty and from the carried starting table otherwise —
+    and the recomputed final table must equal the body's ``end`` byte for
+    byte. Auditing is a pure check: it touches no gate or auditor state
+    and returns no partial result — on success the frozen :class:`BitMap`
+    of the final ``after`` is returned.
+    """
+    evidence = _coerce_bit_map_history_evidence(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _bit_map_history_evidence_mac(key, evidence.body), evidence.mac
+    ):
+        raise ValueError("bit map history evidence mac does not match")
+    start, update_encodings, end = _bit_map_history_body_parts(evidence.body)
+    updates = [
+        BitMapUpdate.from_bytes(encoding) for encoding in update_encodings
+    ]
+    final = audit_map_history(
+        updates, key, checkpoint=None if not start else start
+    )
+    if final.to_bytes() != end:
+        raise ValueError(
+            "bit map history evidence end does not match the audited chain"
+        )
+    return final
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
