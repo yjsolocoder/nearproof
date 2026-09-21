@@ -1,7 +1,7 @@
 """nearproof - verifiable distance measurement and location proofs.
 
 Public API: AttestedObservation / BitEvidence / BitRound / BitSession /
-BoundAttestedObservation / BoundEvidence /
+BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
 Evidence /
@@ -35,6 +35,7 @@ __all__ = [
     "BitEvidence",
     "BitRound",
     "BitSession",
+    "BitState",
     "BoundAttestedObservation",
     "BoundEvidence",
     "BoundEvidenceRevocation",
@@ -109,10 +110,12 @@ _CRL_PROOF_PREFIX = b"NPCCE2"
 # Domain separation prefix for the rollback-protection CRL-state MAC.
 _CRL_STATE_PREFIX = b"NPCK1"
 # Domain separation prefixes for the bit-challenge protocol: the transcript
-# digest, the per-bit response and the bit-evidence MAC respectively.
+# digest, the per-bit response, the bit-evidence MAC and the resumable
+# bit-session checkpoint MAC respectively.
 _BIT_TRANSCRIPT_PREFIX = b"NPFC1"
 _BIT_RESPONSE_PREFIX = b"NPFR1"
 _BIT_EVIDENCE_PREFIX = b"NPFB1"
+_BIT_STATE_PREFIX = b"NPBS1"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -1756,6 +1759,108 @@ class Verifier:
             limit_time,
         )
 
+    def resume_bits(self, x: object, *, floor: object = None) -> "BitSession":
+        """Verify a :class:`BitState` checkpoint and resume the session.
+
+        ``x`` must be a :class:`BitState` or its canonical
+        :meth:`BitState.to_bytes` encoding — anything else raises
+        :class:`TypeError`; ``floor`` is keyword-only and accepts the same
+        two forms or ``None``. Every other failure (a malformed or
+        non-canonical encoding, a MAC mismatch, a recomputed digest,
+        response or timing that does not check out, or a rejected
+        continuation against ``floor``) raises :class:`ValueError`.
+
+        Verification recomputes everything from scratch and compares in
+        constant time:
+
+        - the checkpoint MAC:
+          ``mac == HMAC-SHA256(key, b"NPBS1" + E)``;
+        - the transcript digest: ``D == SHA256(b"NPFC1" + C + O)``;
+        - each completed round at its ``Q`` position ``i``:
+          ``r == HMAC-SHA256(key, b"NPFR1" + t + u32be(i) + bytes([b]) + D)``;
+        - each round trip: ``0 <= e - s <= T``.
+
+        With ``floor`` given it must itself pass the MAC, and the
+        continuation is then gated against it: a lower ``seq`` is rejected;
+        an equal ``seq`` is accepted solely as a replay of the identical
+        body (``SHA256(body)`` must match); a higher ``seq`` requires the
+        first seven body elements (``t, C, D, O, R, T, V``) to be
+        identical and the floor's ``Q`` to be a strict prefix of the new
+        ``Q`` — when the floor carries a pending ``P = [seq, b, s]``, the
+        very next new ``Q`` item must additionally carry that same ``b``
+        and ``s``, so a checkpointed outstanding round can only be
+        continued by the response that actually answered it. On success an
+        active :class:`BitSession` is returned with the completed rounds
+        recorded and a carried ``P`` restored as its one pending round.
+        """
+        state = self._coerce_bit_state(x, "x")
+        if not hmac.compare_digest(
+            _bit_state_mac(self._key, state.version, state.seq, state.body),
+            state.mac,
+        ):
+            raise ValueError("bit state mac does not match")
+        parsed = _parse_bit_state_body(state.body)
+        if not hmac.compare_digest(
+            bit_transcript_digest(parsed["context"], parsed["opening"]),
+            parsed["digest"],
+        ):
+            raise ValueError("bit state digest does not match context and opening")
+        for index, (bit_value, response, start, end) in enumerate(
+            parsed["queries"]
+        ):
+            if not hmac.compare_digest(
+                bit_response(
+                    self._key, parsed["t"], parsed["digest"], index, bit_value
+                ),
+                response,
+            ):
+                raise ValueError(
+                    "bit state response does not match the challenge"
+                )
+            if not 0.0 <= end - start <= parsed["timeout"]:
+                raise ValueError(
+                    "bit state round trip must satisfy 0 <= e - s <= timeout"
+                )
+        if floor is not None:
+            floor_state = self._coerce_bit_state(floor, "floor")
+            if not hmac.compare_digest(
+                _bit_state_mac(
+                    self._key,
+                    floor_state.version,
+                    floor_state.seq,
+                    floor_state.body,
+                ),
+                floor_state.mac,
+            ):
+                raise ValueError("floor bit state mac does not match")
+            parsed_floor = _parse_bit_state_body(floor_state.body)
+            if state.seq < floor_state.seq:
+                raise ValueError(
+                    "bit state sequence is below the floor checkpoint"
+                )
+            if state.seq == floor_state.seq:
+                if not hmac.compare_digest(
+                    hashlib.sha256(state.body).digest(),
+                    hashlib.sha256(floor_state.body).digest(),
+                ):
+                    raise ValueError(
+                        "bit state carries a different body at the floor"
+                        " sequence"
+                    )
+            else:
+                _gate_bit_state_continuation(parsed, parsed_floor)
+        return BitSession._restore(self._key, self._clock, parsed)
+
+    @staticmethod
+    def _coerce_bit_state(value: object, name: str) -> "BitState":
+        if isinstance(value, BitState):
+            return value
+        if isinstance(value, bytes):
+            return BitState.from_bytes(value)
+        raise TypeError(
+            f"{name} must be a BitState instance or its canonical bytes"
+        )
+
 
 class BitSession:
     """One step-driven bit-challenge session created by :meth:`Verifier.start_bits`.
@@ -1958,6 +2063,89 @@ class BitSession:
         with self._lock:
             self._require_active()
             self._state = self._REVOKED
+
+    def checkpoint(self) -> bytes:
+        """Export a MAC'd, resumable :class:`BitState` of the active session.
+
+        Only an active session can be checkpointed — a finished or revoked
+        session raises :class:`ValueError`. The returned bytes are the
+        canonical :meth:`BitState.to_bytes` encoding of
+        ``[1, seq, body, mac]``: ``body`` is the compact JSON array
+        ``[t, C, D, O, R, T, V, Q, P]``, ``seq`` is the number of completed
+        rounds (``len(Q)``, always ``0 <= seq <= R``), ``P`` is ``null``
+        when no round is outstanding and otherwise ``[seq, b, s]`` for the
+        one pending round, and ``mac`` is
+        ``HMAC-SHA256(key, b"NPBS1" + E)`` over the outer first three
+        elements. Checkpointing is a pure read: it changes no session
+        state, so a pending round stays pending and the session keeps
+        running afterwards exactly as before.
+        """
+        with self._lock:
+            self._require_active()
+            seq = len(self._queries)
+            body = _encode_payload(
+                [
+                    self._t.hex(),
+                    self._context.hex(),
+                    self._digest.hex(),
+                    self._opening.hex(),
+                    self._rounds,
+                    self._timeout,
+                    self._speed,
+                    [[b, r.hex(), s, e] for b, r, s, e in self._queries],
+                    (
+                        None
+                        if self._pending is None
+                        else [seq, self._pending[0].bit, self._pending[1]]
+                    ),
+                ]
+            )
+            record = BitState(version=1, seq=seq, body=body, mac=b"\x00" * 32)
+            return replace(
+                record, mac=_bit_state_mac(self._key, 1, seq, body)
+            ).to_bytes()
+
+    @classmethod
+    def _restore(
+        cls, key: bytes, clock: Callable[[], float], parsed: dict
+    ) -> "BitSession":
+        """Rebuild an active session from a verified :class:`BitState` body.
+
+        ``parsed`` is the dict :func:`_parse_bit_state_body` returns after
+        the MAC and every cryptographic check have already been recomputed
+        by :meth:`Verifier.resume_bits`. The restored session is active:
+        its completed rounds are recorded in order, a carried ``P`` becomes
+        the one pending round, and ``next``/``submit``/``finish`` behave
+        exactly as they would on the original session.
+        """
+        session = cls.__new__(cls)
+        session._key = key
+        session._clock = clock
+        session._speed = parsed["speed"]
+        session._context = parsed["context"]
+        session._opening = parsed["opening"]
+        session._rounds = parsed["rounds"]
+        session._timeout = parsed["timeout"]
+        session._t = parsed["t"]
+        session._digest = parsed["digest"]
+        session._queries = list(parsed["queries"])
+        session._durations = [
+            end - start for _b, _r, start, end in parsed["queries"]
+        ]
+        pending = parsed["pending"]
+        if pending is None:
+            session._pending = None
+        else:
+            pending_seq, pending_bit, pending_start = pending
+            session._pending = (
+                BitRound(
+                    version=1, t=parsed["t"], index=pending_seq, bit=pending_bit
+                ),
+                pending_start,
+            )
+        session._state = cls._ACTIVE
+        session._lock = threading.Lock()
+        return session
 
 
 def _bit_evidence_payload(record: "BitEvidence") -> list:
@@ -2233,6 +2421,325 @@ def audit_b(x: object, k: object) -> float:
     if bound != record.limit:
         raise ValueError("bit evidence limit does not match the round trips and speed")
     return bound
+
+
+def _bit_state_mac(key: bytes, version: int, seq: int, body: bytes) -> bytes:
+    """``HMAC-SHA256(key, b"NPBS1" + E)`` with ``E`` the outer first-three
+    elements ``[version, seq, body-hex]`` canonically encoded, the prefix
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _BIT_STATE_PREFIX + _encode_payload([version, seq, body.hex()]),
+        hashlib.sha256,
+    ).digest()
+
+
+def _parse_bit_state_hex(value: object, name: str, length: "Optional[int]") -> bytes:
+    # Body-content fields follow the BitEvidence/CrlProof rule: every
+    # violation inside the opaque body is a ValueError. The TypeError split
+    # applies only to the record's own four outer fields.
+    if not isinstance(value, str):
+        raise ValueError(f"bit state {name} must be a lowercase hex string")
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"bit state {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value or (length is not None and len(raw) != length):
+        raise ValueError(
+            f"bit state {name} must be a lowercase hex string"
+            + ("" if length is None else f" of exactly {length} bytes")
+        )
+    return raw
+
+
+def _parse_bit_state_number(value: object, name: str) -> float:
+    # Genuine checkpoints always spell T/V (float(timeout)/float(speed)) as
+    # JSON floats, and the opaque body is embedded verbatim rather than
+    # re-encoded from a rebuilt record, so require the float spelling
+    # explicitly — an int literal (or bool) is a contract violation rather
+    # than a canonical number here.
+    if type(value) is not float:
+        raise ValueError(f"bit state {name} must be a finite positive number")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"bit state {name} must be a finite positive number")
+    return value
+
+
+def _parse_bit_state_reading(value: object, name: str) -> float:
+    if type(value) is not float or not math.isfinite(value):
+        raise ValueError(f"bit state {name} must be a finite float number")
+    return value
+
+
+def _parse_bit_state_body(body: bytes) -> dict:
+    """Parse and validate the opaque :class:`BitState` body bytes.
+
+    Returns the decoded fields; raises :class:`ValueError` for anything that
+    is not canonical compact JSON satisfying the body contract.
+    """
+    try:
+        decoded = json.loads(body)
+    except ValueError as error:
+        raise ValueError(f"bit state body is not valid JSON: {error}") from error
+    if not isinstance(decoded, list) or len(decoded) != 9:
+        raise ValueError(
+            "bit state body must be a JSON array of exactly t, C, D, O, R,"
+            " T, V, Q and P"
+        )
+    (
+        raw_t,
+        raw_context,
+        raw_digest,
+        raw_opening,
+        raw_rounds,
+        raw_timeout,
+        raw_speed,
+        raw_queries,
+        raw_pending,
+    ) = decoded
+    # t/C/D/O are opaque byte fields inside the body; body-content contract
+    # violations (wrong JSON type, malformed hex, wrong length) are all
+    # ValueErrors, the same rule BitEvidence applies to its fields.
+    t = _parse_bit_state_hex(raw_t, "t", BIT_T_BYTES)
+    context = _parse_bit_state_hex(raw_context, "C", CONTEXT_BYTES)
+    digest = _parse_bit_state_hex(raw_digest, "D", DIGEST_BYTES)
+    opening = _parse_bit_state_hex(raw_opening, "O", OPENING_BYTES)
+    if isinstance(raw_rounds, bool) or type(raw_rounds) is not int:
+        raise ValueError("bit state R must be a non-bool integer")
+    if not 1 <= raw_rounds <= 2**32:
+        # Closed at 2**32 like start_bits: round indices still fit a u32
+        # because they run 0 .. R-1.
+        raise ValueError(
+            "bit state R must be in the range 1 .. 2**32"
+        )
+    timeout = _parse_bit_state_number(raw_timeout, "T")
+    speed = _parse_bit_state_number(raw_speed, "V")
+    if not isinstance(raw_queries, list):
+        raise ValueError("bit state Q must be an array")
+    queries: list[tuple[int, bytes, float, float]] = []
+    for raw_query in raw_queries:
+        if not isinstance(raw_query, list) or len(raw_query) != 4:
+            raise ValueError(
+                "bit state each Q item must be an array of exactly b, r, s"
+                " and e"
+            )
+        raw_bit, raw_response, raw_start, raw_end = raw_query
+        # JSON booleans must be distinguished from the integer challenge bit
+        # 0/1; true/false are value violations here.
+        if isinstance(raw_bit, bool) or type(raw_bit) is not int:
+            raise ValueError("bit state b must be 0 or 1")
+        if raw_bit not in (0, 1):
+            raise ValueError("bit state b must be 0 or 1")
+        response = _parse_bit_state_hex(raw_response, "r", BIT_R_BYTES)
+        start = _parse_bit_state_reading(raw_start, "s")
+        end = _parse_bit_state_reading(raw_end, "e")
+        queries.append((raw_bit, response, start, end))
+    seq = len(queries)
+    if seq > raw_rounds:
+        raise ValueError("bit state seq must satisfy 0 <= seq <= R")
+    pending: "Optional[tuple[int, int, float]]"
+    if raw_pending is None:
+        pending = None
+    else:
+        if not isinstance(raw_pending, list) or len(raw_pending) != 3:
+            raise ValueError(
+                "bit state P must be null or an array of exactly seq, b and s"
+            )
+        raw_pseq, raw_pbit, raw_pstart = raw_pending
+        if isinstance(raw_pseq, bool) or type(raw_pseq) is not int:
+            raise ValueError("bit state P seq must be a non-bool integer")
+        if raw_pseq != seq:
+            raise ValueError("bit state P seq must equal len(Q)")
+        if not 0 <= raw_pseq < raw_rounds:
+            raise ValueError("bit state P requires seq < R")
+        if type(raw_pbit) is not int or raw_pbit not in (0, 1):
+            raise ValueError("bit state P b must be 0 or 1")
+        pending_start = _parse_bit_state_reading(raw_pstart, "P s")
+        pending = (raw_pseq, raw_pbit, pending_start)
+    return {
+        "t": t,
+        "context": context,
+        "digest": digest,
+        "opening": opening,
+        "rounds": raw_rounds,
+        "timeout": timeout,
+        "speed": speed,
+        "queries": tuple(queries),
+        "seq": seq,
+        "pending": pending,
+        "decoded": decoded,
+    }
+
+
+@dataclass(frozen=True)
+class BitState:
+    """A MAC'd, resumable checkpoint of an active :class:`BitSession`.
+
+    ``version`` is always ``1``; ``seq`` a non-bool unsigned 64-bit integer,
+    the number of rounds already completed; ``body`` ``bytes`` holding the
+    compact UTF-8 JSON array ``[t, C, D, O, R, T, V, Q, P]``; ``mac``
+    exactly 32 bytes — ``HMAC-SHA256(key, b"NPBS1" + E)`` with ``E`` the
+    outer first three elements ``[version, seq, body]`` (``body`` as
+    lowercase hex) canonically encoded, the prefix and ``E`` concatenated
+    directly with no separator or length prefix. A field of the wrong type
+    raises :class:`TypeError` at construction time; a value contract
+    violation raises :class:`ValueError`. Instances are frozen, constructed
+    positionally in field order and compare equal by their fields. No key
+    material is stored.
+
+    Inside the body: ``t``/``C``/``D``/``O`` mean exactly what they mean in
+    :class:`BitEvidence` (a 16-byte transcript and four 32-byte context,
+    digest and opening values); ``R`` is a non-bool integer in
+    ``1 .. 2**32`` — the total number of rounds; ``T``/``V`` finite
+    positive non-bool numbers (the timeout and the propagation speed);
+    ``Q`` is the array of completed ``[b, r, s, e]`` rounds, identical in
+    meaning to the :class:`BitEvidence` queries, whose length must equal
+    ``seq`` and satisfy ``seq <= R``; ``P`` is either ``null`` or a
+    ``[seq, b, s]`` triple describing one outstanding round — only allowed
+    when ``seq < R``, with its ``seq`` equal to ``len(Q)``. The body bytes
+    are opaque to the constructor — :meth:`BitSession.checkpoint` produces
+    conforming ones and :meth:`from_bytes` (and :meth:`Verifier.resume_bits`)
+    enforces the whole contract.
+    """
+
+    version: int
+    seq: int
+    body: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("bit state version must be an integer")
+        if self.version != 1:
+            raise ValueError("bit state version must be 1")
+        if isinstance(self.seq, bool) or type(self.seq) is not int:
+            raise TypeError("bit state seq must be a non-bool integer")
+        if not 0 <= self.seq <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "bit state seq must fit in an unsigned 64-bit integer"
+            )
+        if not isinstance(self.body, bytes):
+            raise TypeError("bit state body must be bytes")
+        if not self.body:
+            raise ValueError("bit state body must not be empty")
+        if not isinstance(self.mac, bytes):
+            raise TypeError("bit state mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("bit state mac must be exactly 32 bytes")
+        # The opaque body must itself be canonical compact JSON satisfying
+        # the field contract; construction never repairs or replaces it.
+        parsed = _parse_bit_state_body(self.body)
+        if parsed["seq"] != self.seq:
+            raise ValueError("bit state seq must equal the number of body Q items")
+        if _encode_payload(parsed["decoded"]) != self.body:
+            raise ValueError("bit state body encoding is not canonical")
+
+    def to_bytes(self) -> bytes:
+        """Encode as a compact UTF-8 JSON array in field order:
+        ``[version, seq, body, mac]`` with ``body`` and ``mac`` as lowercase
+        hex strings, no whitespace, no length prefix, no NaN/Infinity.
+
+        The opaque ``body`` must itself be canonical compact JSON; it was
+        checked at construction time and is embedded verbatim.
+        """
+        return _encode_payload(
+            [self.version, self.seq, self.body.hex(), self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BitState":
+        """Decode :meth:`to_bytes` output, enforcing the full field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and for
+        fields of the wrong type; raises :class:`ValueError` for anything
+        that does not satisfy the contract: an outer array of exactly four
+        elements ``[version, seq, body, mac]`` in field order,
+        ``version == 1``, a non-bool u64 ``seq``, non-empty lowercase-hex
+        ``body`` and a 32-byte lowercase-hex ``mac``; the body decoding to
+        exactly the array ``[t, C, D, O, R, T, V, Q, P]`` with ``t`` 16
+        bytes, ``C``/``D``/``O`` 32 bytes each, ``R`` a non-bool integer in
+        ``1 .. 2**32``, ``T``/``V`` finite positive non-bool numbers, ``Q``
+        an array whose length equals ``seq`` and is at most ``R`` of
+        ``[b, r, s, e]`` rounds (``b`` in ``{0, 1}`` and not bool, ``r``
+        32 bytes, ``s``/``e`` finite non-bool numbers), and ``P`` either
+        ``null`` or a ``[seq, b, s]`` triple only when ``seq < R``. After
+        parsing and validation the record and its body are re-encoded and
+        both encodings must equal the input byte for byte. The MAC is not
+        verified here — use :meth:`Verifier.resume_bits` with the shared key
+        for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("bit state data must be bytes")
+        try:
+            decoded = json.loads(data)
+        except ValueError as error:
+            raise ValueError(f"bit state is not valid JSON: {error}") from error
+        if not isinstance(decoded, list) or len(decoded) != 4:
+            raise ValueError(
+                "bit state must be a JSON array of exactly version, seq,"
+                " body and mac"
+            )
+        raw_version, raw_seq, raw_body, raw_mac = decoded
+        if type(raw_version) is not int:
+            raise TypeError("bit state version must be an integer")
+        if raw_version != 1:
+            raise ValueError("bit state version must be 1")
+        if isinstance(raw_seq, bool) or type(raw_seq) is not int:
+            raise TypeError("bit state seq must be a non-bool integer")
+        if not 0 <= raw_seq <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "bit state seq must fit in an unsigned 64-bit integer"
+            )
+        body = _parse_bit_state_hex(raw_body, "body", None)
+        if not body:
+            raise ValueError("bit state body must not be empty")
+        mac = _parse_bit_state_hex(raw_mac, "mac", 32)
+        record = cls(version=raw_version, seq=raw_seq, body=body, mac=mac)
+        # Re-encoding enforces canonicity of both the outer layer and the
+        # opaque body (the constructor already re-checked the body), so
+        # whitespace, pretty-printing, framing and non-canonical number or
+        # string spellings are all rejected.
+        if record.to_bytes() != data:
+            raise ValueError("bit state encoding is not canonical")
+        return record
+
+
+def _gate_bit_state_continuation(parsed: dict, parsed_floor: dict) -> None:
+    """Gate a higher-sequence checkpoint against an older floor.
+
+    Both bodies have already passed :func:`_parse_bit_state_body`; the
+    caller has established ``parsed["seq"] > parsed_floor["seq"]``. The
+    continuation is accepted only when the fixed first seven body elements
+    ``t, C, D, O, R, T, V`` are identical, the floor's completed rounds are
+    a strict prefix of the new ones, and — when the floor carries a
+    pending ``P = [seq, b, s]`` — the first new round answered that exact
+    challenge at the exact recorded start time.
+    """
+    for name in ("t", "context", "digest", "opening", "rounds", "timeout", "speed"):
+        if parsed[name] != parsed_floor[name]:
+            raise ValueError(
+                f"bit state continuation must keep {name} identical to the floor"
+            )
+    floor_seq = parsed_floor["seq"]
+    new_queries = parsed["queries"]
+    floor_queries = parsed_floor["queries"]
+    if tuple(new_queries[:floor_seq]) != tuple(floor_queries):
+        raise ValueError(
+            "bit state Q must continue the floor Q as a prefix"
+        )
+    floor_pending = parsed_floor["pending"]
+    if floor_pending is not None:
+        # The floor had one outstanding round at index floor_seq; the next
+        # Q item must be its answer: the same challenge bit b at the same
+        # start s, now completed.
+        pending_seq, pending_bit, pending_start = floor_pending
+        next_query = new_queries[pending_seq]
+        if next_query[0] != pending_bit or next_query[2] != pending_start:
+            raise ValueError(
+                "bit state next Q item must answer the floor pending round"
+            )
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
