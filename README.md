@@ -72,6 +72,7 @@ python3 -m nearproof
   - `to_bytes()` / `from_bytes(data)` — 字段序五元素紧凑 UTF-8 JSON 数组 `[1, sequence, checkpoint, digest, mac]`，三个 bytes 字段小写 hex，无空白；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），其余不合契约（含 checkpoint 非规范 `BitMap` 字节、非规范拼写）抛 `ValueError`，重编码须逐字节相等；不验 MAC（无论 checkpoint 的 `NPBL1`、摘要链还是状态 `NPBJ1` 都不验）
 - `BitMapHistoryJournalAuditor(key, *, state=None)` — 把 `BitMapHistoryEvidence` 段链接成带序号与摘要链的单调日志的带状态审计器；`key` 为非空 `bytes`（错型抛 `TypeError`，空值抛 `ValueError`）；`state` 收 `BitMapHistoryJournalState` 或其规范字节或 `None`，非空时恒时复核双层 MAC（checkpoint 的 `NPBL1` 与状态自身的 `NPBJ1`，见下）
   - `audit(x) -> 本类` 收历史证据对象或其规范字节（余类型抛 `TypeError`）；锁内先按 `audit_map_history_evidence` 完整验链，再要求证据 `start` 与当前 checkpoint 逐字节相等（空状态须为 `""`），然后令 `n = 旧sequence+1`、新 checkpoint 为证据 `end`、新摘要 `d' = SHA256(b"NPBJ2"+d+u64be(n)+E)`（`d0` 为 32 个零字节，`u64be(n)` 为固定 8 字节大端，`E` 为证据规范字节，直拼无长度前缀），并对前四项重新 MAC 为 `NPBJ1`；任何失败抛 `ValueError` 且不改状态，并发按取锁顺序线性化
+  - `audit_bundle(x) -> 本类` 原子整包提交：收 `BitMapHistoryJournalBundle` 或其规范字节（余类型抛 `TypeError`，余违约抛 `ValueError`）；同一把锁内先解析并恒时复核包的 `NPBJ3` MAC，再对非空 `start` 与 `end` 各重算状态 `NPBJ1` 及内嵌 `BitMap` 的 `NPBL1`（两层均恒时比较，任一失败不开始重放），然后要求 `start` 与当前状态逐字节相等（空审计器仅接受 `b""`）；匹配后在**临时状态**逐段完整重放（每段验 `NPBH1`、内部 `NPBU1`/`NPBL1`、逐字节连续起点、u64 序号与 `NPBJ2` 摘要推进），仅当全段通过且临时状态规范字节等于 `end` 才一次性替换只读 `state`；失败不改状态，同包重放因起点不符被拒，并发按取锁顺序线性化
   - 只读 `state` 属性导出当前 `BitMapHistoryJournalState | None`（首次成功审计前为 `None`），重启时调用方须自行落盘并传回
 - `BitMapHistoryJournalBundle(version, start, evidences, end, mac)` — 把一段连续历史证据链连同其日志起止状态封进一条记录的防篡改冻结包（`version=1`；`start` 为规范 `BitMapHistoryJournalState` 字节或 `b""`（空起点）；`evidences` 为非空有序规范证据字节元组；`end` 为规范非空 `BitMapHistoryJournalState` 字节；`mac` 恰 32 字节，`mac=HMAC-SHA256(key, b"NPBJ3"+C)`，`C` 为前 4 项的字段序规范编码，直拼无长度前缀；位置构造、冻结、按字段相等；字段错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
   - `to_bytes()` / `from_bytes(data)` — 字段序五元素紧凑 UTF-8 JSON 数组 `[1, start, E, end, mac]`，bytes 字段小写 hex（空起点为 `""`），`E` 为证据 hex 数组，无空白；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），其余不合契约（含非规范拼写）抛 `ValueError`，重编码须逐字节相等；不验 MAC（无论包的 `NPBJ3` 还是起止状态的 `NPBJ1`/`NPBL1` 都不验）
@@ -459,6 +460,8 @@ auditor.audit(old_fork)                     # 从旧起点分叉：ValueError，
 - 整条链先按 `BitMapHistoryJournalAuditor` 的语义从给定状态完整审计一遍，全部通过才产出包：`start` 为起点（`state=None` 时 `b""`，否则为其规范字节），`evidences` 为各段规范字节（按序），`end` 为最终日志状态的规范字节，再以前四项算出 `NPBJ3` 包 MAC。封包不触碰任何审计器状态。
 
 `audit_map_history_journal_bundle(x, key)` 验包：`x` 收 `BitMapHistoryJournalBundle` 或其规范字节（其余类型抛 `TypeError`），`key` 为非空 `bytes`。先以 `key` 恒时复核包的 `NPBJ3` MAC，再对**起止两个状态各做双层 MAC 复核**（checkpoint 表的 `NPBL1` 与状态自身的 `NPBJ1`，两层都会重算且各用 `hmac.compare_digest` 比较后才统一判定），最后把携带的段**逐段重放**——`start` 为空时从空日志出发，否则从携带的起始状态出发，完全按 `BitMapHistoryJournalAuditor` 的语义审计每一段——重放的最终状态必须与包的 `end` **逐字节相等**。任何一步失败抛 `ValueError`；验包是纯检查，不触碰任何审计器状态、不返回部分结果，成功时返回重放到达的冻结 `BitMapHistoryJournalState`。
+
+带状态的接收方改用审计器方法 `BitMapHistoryJournalAuditor.audit_bundle(x) -> 审计器自身` 做**原子整包提交**：复核顺序与独立验包完全一致（包 `NPBJ3`、非空 `start`/`end` 的 `NPBJ1`+`NPBL1` 双层恒时复核全部先于重放），但额外要求包的 `start` 与审计器**当前状态逐字节相等**——空审计器只接受 `start == b""`，否则须 `start == state.to_bytes()`。匹配后在临时状态逐段完整重放（`NPBH1`、内部 `NPBU1`/`NPBL1`、逐字节连续起点、u64 序号与 `NPBJ2` 摘要推进），仅当全段通过且临时状态规范字节等于 `end` 才一次性替换只读 `state`。参数种类错抛 `TypeError`，其余违约抛 `ValueError`；任何失败不改状态，同一包重复提交因起点已不匹配而被拒，`audit` 与 `audit_bundle` 的并发调用按同一把锁的取锁顺序线性化。
 
 ```python
 bundle = seal_map_history_journal_bundle([evidence1, evidence2], key)
