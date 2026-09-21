@@ -4733,6 +4733,19 @@ class BitMapHistoryJournalAuditor:
     :class:`ValueError` and leaves the state untouched, and concurrent
     audits linearize in lock-acquisition order so a committed segment is
     never lost.
+
+    :meth:`audit_bundle` accepts one :class:`BitMapHistoryJournalBundle`
+    (or its canonical bytes) and commits the whole sealed journey in one
+    atomic step: the bundle's ``NPBJ3`` MAC and both endpoint states' two
+    MAC layers (the checkpoint tables' ``NPBL1`` and the states' own
+    ``NPBJ1``) are recomputed and compared in constant time before any
+    replay, the bundle start must equal the current state (the empty
+    journal accepts only ``start == b""``), and every carried segment is
+    then replayed on a temporary state exactly like :meth:`audit`; the
+    read-only state is replaced only once the complete chain replays and
+    lands byte for byte on the bundle's ``end``. Any failure raises
+    :class:`ValueError` without touching the journal, so the same bundle
+    cannot be replayed afterwards (its start no longer matches).
     """
 
     def __init__(self, key: object, *, state: object = None) -> None:
@@ -4804,41 +4817,122 @@ class BitMapHistoryJournalAuditor:
         """
         with self._lock:
             evidence = _coerce_bit_map_history_evidence(x, "x")
-            final = audit_map_history_evidence(evidence, self._key)
-            start, _, _ = _bit_map_history_body_parts(evidence.body)
-            current = (
-                b"" if self._state is None else self._state.checkpoint
-            )
-            if start != current:
-                raise ValueError(
-                    "bit map history evidence start does not match the"
-                    " journal checkpoint"
-                )
-            previous_sequence = 0 if self._state is None else self._state.sequence
-            if previous_sequence >= 0xFFFFFFFFFFFFFFFF:
-                raise ValueError(
-                    "bit map history journal sequence would overflow the"
-                    " unsigned 64-bit range"
-                )
-            sequence = previous_sequence + 1
-            previous_digest = (
-                b"\x00" * 32 if self._state is None else self._state.digest
-            )
-            digest = _bit_map_history_journal_next_digest(
-                previous_digest, sequence, evidence.to_bytes()
-            )
-            candidate = BitMapHistoryJournalState(
-                version=1,
-                sequence=sequence,
-                checkpoint=final.to_bytes(),
-                digest=digest,
-                mac=b"\x00" * 32,
-            )
-            self._state = replace(
-                candidate,
-                mac=_bit_map_history_journal_mac(self._key, candidate),
+            self._state = _bit_map_history_journal_advance(
+                self._key, self._state, evidence
             )
             return self
+
+    def audit_bundle(self, x: object) -> "BitMapHistoryJournalAuditor":
+        """Atomically audit one :class:`BitMapHistoryJournalBundle` and
+        commit the whole journey.
+
+        ``x`` must be a :class:`BitMapHistoryJournalBundle` or its canonical
+        :meth:`BitMapHistoryJournalBundle.to_bytes` encoding — any other
+        type raises :class:`TypeError`; every other contract violation
+        raises :class:`ValueError`. The whole check runs under the auditor
+        lock: the bundle is first parsed per its field contract and its
+        ``NPBJ3`` MAC recomputed with the auditor key and compared in
+        constant time; then, for each non-empty endpoint — ``start`` when
+        it is non-empty and the always non-empty ``end`` — the state's
+        ``NPBJ1`` MAC and the embedded checkpoint table's ``NPBL1`` MAC are
+        both recomputed, each compared in constant time, and no replay
+        begins until every one of these checks passes. The bundle start
+        must then stand exactly where the journal currently stands: an
+        empty auditor accepts ``start == b""`` only, and otherwise the
+        carried start must equal the current
+        :meth:`BitMapHistoryJournalState.to_bytes` output byte for byte.
+        Only then are the carried segments replayed in order on a
+        temporary journal state — each segment re-verified exactly like
+        :meth:`audit` (its ``NPBH1`` evidence MAC, every carried
+        ``NPBU1``/``NPBL1`` MAC, the byte-for-byte contiguous start, the
+        u64 sequence advance and the ``NPBJ2`` digest-chain step) — and the
+        replayed final state must equal the bundle's ``end`` byte for byte.
+        Verification, the start match and the state replacement are one
+        atomic commit: the read-only :attr:`state` is replaced only after
+        the entire bundle replays, so any failure leaves the journal
+        untouched, replaying the same bundle again is rejected because its
+        start no longer matches, and concurrent audits linearize in
+        lock-acquisition order. Returns the auditor itself.
+        """
+        with self._lock:
+            bundle = _coerce_bit_map_history_journal_bundle(x, "x")
+            _verify_bit_map_history_journal_bundle_endpoints(
+                self._key, bundle
+            )
+            current = (
+                b"" if self._state is None else self._state.to_bytes()
+            )
+            if bundle.start != current:
+                raise ValueError(
+                    "bit map history journal bundle start does not match the"
+                    " journal state"
+                )
+            candidate = self._state
+            for encoding in bundle.evidences:
+                # Every carried encoding is already enforced canonical by
+                # the bundle field contract; the segment audit re-verifies
+                # every MAC and chain link on the temporary journal state.
+                evidence = BitMapHistoryEvidence.from_bytes(encoding)
+                candidate = _bit_map_history_journal_advance(
+                    self._key, candidate, evidence
+                )
+            if candidate is None or candidate.to_bytes() != bundle.end:
+                raise ValueError(
+                    "bit map history journal bundle end does not match the"
+                    " replayed chain"
+                )
+            self._state = candidate
+            return self
+
+
+def _bit_map_history_journal_advance(
+    key: bytes,
+    current: "Optional[BitMapHistoryJournalState]",
+    evidence: "BitMapHistoryEvidence",
+) -> "BitMapHistoryJournalState":
+    """Verify one evidence segment against journal state ``current`` and
+    return the next :class:`BitMapHistoryJournalState`.
+
+    Pure: no auditor state is touched. The evidence is re-verified exactly
+    per :func:`audit_map_history_evidence` — the ``NPBH1`` MAC, every
+    carried ``NPBU1``/``NPBL1`` MAC and the byte-contiguous inner chain —
+    and its ``start`` must equal the current checkpoint (the empty string
+    when ``current`` is ``None``). The next sequence is the old one plus
+    one — overflowing u64 raises :class:`ValueError` — the digest advances
+    as ``SHA256(b"NPBJ2" + d + u64be(n) + E)`` and the new state is MAC'd
+    as ``HMAC-SHA256(key, b"NPBJ1" + C)``.
+    """
+    final = audit_map_history_evidence(evidence, key)
+    start, _, _ = _bit_map_history_body_parts(evidence.body)
+    expected = b"" if current is None else current.checkpoint
+    if start != expected:
+        raise ValueError(
+            "bit map history evidence start does not match the journal"
+            " checkpoint"
+        )
+    previous_sequence = 0 if current is None else current.sequence
+    if previous_sequence >= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(
+            "bit map history journal sequence would overflow the unsigned"
+            " 64-bit range"
+        )
+    sequence = previous_sequence + 1
+    previous_digest = (
+        b"\x00" * 32 if current is None else current.digest
+    )
+    digest = _bit_map_history_journal_next_digest(
+        previous_digest, sequence, evidence.to_bytes()
+    )
+    candidate = BitMapHistoryJournalState(
+        version=1,
+        sequence=sequence,
+        checkpoint=final.to_bytes(),
+        digest=digest,
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        candidate, mac=_bit_map_history_journal_mac(key, candidate)
+    )
 
 
 def _require_bit_map_history_journal_state_encoding(
@@ -5108,25 +5202,53 @@ def _coerce_bit_map_history_journal_bundle(
     )
 
 
-def _verify_bit_map_history_journal_state_macs(
-    key: bytes, journal: "BitMapHistoryJournalState", name: str
+def _verify_bit_map_history_journal_bundle_endpoints(
+    key: bytes, bundle: "BitMapHistoryJournalBundle"
 ) -> None:
-    """Recompute both MAC layers of a parsed journal state — the checkpoint
-    table's ``NPBL1`` MAC and the state's own ``NPBJ1`` MAC. Both layers are
-    always recomputed and each compared in constant time before either
-    result is consulted."""
-    table = BitMap.from_bytes(journal.checkpoint)
-    checkpoint_mac_ok = hmac.compare_digest(
-        _bit_map_mac(key, _bit_map_payload(table.entries)),
-        table.mac,
+    """Recompute the bundle's ``NPBJ3`` MAC and the two MAC layers of each
+    non-empty endpoint state.
+
+    Every check is always performed before any result is consulted: the
+    bundle MAC, then (for ``start`` when it is non-empty and for the always
+    non-empty ``end``) the checkpoint table's ``NPBL1`` MAC and the state's
+    own ``NPBJ1`` MAC, each recomputed and compared in constant time. The
+    endpoint encodings are already enforced canonical by the bundle field
+    contract. Any mismatch raises :class:`ValueError`."""
+    bundle_mac_ok = hmac.compare_digest(
+        _bit_map_history_journal_bundle_mac(key, bundle), bundle.mac
     )
-    state_mac_ok = hmac.compare_digest(
-        _bit_map_history_journal_mac(key, journal), journal.mac
+    endpoint_failures: list[bool] = []
+    if bundle.start:
+        start_state = BitMapHistoryJournalState.from_bytes(bundle.start)
+        start_table = BitMap.from_bytes(start_state.checkpoint)
+        endpoint_failures.append(
+            not hmac.compare_digest(
+                _bit_map_mac(key, _bit_map_payload(start_table.entries)),
+                start_table.mac,
+            )
+        )
+        endpoint_failures.append(
+            not hmac.compare_digest(
+                _bit_map_history_journal_mac(key, start_state),
+                start_state.mac,
+            )
+        )
+    end_state = BitMapHistoryJournalState.from_bytes(bundle.end)
+    end_table = BitMap.from_bytes(end_state.checkpoint)
+    endpoint_failures.append(
+        not hmac.compare_digest(
+            _bit_map_mac(key, _bit_map_payload(end_table.entries)),
+            end_table.mac,
+        )
     )
-    if not checkpoint_mac_ok or not state_mac_ok:
+    endpoint_failures.append(
+        not hmac.compare_digest(
+            _bit_map_history_journal_mac(key, end_state), end_state.mac
+        )
+    )
+    if not bundle_mac_ok or any(endpoint_failures):
         raise ValueError(
-            f"bit map history journal bundle {name} mac does not match the"
-            " key"
+            "bit map history journal bundle mac does not match the key"
         )
 
 
@@ -5221,23 +5343,14 @@ def audit_map_history_journal_bundle(
         raise TypeError("key must be bytes")
     if not key:
         raise ValueError("key must be non-empty")
-    if not hmac.compare_digest(
-        _bit_map_history_journal_bundle_mac(key, bundle), bundle.mac
-    ):
-        raise ValueError("bit map history journal bundle mac does not match")
+    _verify_bit_map_history_journal_bundle_endpoints(key, bundle)
+    current: "Optional[BitMapHistoryJournalState]" = None
     if bundle.start:
-        _verify_bit_map_history_journal_state_macs(
-            key, BitMapHistoryJournalState.from_bytes(bundle.start), "start"
-        )
-    _verify_bit_map_history_journal_state_macs(
-        key, BitMapHistoryJournalState.from_bytes(bundle.end), "end"
-    )
-    auditor = BitMapHistoryJournalAuditor(
-        key, state=bundle.start if bundle.start else None
-    )
-    for evidence in bundle.evidences:
-        auditor.audit(evidence)
-    final = auditor.state
+        current = BitMapHistoryJournalState.from_bytes(bundle.start)
+    for encoding in bundle.evidences:
+        evidence = BitMapHistoryEvidence.from_bytes(encoding)
+        current = _bit_map_history_journal_advance(key, current, evidence)
+    final = current
     if final is None or final.to_bytes() != bundle.end:
         raise ValueError(
             "bit map history journal bundle end does not match the replayed"

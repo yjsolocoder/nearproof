@@ -9,11 +9,14 @@ from nearproof import (
     BitMap,
     BitMapHistoryEvidence,
     BitMapHistoryJournalAuditor,
+    BitMapHistoryJournalBundle,
     BitMapHistoryJournalState,
     BitMapUpdate,
+    _BIT_MAP_HISTORY_JOURNAL_BUNDLE_PREFIX,
     _BIT_MAP_HISTORY_JOURNAL_DIGEST_PREFIX,
     _BIT_MAP_HISTORY_JOURNAL_MAC_PREFIX,
     _bit_map_history_evidence_mac,
+    _bit_map_history_journal_bundle_mac,
     _bit_map_history_journal_mac,
     _bit_map_history_journal_next_digest,
     _bit_map_history_journal_u64be,
@@ -23,6 +26,7 @@ from nearproof import (
     _bit_map_update_payload,
     _encode_payload,
     seal_map_history,
+    seal_map_history_journal_bundle,
 )
 
 KEY = b"shared-secret-key" * 2
@@ -519,6 +523,296 @@ class AuditorAuditTest(unittest.TestCase):
             auditor.state = state_for(1, MAP_2.to_bytes(), ZERO)
 
 
+class AuditorAuditBundleTest(unittest.TestCase):
+    def _next_evidence(self, auditor):
+        """One evidence segment appending one entry to the checkpoint."""
+        index = auditor.state.sequence
+        before = auditor.state.checkpoint
+        existing = BitMap.from_bytes(before).entries
+        sid = bytes((0x10 + index,)) * 32
+        table = map_for(existing + ((sid, index + 10, sid),))
+        return seal_map_history(
+            [update_for(before, table.to_bytes())], KEY,
+            checkpoint=BitMap.from_bytes(before),
+        )
+
+    def test_commit_from_empty_returns_same_auditor(self):
+        bundle = seal_map_history_journal_bundle([EVIDENCE_1], KEY)
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        self.assertIs(auditor.audit_bundle(bundle), auditor)
+        self.assertEqual(auditor.state.sequence, 1)
+        self.assertEqual(auditor.state.checkpoint, MAP_2.to_bytes())
+        d1 = _bit_map_history_journal_next_digest(
+            b"\x00" * 32, 1, EVIDENCE_1.to_bytes()
+        )
+        self.assertEqual(auditor.state.digest, d1)
+
+    def test_commit_full_chain_and_accepts_bytes(self):
+        bundle = seal_map_history_journal_bundle(
+            [EVIDENCE_1, EVIDENCE_2], KEY
+        )
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        self.assertIs(auditor.audit_bundle(bundle.to_bytes()), auditor)
+        self.assertEqual(auditor.state.sequence, 2)
+        self.assertEqual(auditor.state.checkpoint, MAP_3.to_bytes())
+
+    def test_commit_from_current_state_then_chain_again(self):
+        first = seal_map_history_journal_bundle([EVIDENCE_1], KEY)
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        auditor.audit_bundle(first)
+        middle = auditor.state
+        second = seal_map_history_journal_bundle(
+            [EVIDENCE_2], KEY, state=middle
+        )
+        self.assertIs(auditor.audit_bundle(second), auditor)
+        self.assertEqual(auditor.state.sequence, 2)
+        self.assertEqual(auditor.state.checkpoint, MAP_3.to_bytes())
+        third = seal_map_history_journal_bundle(
+            [self._next_evidence(auditor)], KEY, state=auditor.state
+        )
+        auditor.audit_bundle(third)
+        self.assertEqual(auditor.state.sequence, 3)
+
+    def test_same_bundle_replay_rejected_state_kept(self):
+        bundle = seal_map_history_journal_bundle(
+            [EVIDENCE_1, EVIDENCE_2], KEY
+        )
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        auditor.audit_bundle(bundle)
+        before = auditor.state
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle.to_bytes())
+        self.assertEqual(auditor.state, before)
+
+    def test_empty_auditor_rejects_nonempty_start(self):
+        bundle = seal_map_history_journal_bundle(
+            [EVIDENCE_2], KEY,
+            state=BitMapHistoryJournalAuditor(KEY).audit(EVIDENCE_1).state,
+        )
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        self.assertIsNone(auditor.state)
+
+    def test_nonempty_auditor_rejects_empty_start(self):
+        bundle = seal_map_history_journal_bundle(
+            [EVIDENCE_1, EVIDENCE_2], KEY
+        )
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        auditor.audit(EVIDENCE_1)
+        before = auditor.state
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        self.assertEqual(auditor.state, before)
+
+    def test_start_from_different_state_rejected(self):
+        # A validly sealed bundle whose start state sits at the same
+        # checkpoint table but carries a different digest head does not
+        # match the auditor's current state bytes.
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        auditor.audit(EVIDENCE_1)
+        before = auditor.state
+        divergent_start = state_for(1, MAP_2.to_bytes(), ZERO)
+        divergent_digest = _bit_map_history_journal_next_digest(
+            ZERO, 2, EVIDENCE_2.to_bytes()
+        )
+        divergent_end = state_for(2, MAP_3.to_bytes(), divergent_digest)
+        bundle = self._bundle_for(
+            divergent_start.to_bytes(),
+            (EVIDENCE_2.to_bytes(),),
+            divergent_end.to_bytes(),
+        )
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        self.assertEqual(auditor.state, before)
+
+    def test_argument_type_contract(self):
+        bundle = seal_map_history_journal_bundle([EVIDENCE_1], KEY)
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        for bad in (1, "x", None, [bundle], {}, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                auditor.audit_bundle(bad)
+        with self.assertRaises(TypeError):
+            auditor.audit_bundle(bytearray(bundle.to_bytes()))
+        self.assertIsNone(auditor.state)
+
+    def test_malformed_bytes_is_value_error(self):
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(b"junk")
+        self.assertIsNone(auditor.state)
+
+    def test_failure_never_changes_state_chain(self):
+        bundle = seal_map_history_journal_bundle([EVIDENCE_1], KEY)
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        auditor.audit_bundle(bundle)
+        before = auditor.state
+        # Every failure mode below must leave the state untouched.
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)  # replay
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(
+                dataclasses.replace(bundle, mac=ZERO)
+            )
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(
+                dataclasses.replace(
+                    bundle,
+                    mac=_bit_map_history_journal_bundle_mac(
+                        b"a-different-key!!" * 2, bundle
+                    ),
+                )
+            )
+        self.assertEqual(auditor.state, before)
+
+    def _bundle_for(self, start, evidences, end, key=KEY):
+        placeholder = BitMapHistoryJournalBundle(
+            1, start, evidences, end, ZERO
+        )
+        return dataclasses.replace(
+            placeholder,
+            mac=_bit_map_history_journal_bundle_mac(key, placeholder),
+        )
+
+    def test_tampered_start_state_mac(self):
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        auditor.audit(EVIDENCE_1)
+        end = BitMapHistoryJournalAuditor(
+            KEY, state=auditor.state.to_bytes()
+        )
+        end.audit(EVIDENCE_2)
+        bundle = self._bundle_for(
+            dataclasses.replace(auditor.state, mac=ZERO).to_bytes(),
+            (EVIDENCE_2.to_bytes(),),
+            end.state.to_bytes(),
+        )
+        before = auditor.state
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        self.assertEqual(auditor.state, before)
+
+    def test_tampered_end_state_mac(self):
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        auditor.audit(EVIDENCE_1)
+        end = BitMapHistoryJournalAuditor(
+            KEY, state=auditor.state.to_bytes()
+        )
+        end.audit(EVIDENCE_2)
+        bundle = self._bundle_for(
+            auditor.state.to_bytes(),
+            (EVIDENCE_2.to_bytes(),),
+            dataclasses.replace(end.state, mac=ZERO).to_bytes(),
+        )
+        before = auditor.state
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        self.assertEqual(auditor.state, before)
+
+    def test_foreign_checkpoint_key_fails_npbl1_layer(self):
+        other_key = b"a-different-key!!" * 2
+        foreign = map_for(((SID_A, 1, HASH_1),), key=other_key)
+        foreign_update = update_for(b"", foreign.to_bytes(), key=other_key)
+        foreign_evidence = seal_map_history(
+            [foreign_update], other_key
+        )
+        foreign_auditor = BitMapHistoryJournalAuditor(other_key)
+        foreign_auditor.audit(foreign_evidence)
+        placeholder = BitMapHistoryJournalState(
+            1,
+            foreign_auditor.state.sequence,
+            foreign_auditor.state.checkpoint,
+            foreign_auditor.state.digest,
+            ZERO,
+        )
+        # NPBJ1 valid under KEY but the carried checkpoint is not: the
+        # NPBL1 layer must fail before replay starts.
+        mixed = dataclasses.replace(
+            placeholder,
+            mac=_bit_map_history_journal_mac(KEY, placeholder),
+        )
+        bundle = self._bundle_for(
+            b"", (foreign_evidence.to_bytes(),), mixed.to_bytes()
+        )
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        self.assertIsNone(auditor.state)
+
+    def test_end_mismatch_state_kept(self):
+        first = BitMapHistoryJournalAuditor(KEY)
+        first.audit(EVIDENCE_1)
+        bundle = self._bundle_for(
+            b"",
+            (EVIDENCE_1.to_bytes(), EVIDENCE_2.to_bytes()),
+            first.state.to_bytes(),
+        )
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        self.assertIsNone(auditor.state)
+
+    def test_broken_inner_chain_state_kept(self):
+        end = BitMapHistoryJournalAuditor(KEY)
+        end.audit(EVIDENCE_1)
+        end.audit(EVIDENCE_2)
+        # First segment does not start from the empty journal.
+        bundle = self._bundle_for(
+            b"", (EVIDENCE_2.to_bytes(),), end.state.to_bytes()
+        )
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        self.assertIsNone(auditor.state)
+
+    def test_tampered_carried_evidence_mac(self):
+        # Rebuild the bundle bytes over an evidence whose NPBH1 mac was
+        # zeroed, re-sealing only the outer NPBJ3 mac: the endpoint MACs
+        # stay valid but segment replay must fail.
+        sealed = seal_map_history_journal_bundle(
+            [EVIDENCE_1, EVIDENCE_2], KEY
+        )
+        outer = json.loads(sealed.to_bytes())
+        evidence_outer = json.loads(bytes.fromhex(outer[2][0]))
+        evidence_outer[2] = ZERO.hex()
+        outer[2][0] = json.dumps(
+            evidence_outer, separators=(",", ":")
+        ).encode().hex()
+        content = _encode_payload(
+            [outer[0], outer[1], outer[2], outer[3]]
+        )
+        outer[4] = hmac.new(
+            KEY,
+            _BIT_MAP_HISTORY_JOURNAL_BUNDLE_PREFIX + content,
+            hashlib.sha256,
+        ).hexdigest()
+        evil = _encode_payload(outer)
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(evil)
+        self.assertIsNone(auditor.state)
+
+    def test_sequence_overflow(self):
+        state = state_for(U64_MAX, MAP_2.to_bytes(), HASH_2)
+        end = state_for(U64_MAX, MAP_2.to_bytes(), HASH_2)
+        bundle = self._bundle_for(
+            state.to_bytes(), (EVIDENCE_2.to_bytes(),), end.to_bytes()
+        )
+        auditor = BitMapHistoryJournalAuditor(KEY, state=state)
+        with self.assertRaises(ValueError):
+            auditor.audit_bundle(bundle)
+        self.assertEqual(auditor.state, state)
+
+    def test_audit_still_works_after_bundle(self):
+        bundle = seal_map_history_journal_bundle([EVIDENCE_1], KEY)
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        auditor.audit_bundle(bundle)
+        auditor.audit(EVIDENCE_2)
+        self.assertEqual(auditor.state.sequence, 2)
+        self.assertEqual(auditor.state.checkpoint, MAP_3.to_bytes())
+
+
 class AuditorConcurrencyTest(unittest.TestCase):
     def test_competing_segments_linearize(self):
         auditor = BitMapHistoryJournalAuditor(KEY)
@@ -548,6 +842,49 @@ class AuditorConcurrencyTest(unittest.TestCase):
             auditor.state.checkpoint,
             (MAP_1.to_bytes(), MAP_2.to_bytes()),
         )
+
+    def test_competing_bundles_linearize(self):
+        # Two validly sealed bundles both start from the empty journal;
+        # only the first to take the lock commits, the other is rejected
+        # on the start match and the committed state is never lost.
+        one_segment = seal_map_history([UPDATE_1], KEY)  # "" -> MAP_1
+        first_bundle = seal_map_history_journal_bundle(
+            [one_segment], KEY
+        )
+        full_bundle = seal_map_history_journal_bundle(
+            [EVIDENCE_1, EVIDENCE_2], KEY
+        )
+        auditor = BitMapHistoryJournalAuditor(KEY)
+        results = []
+        failures = []
+
+        def run(bundle):
+            try:
+                results.append(auditor.audit_bundle(bundle))
+            except ValueError:
+                failures.append(bundle)
+
+        threads = [
+            threading.Thread(target=run, args=(first_bundle,)),
+            threading.Thread(target=run, args=(full_bundle,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertIn(auditor.state.sequence, (1, 2))
+        # A bundle replays multiple segments atomically or not at all, so
+        # a partial two-segment commit ending at sequence 1 cannot happen.
+        if auditor.state.sequence == 1:
+            self.assertEqual(
+                auditor.state.checkpoint, MAP_1.to_bytes()
+            )
+        else:
+            self.assertEqual(
+                auditor.state.checkpoint, MAP_3.to_bytes()
+            )
 
 
 if __name__ == "__main__":
