@@ -2,6 +2,7 @@
 
 Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
 BitGuard / BitMap / BitMapHistoryAuditor / BitMapHistoryEvidence /
+BitMapHistoryEvidenceAuditor /
 BitMapUpdate / BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
@@ -44,6 +45,7 @@ __all__ = [
     "BitMap",
     "BitMapHistoryAuditor",
     "BitMapHistoryEvidence",
+    "BitMapHistoryEvidenceAuditor",
     "BitMapUpdate",
     "BitRound",
     "BitSession",
@@ -4351,6 +4353,111 @@ def audit_map_history_evidence(x: object, key: object) -> "BitMap":
             "bit map history evidence end does not match the audited chain"
         )
     return final
+
+
+class BitMapHistoryEvidenceAuditor:
+    """Stateful auditor chaining sealed history evidences into one stream.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    shared key the tables, transition proofs and history evidences are
+    MAC'd with. ``checkpoint`` is keyword-only: ``None`` (the default)
+    starts from no table at all; otherwise it must be a :class:`BitMap` or
+    its canonical :meth:`BitMap.to_bytes` encoding (any other type raises
+    :class:`TypeError`), parsed under the full :class:`BitMap` contract and
+    its ``NPBL1`` MAC recomputed with ``key`` and compared in constant time
+    — a malformed encoding or MAC mismatch raises :class:`ValueError`.
+    Across a restart the caller must pass the value previously exported at
+    :attr:`checkpoint`; nothing is persisted by the auditor itself.
+
+    Each :meth:`audit` re-runs :func:`audit_map_history_evidence` over the
+    evidence under the auditor lock and then chains it onto the current
+    checkpoint: with no checkpoint yet the body's ``start`` must be the
+    empty string, otherwise the :class:`BitMap` it decodes to must equal
+    the current checkpoint byte for byte. Only when the whole evidence
+    verifies and chains is the checkpoint replaced with the body's ``end``
+    table, so a replayed evidence, a fork from an already-advanced starting
+    point, a broken chain, a wrong key, a tampered or non-canonical
+    encoding or any start mismatch raises :class:`ValueError` and leaves
+    the checkpoint untouched. Concurrent audits linearize in
+    lock-acquisition order: of competing evidences chaining from the same
+    starting point only the first to commit can succeed, and a committed
+    evidence is never rolled back.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._table: "Optional[BitMap]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, BitMap):
+            table = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                table = BitMap.from_bytes(checkpoint)
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value error.
+                raise ValueError(
+                    "checkpoint does not satisfy the bit map field contract"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be a BitMap instance, its canonical bytes,"
+                " or None"
+            )
+        if not hmac.compare_digest(
+            _bit_map_mac(self._key, _bit_map_payload(table.entries)),
+            table.mac,
+        ):
+            raise ValueError("checkpoint mac does not match the key")
+        self._table = table
+
+    @property
+    def checkpoint(self) -> "Optional[BitMap]":
+        """The current frontier :class:`BitMap`, or ``None`` before the
+        first successfully audited evidence. The returned object is frozen
+        and the property read-only; persist its :meth:`BitMap.to_bytes`
+        output and pass it back to a new auditor to survive a restart."""
+        return self._table
+
+    def audit(self, x: object) -> "BitMap":
+        """Audit one :class:`BitMapHistoryEvidence` and advance.
+
+        ``x`` must be a :class:`BitMapHistoryEvidence` or its canonical
+        :meth:`BitMapHistoryEvidence.to_bytes` encoding — any other type
+        raises :class:`TypeError`. The evidence is fully re-verified with
+        :func:`audit_map_history_evidence` against the auditor key under
+        the auditor lock — MAC, per-update chain and recomputed final table
+        — and must chain onto the current checkpoint: from the empty state
+        the body's ``start`` must be the empty string, otherwise the
+        canonical :class:`BitMap` bytes it decodes to must equal
+        ``checkpoint.to_bytes()`` byte for byte. Every failure — a
+        malformed or non-canonical encoding, a MAC mismatch, a replayed
+        evidence, a fork from an already-advanced start, a broken chain or
+        a start mismatch — raises :class:`ValueError` and changes nothing.
+        The check and the checkpoint advance are one atomic step, so
+        concurrent audits are serialized in lock-acquisition order. On
+        success the checkpoint is replaced with the body's ``end`` table
+        and that frozen :class:`BitMap` is returned.
+        """
+        evidence = _coerce_bit_map_history_evidence(x, "x")
+        with self._lock:
+            final = audit_map_history_evidence(evidence, self._key)
+            start, _, _ = _bit_map_history_body_parts(evidence.body)
+            expected = b"" if self._table is None else self._table.to_bytes()
+            if start != expected:
+                raise ValueError(
+                    "bit map history evidence start does not match the"
+                    " current checkpoint"
+                )
+            self._table = final
+            return final
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
