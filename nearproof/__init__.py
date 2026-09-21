@@ -7,7 +7,7 @@ Evidence /
 Measurement / Observation / ObservationRevocation / Prover / RangeDecision
 / SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList / Verifier /
 VerifierTrust / assess / attest_observation /
-attest_observation_for_point / audit / audit_bound / audit_bound_policy /
+attest_observation_for_point / audit / audit_b / audit_bound / audit_bound_policy /
 audit_cert_evidence / audit_crl / audit_proof / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
@@ -56,6 +56,7 @@ __all__ = [
     "attest_observation",
     "attest_observation_for_point",
     "audit",
+    "audit_b",
     "audit_bound",
     "audit_bound_policy",
     "audit_cert_evidence",
@@ -102,6 +103,11 @@ _CERT_EVIDENCE_PREFIX = b"NPCCE1"
 _CRL_PROOF_PREFIX = b"NPCCE2"
 # Domain separation prefix for the rollback-protection CRL-state MAC.
 _CRL_STATE_PREFIX = b"NPCK1"
+# Domain separation prefixes for the bit-challenge commitment, the bit
+# response and the bits-record MAC.
+_BIT_COMMITMENT_PREFIX = b"NPFC1"
+_BIT_RESPONSE_PREFIX = b"NPFR1"
+_BITS_RECORD_PREFIX = b"NPFB1"
 
 _PENDING = "pending"
 _CONSUMED = "consumed"
@@ -955,6 +961,35 @@ def bound_response(
     return hmac.new(key, message, hashlib.sha256).digest()
 
 
+def bit_commitment(context: bytes, opening: bytes) -> bytes:
+    """The bit-challenge commitment ``SHA256(b"NPFC1" + context + opening)``.
+
+    ``context`` and ``opening`` are concatenated with no separator or length
+    prefix; both are fixed-width 32-byte values so the concatenation is
+    unambiguous.
+    """
+    return hashlib.sha256(_BIT_COMMITMENT_PREFIX + context + opening).digest()
+
+
+def bit_response(
+    key: bytes, token: bytes, index: int, bit: int, digest: bytes
+) -> bytes:
+    """The response for one bit-challenge round.
+
+    ``HMAC-SHA256(key, b"NPFR1" + token + u32be(index) + bytes([bit]) +
+    digest)`` with ``index`` encoded as a fixed 4-byte unsigned big-endian
+    integer and ``bit`` as a single byte.
+    """
+    message = (
+        _BIT_RESPONSE_PREFIX
+        + token
+        + int(index).to_bytes(4, byteorder="big", signed=False)
+        + bytes([bit])
+        + digest
+    )
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+
 class Prover:
     """Answers challenges with a keyed response."""
 
@@ -1001,6 +1036,28 @@ class Prover:
             raise ValueError(f"nonce must be exactly {NONCE_BYTES} bytes")
         digest = context_digest(context, opening)
         return bound_response(self._key, digest, round_index, challenge.nonce)
+
+    def bit(self, token: bytes, digest: bytes, index: int, bit: int) -> bytes:
+        """Answer one single-bit challenge of a :meth:`Verifier.bits` batch.
+
+        ``token`` must be exactly 16 bytes and ``digest`` exactly 32 bytes
+        (the ``SHA256(b"NPFC1" + context + opening)`` commitment of the
+        batch); ``index`` must be a non-bool unsigned 32-bit integer and
+        ``bit`` exactly ``0`` or ``1``. Returns
+        ``HMAC-SHA256(key, b"NPFR1" + token + u32be(index) + bytes([bit]) +
+        digest)``. Any contract violation raises :class:`ValueError`.
+        """
+        if not isinstance(token, bytes) or len(token) != NONCE_BYTES:
+            raise ValueError(f"token must be exactly {NONCE_BYTES} bytes")
+        if not isinstance(digest, bytes) or len(digest) != DIGEST_BYTES:
+            raise ValueError(f"digest must be exactly {DIGEST_BYTES} bytes")
+        if isinstance(index, bool) or type(index) is not int:
+            raise ValueError("index must be a non-bool integer")
+        if not 0 <= index <= 0xFFFFFFFF:
+            raise ValueError("index must fit in an unsigned 32-bit integer")
+        if not isinstance(bit, int) or bit not in (0, 1):
+            raise ValueError("bit must be 0 or 1")
+        return bit_response(self._key, token, index, bit, digest)
 
 
 class Verifier:
@@ -1490,6 +1547,85 @@ class Verifier:
         response = prover.respond(challenge)
         return self.verify(challenge, response, started_at)
 
+    def bits(
+        self,
+        prover: Prover,
+        context: bytes,
+        opening: bytes,
+        *,
+        rounds: int = 32,
+        timeout: float = 0.001,
+    ) -> bytes:
+        """Run a batch of single-bit challenge rounds and return a MAC'd record.
+
+        ``context`` and ``opening`` must each be exactly 32 bytes; the batch
+        is bound to the commitment ``D = SHA256(b"NPFC1" + context +
+        opening)``. ``rounds`` must be a non-bool integer in ``1..2**32``
+        and ``timeout`` a finite positive non-bool number; any contract
+        violation raises :class:`ValueError`.
+
+        A random 16-byte token ``t`` is drawn for the batch. In round ``j``
+        a random challenge bit ``b`` is picked, the clock is read, the
+        prover answers ``bit(t, D, j, b)``, the clock is read again and the
+        response is compared in constant time against
+        ``HMAC-SHA256(key, b"NPFR1" + t + u32be(j) + bytes([b]) + D)``; a
+        mismatch raises :class:`ValueError`. The round trip ``R = e - s``
+        must satisfy ``0 <= R <= T`` with ``T = float(timeout)`` — a slow or
+        non-finite round trip raises :class:`ValueError`.
+
+        The record ``A = [1, t, C, D, O, Q, V, T, L, M]`` collects the
+        per-round entries ``Q[j] = [b, r, s, e]``, the propagation speed
+        ``V`` and the distance bound ``L = max(R) * V / 2``; ``M`` is
+        ``HMAC-SHA256(key, b"NPFB1" + E)`` over the canonical encoding
+        ``E`` of ``A`` without ``M``. The canonical encoding of the full
+        record is returned: a compact UTF-8 JSON array, byte fields as
+        lowercase hex, no whitespace, no NaN/Infinity. A holder of the
+        shared key can re-check it later with :func:`audit_b`.
+        """
+        if not isinstance(context, bytes) or len(context) != CONTEXT_BYTES:
+            raise ValueError(f"context must be exactly {CONTEXT_BYTES} bytes")
+        if not isinstance(opening, bytes) or len(opening) != OPENING_BYTES:
+            raise ValueError(f"opening must be exactly {OPENING_BYTES} bytes")
+        if isinstance(rounds, bool) or type(rounds) is not int:
+            raise ValueError("rounds must be a non-bool integer")
+        if not 1 <= rounds <= 0x100000000:
+            raise ValueError("rounds must be between 1 and 2**32")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise ValueError("timeout must be a finite positive number")
+        limit = float(timeout)
+        if not math.isfinite(limit) or limit <= 0:
+            raise ValueError("timeout must be a finite positive number")
+        if not math.isfinite(self._speed):
+            raise ValueError("speed_mps must be a finite number")
+        token = os.urandom(NONCE_BYTES)
+        digest = bit_commitment(context, opening)
+        samples: list[tuple[int, bytes, float, float]] = []
+        slowest = 0.0
+        for index in range(rounds):
+            bit = os.urandom(1)[0] & 1
+            start = float(self._clock())
+            response = bytes(prover.bit(token, digest, index, bit))
+            end = float(self._clock())
+            expected = bit_response(self._key, token, index, bit, digest)
+            if not hmac.compare_digest(expected, response):
+                raise ValueError("response does not match the challenge")
+            elapsed = end - start
+            if not math.isfinite(elapsed):
+                raise ValueError("elapsed time must be a finite number")
+            if not 0.0 <= elapsed <= limit:
+                raise ValueError("round trip exceeded the timeout")
+            samples.append((bit, response, start, end))
+            if elapsed > slowest:
+                slowest = elapsed
+        distance = slowest * self._speed / 2.0
+        if not math.isfinite(distance) or distance < 0:
+            raise ValueError("distance must be a finite non-negative number")
+        payload = _bits_record_payload(
+            token, context, digest, opening, samples, self._speed, limit, distance
+        )
+        mac = _bits_record_mac(self._key, payload)
+        return _encode_payload(payload + [mac.hex()])
+
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
     """Re-verify an :class:`Evidence` record against the shared ``key``.
@@ -1719,6 +1855,193 @@ def audit_bound_policy(
         if not 0.0 <= age <= age_limit:
             raise ValueError("bound evidence is outside the allowed age")
     return measurement
+
+
+def _bits_record_payload(
+    token: bytes,
+    context: bytes,
+    digest: bytes,
+    opening: bytes,
+    samples: "list[tuple[int, bytes, float, float]]",
+    speed: float,
+    limit: float,
+    distance: float,
+) -> list:
+    """The JSON-ready bits-record elements except ``mac``, in field order."""
+    return [
+        1,
+        token.hex(),
+        context.hex(),
+        digest.hex(),
+        opening.hex(),
+        [
+            [bit, response.hex(), start, end]
+            for bit, response, start, end in samples
+        ],
+        speed,
+        limit,
+        distance,
+    ]
+
+
+def _bits_record_mac(key: bytes, payload: list) -> bytes:
+    """HMAC-SHA256 over ``b"NPFB1"`` plus the canonical encoding without ``mac``."""
+    return hmac.new(
+        key, _BITS_RECORD_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+def _parse_bits_record(
+    data: bytes,
+) -> "tuple[bytes, bytes, bytes, bytes, list[tuple[int, bytes, float, float]], float, float, float, bytes]":
+    """Decode a canonical :meth:`Verifier.bits` record, enforcing the contract.
+
+    Returns ``(token, context, digest, opening, samples, speed, limit,
+    distance, mac)`` with ``samples`` a list of ``(bit, response, start,
+    end)`` tuples. Raises :class:`ValueError` for anything that does not
+    satisfy the contract: a JSON array of exactly ten elements with
+    ``version == 1``; ``token`` a lowercase hex string decoding to exactly
+    16 bytes; ``context``/``digest``/``opening``/``mac`` lowercase hex
+    strings decoding to exactly 32 bytes each; a non-empty sample array of
+    ``[bit, response, start, end]`` entries with ``bit`` a non-bool ``0`` or
+    ``1``, ``response`` a lowercase hex string decoding to exactly 32 bytes
+    and ``start``/``end`` finite non-bool numbers; ``speed``/``timeout``/
+    ``distance`` finite non-bool numbers with ``distance >= 0``. After
+    parsing and field validation the record is re-encoded and the result
+    must equal the input byte for byte, so formatted JSON, whitespace and
+    any non-canonical number or string spelling are rejected as well. The
+    MAC is not verified here — use :func:`audit_b` with the shared key.
+    """
+    try:
+        obj = json.loads(data)
+    except ValueError as error:
+        raise ValueError(f"bits record is not valid JSON: {error}") from error
+    if not isinstance(obj, list) or len(obj) != 10:
+        raise ValueError("bits record must be a JSON array of exactly 10 elements")
+    version = obj[0]
+    if type(version) is not int or version != 1:
+        raise ValueError("bits record version must be 1")
+    token = _parse_hex_field(obj[1], "token")
+    if len(token) != NONCE_BYTES:
+        raise ValueError(
+            f"bits record token must decode to exactly {NONCE_BYTES} bytes"
+        )
+    fixed: dict[str, bytes] = {}
+    for name, index in (("context", 2), ("digest", 3), ("opening", 4), ("mac", 9)):
+        value = _parse_hex_field(obj[index], name)
+        if len(value) != 32:
+            raise ValueError(
+                f"bits record {name} must decode to exactly 32 bytes"
+            )
+        fixed[name] = value
+    raw_samples = obj[5]
+    if not isinstance(raw_samples, list) or not 1 <= len(raw_samples) <= 0x100000000:
+        raise ValueError(
+            "bits record samples must be an array of 1 to 2**32 entries"
+        )
+    samples: list[tuple[int, bytes, float, float]] = []
+    for entry in raw_samples:
+        if not isinstance(entry, list) or len(entry) != 4:
+            raise ValueError(
+                "bits record sample must be an array of exactly 4 elements"
+            )
+        bit = entry[0]
+        if type(bit) is not int or bit not in (0, 1):
+            raise ValueError("bits record sample bit must be 0 or 1")
+        response = _parse_hex_field(entry[1], "response")
+        if len(response) != 32:
+            raise ValueError(
+                "bits record sample response must decode to exactly 32 bytes"
+            )
+        start = _parse_float_field(entry[2], "start")
+        end = _parse_float_field(entry[3], "end")
+        samples.append((bit, response, start, end))
+    speed = _parse_float_field(obj[6], "speed")
+    limit = _parse_float_field(obj[7], "timeout")
+    distance = _parse_float_field(obj[8], "distance")
+    if distance < 0:
+        raise ValueError("bits record distance must be non-negative")
+    mac = fixed["mac"]
+    payload = _bits_record_payload(
+        token,
+        fixed["context"],
+        fixed["digest"],
+        fixed["opening"],
+        samples,
+        speed,
+        limit,
+        distance,
+    )
+    if _encode_payload(payload + [mac.hex()]) != data:
+        # Same canonical-encoding rule as the other records: no whitespace,
+        # pretty-printing, framing or non-canonical number/string spellings.
+        raise ValueError("bits record encoding is not canonical")
+    return (
+        token,
+        fixed["context"],
+        fixed["digest"],
+        fixed["opening"],
+        samples,
+        speed,
+        limit,
+        distance,
+        mac,
+    )
+
+
+def audit_b(x: bytes, k: bytes) -> float:
+    """Re-verify a :meth:`Verifier.bits` record against the shared key ``k``.
+
+    ``x`` must be the non-empty canonical record bytes and ``k`` a non-empty
+    ``bytes`` key; anything else, and every other contract violation, raises
+    :class:`ValueError`. The record MAC ``HMAC-SHA256(k, b"NPFB1" + E)`` is
+    recomputed over the canonical encoding ``E`` of every element except
+    ``mac`` itself and compared in constant time; then every carried value
+    is recomputed: the commitment ``SHA256(b"NPFC1" + context + opening)``
+    must equal the recorded digest, each round's response must equal
+    ``HMAC-SHA256(k, b"NPFR1" + token + u32be(index) + bytes([bit]) +
+    digest)`` (compared in constant time), each round trip ``R = end -
+    start`` must satisfy ``0 <= R <= T``, and the recorded ``L`` must equal
+    ``max(R) * V / 2``. On success the audited distance bound ``L`` is
+    returned.
+
+    Auditing is a pure check: it touches no verifier state.
+    """
+    if not isinstance(k, bytes) or not k:
+        raise ValueError("k must be non-empty bytes")
+    if not isinstance(x, bytes) or not x:
+        raise ValueError("x must be non-empty bytes")
+    (
+        token,
+        context,
+        digest,
+        opening,
+        samples,
+        speed,
+        limit,
+        distance,
+        mac,
+    ) = _parse_bits_record(x)
+    payload = _bits_record_payload(
+        token, context, digest, opening, samples, speed, limit, distance
+    )
+    if not hmac.compare_digest(_bits_record_mac(k, payload), mac):
+        raise ValueError("bits record mac does not match")
+    if not hmac.compare_digest(bit_commitment(context, opening), digest):
+        raise ValueError("bits record digest does not match context and opening")
+    slowest = 0.0
+    for index, (bit, response, start, end) in enumerate(samples):
+        expected = bit_response(k, token, index, bit, digest)
+        if not hmac.compare_digest(expected, response):
+            raise ValueError("bits record response does not match the key")
+        elapsed = end - start
+        if not 0.0 <= elapsed <= limit:
+            raise ValueError("bits record round trip is outside the timeout")
+        if elapsed > slowest:
+            slowest = elapsed
+    if slowest * speed / 2.0 != distance:
+        raise ValueError("bits record distance does not match the round trips")
+    return float(distance)
 
 
 def _check_assess_params(limit: object, min_samples: object) -> tuple[float, int]:
