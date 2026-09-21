@@ -46,6 +46,7 @@ python3 -m nearproof
   - `verify_bound(challenge, response, started_at, *, opening) -> BoundEvidence` — 仅限上下文绑定挑战的 `verify_evidence`（见下）
   - `measure(prover)` — 一次完整往返
   - `bits(prover, context, opening, *, rounds=32, timeout=0.001) -> bytes` — 跑一场位挑战会话，返回 `BitEvidence.to_bytes()` 的字节证据；`context`/`opening` 各 32 字节（见下）
+  - `start_bits(context, opening, *, rounds=32, timeout=0.001) -> BitSession` — 开一场**可分步驱动**的位挑战会话，供验证者跨外部传输逐轮计时/验答；参数契约与 `bits` 相同（见下）
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
   - `clock` — 只读属性，暴露计时函数
 - `assess(samples, limit, *, key=None, min_samples=5) -> RangeDecision` — 基于一批轮次的稳健距离判定（见下）
@@ -54,6 +55,8 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, t, C, D, O, Q, V, T, L, M]`，bytes 字段小写 hex
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
 - `audit_b(x, k) -> float` — **仅收非空 bytes** 的证据字节与非空 bytes 密钥；恒时复核 `NPFB1` MAC，重算 `D`、逐位应答（按下标 i）、`0 <= e-s <= T` 与 `L = max(e-s)*V/2`，任何不符抛 `ValueError`，成功返回复算的 `L`（见下）
+- `BitRound(version, t, index, bit)` — 分步会话中一轮的冻结挑战（按字段序位置构造、冻结且按字段相等）：`version=1`、`t` 恰 16 字节、`index` 为非布尔 u32、`bit` 为非布尔整数 0/1；字段类型错抛 `TypeError`，值违约抛 `ValueError`
+- `BitSession` — `Verifier.start_bits` 返回的可分步驱动会话（见下）：`next() -> BitRound`、`submit(round, response) -> None`、`finish() -> bytes`、`revoke() -> None`，及只读 `round_count`
 - `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮已接受**上下文绑定**验证的防篡改记录（`version=1`，四个 bytes 字段均恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -286,6 +289,28 @@ from nearproof import Prover, Verifier, audit_b
 prover, verifier = Prover(key), Verifier(key)
 blob = verifier.bits(prover, context, opening, rounds=32, timeout=0.001)
 upper_bound = audit_b(blob, key)          # 复算通过则返回 L（米）
+```
+
+#### 可分步驱动的位会话 `Verifier.start_bits`
+
+`bits` 一次性在本进程内调完证明者；当挑战位要经外部传输发给对端、应答稍后才返回时，用 `start_bits(context, opening, *, rounds=32, timeout=0.001) -> BitSession` 把一场会话拆成逐轮的 `next()`/`submit()`。参数契约与 `bits` 完全相同（`context`/`opening` 各 32 字节、`rounds∈1..2^32` 非布尔整数、`timeout` 有限正非布尔数、速度须有限）；创建时即随机生成 16 字节 `t` 并算一次 `D = SHA256(b"NPFC1"+C+O)`。`Verifier.bits` 及其余位协议接口不变，分步会话产出的也是同一份 `BitEvidence` 规范字节。
+
+- `next() -> BitRound`：随机抽取挑战位，**读一次时钟得 `s`**，返回冻结的 `BitRound(version, t, index, bit)`（`version=1`、`t` 恰 16 字节即本场 `t`、`index` 为从 0 起的非布尔 u32 轮次、`bit` 为非布尔整数 0 或 1）。同一时刻只允许一轮未决：上一轮未 `submit` 前再调 `next` 抛 `ValueError`。
+- `submit(round, response) -> None`：**读一次时钟得 `e`**，恒时核对既有 `NPFR1` 应答 `HMAC-SHA256(key, b"NPFR1" + t + u32be(index) + bytes([bit]) + D)`，并要求闭区间 `0 <= e-s <= timeout`、时钟读数有限。成功轮按序进入证据的 `Q` 并解锁下一轮。
+- `finish() -> bytes`：必须全部 `rounds` 轮都成功且当前无未决轮，才返回 `[1, t, C, D, O, Q, V, T, L, M]` 的规范 `BitEvidence.to_bytes()` 字节（`L = max(e-s)*V/2`、`M` 为 `NPFB1` MAC），可直接交 `audit_b` 复核；未完成或有未决轮抛 `ValueError`。
+- `revoke() -> None`：终结会话；终结后 `next`/`submit`/`finish`/再次 `revoke` 一律 `ValueError`，未决轮再不能完成，也不产出证据。
+
+轮次与其 `t`/`index`/`bit` 绑定：跨会话的轮、乱序或重复提交（即使字段相同的另造对象）、终结之后的调用均抛 `ValueError`。状态推进在锁内原子完成，并发提交同一轮至多一次成功；验答失败（错误/超时/负耗时/非有限读数）不推进状态，同一轮在未超时前可凭修正后的应答重试（仍以 `next` 时那次 `s` 计时）。形状错误——`round` 不是 `BitRound`、`response` 不是 `bytes`——抛 `TypeError`；其余违约一律 `ValueError`。另设只读 `round_count` 反映已成功轮数。
+
+```python
+session = verifier.start_bits(context, opening, rounds=32, timeout=0.001)
+for _ in range(32):
+    round_ = session.next()                 # 此刻读 s
+    response = send_over_transport(round_)  # 外部传输；对端用 Prover.bit 应答
+    session.submit(round_, response)        # 此刻读 e 并恒时验答
+blob = session.finish()                     # 全部成功才得到 BitEvidence 字节
+audit_b(blob, key)
+# session.revoke()                           # 或中途放弃
 ```
 
 ### 批量判定 `assess`

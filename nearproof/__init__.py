@@ -1,6 +1,7 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: AttestedObservation / BitEvidence / BoundAttestedObservation /
+Public API: AttestedObservation / BitEvidence / BitRound / BitSession /
+BoundAttestedObservation /
 BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
@@ -33,6 +34,8 @@ from typing import Callable, Optional
 __all__ = [
     "AttestedObservation",
     "BitEvidence",
+    "BitRound",
+    "BitSession",
     "BoundAttestedObservation",
     "BoundEvidence",
     "BoundEvidenceRevocation",
@@ -1663,6 +1666,316 @@ class Verifier:
         return replace(
             record, mac=_bit_evidence_mac(self._key, _bit_evidence_payload(record))
         ).to_bytes()
+
+    def start_bits(
+        self,
+        context: object,
+        opening: object,
+        *,
+        rounds: object = 32,
+        timeout: object = 0.001,
+    ) -> "BitSession":
+        """Open a step-driven bit-challenge session driven over an external
+        transport, without changing :meth:`bits` or the rest of the bit
+        protocol.
+
+        Takes the same ``context``/``opening``/``rounds``/``timeout`` arguments
+        as :meth:`bits` and applies the same contracts: ``context`` and
+        ``opening`` each exactly 32 bytes, ``rounds`` a non-bool integer in
+        ``1 .. 2**32`` and ``timeout`` a finite positive non-bool number; the
+        verifier's speed must be finite, as it is recorded in the evidence. A
+        fresh random 16-byte transcript ``t`` is drawn here and
+        ``D = SHA256(b"NPFC1" + context + opening)`` is computed once.
+
+        The returned :class:`BitSession` hands out one :class:`BitRound` at a
+        time with :meth:`BitSession.next` and accepts its response with
+        :meth:`BitSession.submit`; the verifier only reads its clock once in
+        each call (``s`` at ``next``, ``e`` at ``submit``) and checks the
+        existing ``NPFR1`` response in constant time together with
+        ``0 <= e - s <= timeout``. Every round must succeed in order before
+        :meth:`BitSession.finish` produces the canonical
+        :meth:`BitEvidence.to_bytes` bytes; :meth:`BitSession.revoke` aborts
+        the session.
+        """
+        if not isinstance(context, bytes) or len(context) != CONTEXT_BYTES:
+            raise ValueError(f"context must be exactly {CONTEXT_BYTES} bytes")
+        if not isinstance(opening, bytes) or len(opening) != OPENING_BYTES:
+            raise ValueError(f"opening must be exactly {OPENING_BYTES} bytes")
+        if isinstance(rounds, bool) or type(rounds) is not int:
+            raise ValueError("rounds must be a non-bool integer")
+        # The range is closed at 2**32; round indices still fit a u32
+        # because they run 0 .. rounds-1.
+        if not 1 <= rounds <= 2**32:
+            raise ValueError("rounds must be in the range 1 .. 2**32")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise ValueError("timeout must be a finite positive number")
+        limit_time = float(timeout)
+        if not math.isfinite(limit_time) or limit_time <= 0:
+            raise ValueError("timeout must be a finite positive number")
+        if not math.isfinite(self._speed):
+            raise ValueError("speed_mps must be finite to record bit evidence")
+        transcript = os.urandom(BIT_T_BYTES)
+        digest = bit_transcript_digest(context, opening)
+        return BitSession(
+            key=self._key,
+            speed=self._speed,
+            clock=self._clock,
+            transcript=transcript,
+            context=context,
+            opening=opening,
+            digest=digest,
+            rounds=rounds,
+            timeout=limit_time,
+        )
+
+
+@dataclass(frozen=True)
+class BitRound:
+    """One challenge issued by a step-driven :class:`BitSession`.
+
+    Constructed positionally in field order; instances are frozen and compare
+    equal by their fields. ``version`` is always ``1``; ``t`` is exactly 16
+    bytes (the session transcript); ``index`` a non-bool unsigned 32-bit
+    integer (the round's position, starting at zero); ``bit`` exactly the
+    non-bool integer ``0`` or ``1``. The same ``t``/``index``/``bit`` triple
+    is bound to one round of one session: a round from another session, a
+    replayed or out-of-order round is rejected by
+    :meth:`BitSession.submit`. A field of the wrong type raises
+    :class:`TypeError`; a value contract violation raises :class:`ValueError`.
+    """
+
+    version: int
+    t: bytes
+    index: int
+    bit: int
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("bit round version must be an integer")
+        if self.version != 1:
+            raise ValueError("bit round version must be 1")
+        if not isinstance(self.t, bytes):
+            raise TypeError("bit round t must be bytes")
+        if len(self.t) != BIT_T_BYTES:
+            raise ValueError(f"bit round t must be exactly {BIT_T_BYTES} bytes")
+        if isinstance(self.index, bool) or type(self.index) is not int:
+            raise TypeError("bit round index must be a non-bool integer")
+        if not 0 <= self.index <= 0xFFFFFFFF:
+            raise ValueError("bit round index must fit in an unsigned 32-bit integer")
+        if type(self.bit) is not int:
+            # ``type`` excludes bools and floats (1.0 == 1 would otherwise
+            # satisfy the membership test); only the exact ints 0 and 1.
+            raise TypeError("bit round bit must be the integer 0 or 1")
+        if self.bit not in (0, 1):
+            raise ValueError("bit round bit must be exactly 0 or 1")
+
+
+class BitSession:
+    """A bit-challenge session the verifier drives one round at a time.
+
+    Created with :meth:`Verifier.start_bits`; not intended to be constructed
+    directly. The verifier draws a fresh random 16-byte transcript ``t`` at
+    creation and computes ``D = SHA256(b"NPFC1" + context + opening)`` once;
+    each :meth:`next` draws a random challenge bit, binds it to the round's
+    index and reads the verifier's clock exactly once for the start reading
+    ``s``; each :meth:`submit` reads the clock exactly once for the end
+    reading ``e`` and, in the same lock-held transition, verifies the
+    existing ``NPFR1`` response in constant time and the closed interval
+    ``0 <= e - s <= timeout``.
+
+    Only one round may be outstanding at a time. A successful round joins the
+    evidence query list ``Q`` in order and unlocks the next one; a failed
+    answer does not advance the session and the same round can be resubmitted
+    while it is still within the timeout. A round is bound to this session and
+    to its ``t``/``index``/``bit``: rounds from another session, out-of-order
+    or duplicate submissions, and any call after the session has been revoked
+    or finished raise :class:`ValueError`. :meth:`finish` is allowed only
+    after every round has succeeded and returns the canonical
+    :meth:`BitEvidence.to_bytes` bytes — byte-for-byte the same record
+    :meth:`Verifier.bits` would have produced. A shape error (a
+    non-:class:`BitRound` round or a non-:class:`bytes` response) raises
+    :class:`TypeError`; every other violation raises :class:`ValueError`.
+    """
+
+    def __init__(
+        self,
+        *,
+        key: bytes,
+        speed: float,
+        clock: Callable[[], float],
+        transcript: bytes,
+        context: bytes,
+        opening: bytes,
+        digest: bytes,
+        rounds: int,
+        timeout: float,
+    ) -> None:
+        self._key = key
+        self._speed = speed
+        self._clock = clock
+        self._t = transcript
+        self._context = context
+        self._opening = opening
+        self._digest = digest
+        self._rounds = rounds
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        # Successful rounds, in submission/index order: (b, r, s, e).
+        self._queries: list[tuple[int, bytes, float, float]] = []
+        # The one outstanding round: [round, s] while next() is awaiting a
+        # submit(), None between rounds and once every round is done.
+        self._pending: Optional[list] = None
+        # "open" while rounds are being driven, "finished" by finish() and
+        # "revoked" by revoke(); both terminals reject every further call.
+        self._state = "open"
+
+    @property
+    def round_count(self) -> int:
+        """The number of rounds that have succeeded so far."""
+        with self._lock:
+            return len(self._queries)
+
+    def next(self) -> BitRound:
+        """Issue the next challenge round and read the clock once (``s``).
+
+        Returns a fresh :class:`BitRound` whose ``index`` is the zero-based
+        round position and whose ``bit`` is random. Raises
+        :class:`ValueError` when a round is already outstanding, all rounds
+        have already been issued, or the session has been finished or
+        revoked.
+        """
+        with self._lock:
+            self._require_open_locked()
+            if self._pending is not None:
+                raise ValueError("a bit round is already outstanding")
+            index = len(self._queries)
+            if index >= self._rounds:
+                raise ValueError("all bit rounds have already been issued")
+            start = self._clock_reading_locked("s")
+            bit_value = os.urandom(1)[0] & 1
+            round_ = BitRound(version=1, t=self._t, index=index, bit=bit_value)
+            self._pending = [round_, start]
+            return round_
+
+    def submit(self, round: object, response: object) -> None:
+        """Verify ``response`` for the outstanding ``round`` and read ``e``.
+
+        ``round`` must be the exact :class:`BitRound` currently outstanding
+        from :meth:`next` on this session — a value of any other type raises
+        :class:`TypeError`, while a round from another session or a different
+        (already completed, replayed or not-yet-issued) round raises
+        :class:`ValueError`. ``response`` must be the 32-byte
+        ``HMAC-SHA256(key, b"NPFR1" + t + u32be(index) + bytes([bit]) + D)``
+        value; a non-bytes value raises :class:`TypeError`, a wrong length or
+        mismatched value :class:`ValueError`, as does a round trip outside
+        ``0 <= e - s <= timeout`` or a non-finite clock reading. On any
+        validation failure the session does not advance and the same round
+        stays outstanding (and may be resubmitted while still within the
+        timeout); only success moves the round into the evidence query list
+        in order. The state transition is atomic, so concurrent submissions
+        can succeed at most once.
+        """
+        if not isinstance(round, BitRound):
+            raise TypeError("round must be a BitRound")
+        if not isinstance(response, bytes):
+            raise TypeError("response must be bytes")
+        with self._lock:
+            self._require_open_locked()
+            pending = self._pending
+            if pending is None:
+                raise ValueError("no bit round is outstanding")
+            pending_round, start = pending[0], pending[1]
+            # Rounds are bound to this session and to their t/index/bit: a
+            # replayed, reordered or foreign round never matches the pending
+            # object even if its fields happen to coincide.
+            if round is not pending_round:
+                raise ValueError(
+                    "round is not the outstanding round of this bit session"
+                )
+            end = self._clock_reading_locked("e")
+            if len(response) != BIT_R_BYTES:
+                raise ValueError("prover bit response must be exactly 32 bytes")
+            expected = bit_response(
+                self._key, self._t, self._digest, round.index, round.bit
+            )
+            if not hmac.compare_digest(expected, response):
+                raise ValueError("prover bit response does not match the challenge")
+            duration = end - start
+            if not 0.0 <= duration <= self._timeout:
+                raise ValueError("bit round trip must satisfy 0 <= e - s <= timeout")
+            self._queries.append((round.bit, response, start, end))
+            self._pending = None
+
+    def finish(self) -> bytes:
+        """Return the canonical :class:`BitEvidence` bytes of the session.
+
+        Every issued round must have succeeded; finishing while a round is
+        outstanding, before all rounds have completed, or after the session
+        was already finished or revoked raises :class:`ValueError`. On
+        success the session becomes terminal. The bytes are exactly those
+        :meth:`Verifier.bits` produces for the same rounds, so
+        :func:`audit_b` verifies them unchanged.
+        """
+        with self._lock:
+            self._require_open_locked()
+            if self._pending is not None:
+                raise ValueError("an outstanding bit round must be submitted first")
+            if len(self._queries) != self._rounds:
+                raise ValueError(
+                    "all bit rounds must succeed before the session can finish"
+                )
+            bound = max(e - s for _b, _r, s, e in self._queries)
+            bound = bound * self._speed / 2.0
+            if not math.isfinite(bound) or bound < 0:
+                raise ValueError(
+                    "computed distance bound must be finite and non-negative"
+                )
+            record = BitEvidence(
+                version=1,
+                t=self._t,
+                context=self._context,
+                digest=self._digest,
+                opening=self._opening,
+                queries=tuple(self._queries),
+                speed=self._speed,
+                timeout=self._timeout,
+                limit=bound,
+                mac=b"\x00" * 32,
+            )
+            evidence = replace(
+                record,
+                mac=_bit_evidence_mac(self._key, _bit_evidence_payload(record)),
+            )
+            self._state = "finished"
+            return evidence.to_bytes()
+
+    def revoke(self) -> None:
+        """Permanently abort the session.
+
+        After this every :meth:`next`, :meth:`submit`, :meth:`finish` and
+        further :meth:`revoke` raises :class:`ValueError`; an outstanding
+        round can never be completed and no evidence is produced. Revoking an
+        already finished or revoked session raises :class:`ValueError`.
+        """
+        with self._lock:
+            self._require_open_locked()
+            self._state = "revoked"
+            self._pending = None
+
+    def _require_open_locked(self) -> None:
+        if self._state == "finished":
+            raise ValueError("bit session has already finished")
+        if self._state == "revoked":
+            raise ValueError("bit session has been revoked")
+
+    def _clock_reading_locked(self, label: str) -> float:
+        reading = self._clock()
+        if isinstance(reading, bool) or not isinstance(reading, (int, float)):
+            raise ValueError("clock readings must be finite numbers")
+        value = float(reading)
+        if not math.isfinite(value):
+            raise ValueError("clock readings must be finite numbers")
+        return value
 
 
 def _bit_evidence_payload(record: "BitEvidence") -> list:
