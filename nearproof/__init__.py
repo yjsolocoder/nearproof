@@ -2,7 +2,7 @@
 
 Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
 BitGuard / BitMap / BitMapHistoryAuditor / BitMapHistoryEvidence /
-BitMapUpdate / BitRound /
+BitMapHistoryEvidenceAuditor / BitMapUpdate / BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
@@ -44,6 +44,7 @@ __all__ = [
     "BitMap",
     "BitMapHistoryAuditor",
     "BitMapHistoryEvidence",
+    "BitMapHistoryEvidenceAuditor",
     "BitMapUpdate",
     "BitRound",
     "BitSession",
@@ -4351,6 +4352,112 @@ def audit_map_history_evidence(x: object, key: object) -> "BitMap":
             "bit map history evidence end does not match the audited chain"
         )
     return final
+
+
+class BitMapHistoryEvidenceAuditor:
+    """Stateful auditor chaining attested :class:`BitMapHistoryEvidence`
+    segments into one monotone, restartable audit stream.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    shared key the tables, transition proofs and history evidence are
+    MAC'd with. ``checkpoint`` is keyword-only: ``None`` (the default)
+    starts from no table at all; otherwise it must be a :class:`BitMap` or
+    its canonical :meth:`BitMap.to_bytes` encoding (any other type raises
+    :class:`TypeError`), parsed under the full :class:`BitMap` contract and
+    its ``NPBL1`` MAC recomputed with ``key`` and compared in constant time
+    — a malformed encoding or MAC mismatch raises :class:`ValueError`.
+    Across a restart the caller must pass the value previously exported at
+    :attr:`checkpoint`; nothing is persisted by the auditor itself.
+
+    Each :meth:`audit` re-verifies one :class:`BitMapHistoryEvidence` with
+    :func:`audit_map_history_evidence` under the auditor lock — the
+    evidence MAC, every carried update and the final table are all
+    recomputed — and then demands the chain segment starts exactly where
+    the auditor currently stands: with no checkpoint the body's ``start``
+    must be the empty string, and with a checkpoint the ``start`` encoding
+    must equal the checkpoint's canonical :meth:`BitMap.to_bytes` output
+    byte for byte. Only when both checks pass is the checkpoint replaced
+    with the body's ``end`` table, so a replayed already-advanced segment,
+    a fork from an earlier starting point, a broken chain, a wrong key, a
+    tampered or non-canonical encoding and a mismatched start all raise
+    :class:`ValueError` and leave the checkpoint untouched. Concurrent
+    audits linearize in lock-acquisition order: of competing segments
+    chaining from the same starting point only the first to commit
+    succeeds, and a committed segment is never lost.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._table: "Optional[BitMap]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, BitMap):
+            table = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                table = BitMap.from_bytes(checkpoint)
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value error.
+                raise ValueError(
+                    "checkpoint does not satisfy the bit map field contract"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be a BitMap instance, its canonical bytes,"
+                " or None"
+            )
+        if not hmac.compare_digest(
+            _bit_map_mac(self._key, _bit_map_payload(table.entries)),
+            table.mac,
+        ):
+            raise ValueError("checkpoint mac does not match the key")
+        self._table = table
+
+    @property
+    def checkpoint(self) -> "Optional[BitMap]":
+        """The current frontier :class:`BitMap`, or ``None`` before the
+        first successfully audited segment. The returned object is frozen
+        and the property read-only; persist its :meth:`BitMap.to_bytes`
+        output and pass it back to a new auditor to survive a restart."""
+        return self._table
+
+    def audit(self, x: object) -> "BitMap":
+        """Audit one :class:`BitMapHistoryEvidence` segment and advance.
+
+        ``x`` must be a :class:`BitMapHistoryEvidence` or its canonical
+        :meth:`BitMapHistoryEvidence.to_bytes` encoding — any other type
+        raises :class:`TypeError`; a malformed or non-canonical encoding,
+        a MAC mismatch, a failed carried update, an ``end`` that does not
+        match the audited chain, or a ``start`` that does not equal the
+        current checkpoint (the empty string when no segment has committed
+        yet) raises :class:`ValueError`. The evidence is re-verified with
+        :func:`audit_map_history_evidence` and the start matched against
+        the checkpoint under the auditor lock, so verification and the
+        checkpoint advance are one atomic step: a failed segment changes
+        nothing and returns no partial result, and concurrent segments are
+        serialized in lock-acquisition order. On success the checkpoint is
+        replaced with the segment's ``end`` table and that frozen
+        :class:`BitMap` is returned.
+        """
+        with self._lock:
+            evidence = _coerce_bit_map_history_evidence(x, "x")
+            final = audit_map_history_evidence(evidence, self._key)
+            start, _, _ = _bit_map_history_body_parts(evidence.body)
+            current = b"" if self._table is None else self._table.to_bytes()
+            if start != current:
+                raise ValueError(
+                    "bit map history evidence start does not match the"
+                    " current checkpoint"
+                )
+            self._table = final
+            return final
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
