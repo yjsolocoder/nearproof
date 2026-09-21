@@ -46,6 +46,8 @@ python3 -m nearproof
   - `verify_bound(challenge, response, started_at, *, opening) -> BoundEvidence` — 仅限上下文绑定挑战的 `verify_evidence`（见下）
   - `measure(prover)` — 一次完整往返
   - `bits(prover, context, opening, *, rounds=32, timeout=0.001) -> bytes` — 跑一场位挑战会话，返回 `BitEvidence.to_bytes()` 的字节证据；`context`/`opening` 各 32 字节（见下）
+  - `start_bits(context, opening, *, rounds=32, timeout=0.001) -> BitSession` — 开始一场**步进驱动**的位挑战会话（同 `bits` 参数契约）；`BitSession.next() -> BitRound` 发一轮、`submit(round, response)` 交应答、`finish() -> bytes` 产出与 `bits` 相同的 `BitEvidence` 字节、`revoke()` 放弃
+  - `resume_bits(x, *, floor=None) -> BitSession` — 从冻结的 `BitState`（对象或规范字节）验签并恢复一场**活动**位会话；`floor` 可收上一次接受的 `BitState`/字节或 `None`，做低序/同序/高序门控（见下）
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
   - `clock` — 只读属性，暴露计时函数
 - `assess(samples, limit, *, key=None, min_samples=5) -> RangeDecision` — 基于一批轮次的稳健距离判定（见下）
@@ -54,6 +56,8 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, t, C, D, O, Q, V, T, L, M]`，bytes 字段小写 hex
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
 - `audit_b(x, k) -> float` — **仅收非空 bytes** 的证据字节与非空 bytes 密钥；恒时复核 `NPFB1` MAC，重算 `D`、逐位应答（按下标 i）、`0 <= e-s <= T` 与 `L = max(e-s)*V/2`，任何不符抛 `ValueError`，成功返回复算的 `L`（见下）
+- `BitState(version, seq, body, mac)` — 一场**进行中**步进位会话的冻结检查点（`version=1`、`seq` 为非布尔 u64 且等于 body 中 `Q` 项数；`body` 为内层紧凑 JSON 字节、`mac` 恰 32 字节；按字段序位置构造、冻结、按字段相等；错型 `TypeError`、余错 `ValueError`；不含密钥；见下）
+  - `to_bytes()` / `from_bytes(data)` — 内外两层均为紧凑 UTF-8 JSON 且规范往返：外层字段序四元数组 `[1, seq, body, mac]`，`body`/`mac` 小写 hex；body 解码为 `[t, C, D, O, R, T, V, Q, P]`；`from_bytes` 非 bytes 或内层字段错型抛 `TypeError`，其余不合契约（含非规范拼写）抛 `ValueError`，均不验 MAC
 - `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮已接受**上下文绑定**验证的防篡改记录（`version=1`，四个 bytes 字段均恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -286,6 +290,34 @@ from nearproof import Prover, Verifier, audit_b
 prover, verifier = Prover(key), Verifier(key)
 blob = verifier.bits(prover, context, opening, rounds=32, timeout=0.001)
 upper_bound = audit_b(blob, key)          # 复算通过则返回 L（米）
+```
+
+### 会话冻结与恢复 `BitSession.checkpoint`、`BitState` 与 `Verifier.resume_bits`
+
+步进会话（`start_bits`）可以在任意**活动**时刻冻结成自证检查点，落到另一进程/验证者后继续跑完：
+
+- `BitSession.checkpoint() -> bytes` **仅活动态可用**：已 `finish()` 或 `revoke()` 的会话调用抛 `ValueError`；取检查点不推进会话（待决轮次保持待决，可再次 `checkpoint` 得到逐字节相同的结果）。
+- 冻结记录为 `BitState(version, seq, body, mac)`：按字段序位置构造、冻结、按字段相等；字段错型抛 `TypeError`，其余违约抛 `ValueError`。
+  - `version=1`；`seq` 为非布尔 u64，且恒等于 body 中 `Q` 的项数；
+  - `body` 解码为数组 `[t, C, D, O, R, T, V, Q, P]`：`t`/`C`/`D`/`O` 同既有位协议（16/32/32/32 字节小写 hex）；`R` 为 `1 .. 2**32` 的非布尔整数（总轮数）；`T`/`V` 为有限正的非布尔数；`Q` 项为 `[b, r, s, e]`，字段同位证据（`b∈{0,1}` 非布尔、`r` 为 32 字节小写 hex、`s`/`e` 有限非布尔），且 `0 <= seq = len(Q) <= R`；`P` 为 `null` 或 `[seq, b, s]`，后者的 `seq` 须满足 `0 <= seq < R`，描述取检查点时仍待决的那一轮（无待决轮时为 `null`）；
+  - `mac = HMAC-SHA256(key, b"NPBS1" + E)`，`E` 是外层去掉 `mac` 的字段序数组 `[1, seq, body_hex]` 用同一紧凑法编码，前缀直拼无分隔/长度前缀。
+  - `to_bytes()`/`from_bytes(data)` 内外两层都是紧凑 UTF-8 JSON 并做规范往返：外层为 `[1, seq, body, mac]` 四元数组、`body`/`mac` 小写 hex；内层 body 重编码（数值按 float 拼写）须与原字节逐字节相等——整数时钟字面量、空白、格式化 JSON 等均拒绝。`from_bytes` 仅收 bytes（非 bytes 抛 `TypeError`），内层字段错型也抛 `TypeError`，其余（含非规范）抛 `ValueError`；它不验 MAC。
+
+恢复入口为 `Verifier.resume_bits(x, *, floor=None) -> BitSession`：
+
+- `x` 与 `floor` 仅收 `BitState` 对象或其规范 bytes，`floor` 还可为 `None`（默认）；参数种类不对（`str`、`bytearray`、`None` 给 `x` 等）抛 `TypeError`，bytes 内容不合契约抛 `ValueError`。
+- 先恒时验证 `NPBS1` MAC，再由原始字段重算并核对：`D = SHA256(b"NPFC1"+C+O)`、每项按下标 `i` 的 `NPFR1` 应答、闭区间 `0 <= e-s <= T`，以及待决轮 `P` 的下标恰为 `len(Q)`；任一不符抛 `ValueError`。
+- 恢复出的会话为**活动态**，沿用检查点自带的 `V`/`T`/`C`/`O`/`t` 与已完成的 `Q`，但使用**当前验证者**的时钟；有 `P` 时该轮仍待决（先 `submit` 再 `next`），无 `P` 时从 `len(Q)` 续发；随后 `next`/`submit`/`finish`/`revoke` 语义全新会话，`finish` 产出与一次跑完完全相同的 `BitEvidence`。
+- `floor` 为调用方上次接受的检查点时做单调门控：**低序拒绝**；**同序**仅当两份 `SHA256(body)` 完全相同才作为重放接受；**高序**要求前七项（`t, C, D, O, R, T, V`）逐项相同、`Q` 逐项延续 floor 的 `Q` 前缀；floor 的 `P` 有值时，新状态中下一个 `Q` 项必须承接其待决轮的 `b` 与 `s`（即该轮已被完成且起点/挑战位未变）。门控不改变任何状态，失败即 `ValueError`。旧接口（`bits`/`start_bits`/`audit_b` 等）保持不变。
+
+```python
+session = verifier.start_bits(context, opening, rounds=32, timeout=0.001)
+rnd = session.next(); session.submit(rnd, prover.bit(rnd.t, D, rnd.index, rnd.bit))
+saved = session.checkpoint()                 # 活动态随时冻结（BitState bytes）
+# ... 另一个进程、同一个 key 的验证者 ...
+session2 = verifier2.resume_bits(saved, floor=last_accepted)
+rnd = session2.next(); session2.submit(rnd, prover.bit(rnd.t, D, rnd.index, rnd.bit))
+blob = session2.finish()                     # 与一次跑完相同的 BitEvidence
 ```
 
 ### 批量判定 `assess`
