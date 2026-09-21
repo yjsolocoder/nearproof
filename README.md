@@ -58,6 +58,11 @@ python3 -m nearproof
 - `audit_b(x, k) -> float` — **仅收非空 bytes** 的证据字节与非空 bytes 密钥；恒时复核 `NPFB1` MAC，重算 `D`、逐位应答（按下标 i）、`0 <= e-s <= T` 与 `L = max(e-s)*V/2`，任何不符抛 `ValueError`，成功返回复算的 `L`（见下）
 - `BitState(version, seq, body, mac)` — 一场**进行中**步进位会话的冻结检查点（`version=1`、`seq` 为非布尔 u64 且等于 body 中 `Q` 项数；`body` 为内层紧凑 JSON 字节、`mac` 恰 32 字节；按字段序位置构造、冻结、按字段相等；错型 `TypeError`、余错 `ValueError`；不含密钥；见下）
   - `to_bytes()` / `from_bytes(data)` — 内外两层均为紧凑 UTF-8 JSON 且规范往返：外层字段序四元数组 `[1, seq, body, mac]`，`body`/`mac` 小写 hex；body 解码为 `[t, C, D, O, R, T, V, Q, P]`；`from_bytes` 非 bytes 或内层字段错型抛 `TypeError`，其余不合契约（含非规范拼写）抛 `ValueError`，均不验 MAC
+- `BitFrontier(version, seq, digest, mac)` — 位会话持久化的防回滚冻结前沿（`version=1`、`seq` 为非布尔 u64、`digest`/`mac` 各恰 32 字节；`digest=SHA256(x.body)`、`mac=HMAC-SHA256(key, b"NPBF1"+去mac规范JSON)`，各段直拼无长度前缀；位置构造、冻结、按字段相等；字段错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
+  - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON **对象**（键序 `version, seq, digest, mac`，各一次，bytes 小写 hex，无空白）；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），缺/多/重复/乱序键、u64 越界、hex 非 32 字节及任何非规范拼写抛 `ValueError`，重编码须逐字节相等，不验 MAC
+- `BitGuard(verifier, *, checkpoint=None)` — 带状态、防回滚的位会话恢复门；`verifier` 必须是 `Verifier` 实例（错型抛 `TypeError`），用其共享密钥；`checkpoint` 收 `BitFrontier` 或其规范字节或 `None`，并以该共享密钥恒时验证 `NPBF1` MAC（见下）
+  - `resume(x) -> BitSession` — 收 `BitState` 或其规范 bytes（余类型抛 `TypeError`）；复用 `resume_bits` 验签并恢复，再在锁内以 `seq` 与 `SHA256(body)` 门控：低序拒绝、同序仅同摘要重放、高序推进；验签、门控与更新原子完成，失败不改状态
+  - 只读 `checkpoint` 属性导出当前 `BitFrontier | None`（首次成功恢复前为 `None`）
 - `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮已接受**上下文绑定**验证的防篡改记录（`version=1`，四个 bytes 字段均恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -318,6 +323,41 @@ saved = session.checkpoint()                 # 活动态随时冻结（BitState 
 session2 = verifier2.resume_bits(saved, floor=last_accepted)
 rnd = session2.next(); session2.submit(rnd, prover.bit(rnd.t, D, rnd.index, rnd.bit))
 blob = session2.finish()                     # 与一次跑完相同的 BitEvidence
+```
+
+### 位会话防回滚前沿 `BitFrontier` 与 `BitGuard`
+
+无状态的 `resume_bits` 只认证单个检查点（配合调用方自管的 `floor` 做门控）；持久化到不可信存储后，攻击者仍可把一张序号更低（更旧）的检查点重新送达。`BitFrontier` 与 `BitGuard` 在 `resume_bits` 之上加一道带状态、加锁的单调门控，防止位会话检查点序号回退。
+
+`BitFrontier(version, seq, digest, mac)` 是冻结的共享密钥 MAC **前沿记录**：位置构造、按字段相等，字段契约、编码规则与其余记录一致——`version=1`；`seq` 为非布尔 u64（最近接受的 `BitState.seq`）；`digest` 恰 32 字节，即所接受检查点 `x.body`（`BitState` 内层规范 JSON 字节）的 `SHA256`；`mac` 恰 32 字节，`mac = HMAC-SHA256(key, b"NPBF1" + 去mac规范JSON)`——“去 mac 规范 JSON”为字段序对象 `{"version":1,"seq":seq,"digest":digest_hex}` 的紧凑 UTF-8 编码，前缀与编码直接拼接、无定界符、无长度前缀。字段错型抛 `TypeError`，其余任何字段违约在构造时抛 `ValueError`，记录本身不含密钥。
+
+`to_bytes()` 输出字段序紧凑 UTF-8 JSON **对象**（键序 `version, seq, digest, mac` 各一次，`digest`/`mac` 为小写 hex，无空白、无长度前缀）。`from_bytes(data)` **仅收 `bytes`**（其他类型抛 `TypeError`）：键必须恰好四个、各一次且依字段序（缺失、多余、重复、乱序即拒），`version == 1`，`seq` 为非布尔 u64，两个 hex 字段须解码为恰好 32 字节；解析后重编码须与输入逐字节相等；**不验 MAC**。
+
+`BitGuard(verifier, *, checkpoint=None)` 持有当前前沿：
+
+- `verifier` 必须是 `Verifier` 实例（其余类型抛 `TypeError`）；恢复出的会话沿用该验证者的密钥、时钟与速度，检查点与前沿的 MAC 都用它的共享密钥复核。
+- `checkpoint` 仅限关键字。`None`（默认）为空状态；否则收 `BitFrontier` 对象或其规范字节，字节先过 `BitFrontier.from_bytes` 契约，再以 verifier 的共享密钥恒时复核其 `NPBF1` MAC——错型抛 `TypeError`，编码不合契约或 MAC 不符抛 `ValueError`。守卫自身不做任何持久化：**重启时调用方必须把上次保存的最新前沿传回来**（取 `checkpoint` 属性、`to_bytes()` 落盘）。
+- `resume(x) -> BitSession` 收 `BitState` 或其规范 bytes（其余类型抛 `TypeError`）。先按与 `resume_bits` 完全相同的语义校验并恢复（恒时验证 `NPBS1` MAC、由原始字段重算 `D`/逐项应答/往返区间）；成功后才在锁内取该检查点的 `seq` 与 `SHA256(body)` 与当前前沿比较并更新：
+  - **首次**：以该 `seq` 与摘要建立前沿；
+  - **低序拒绝**：`seq` 低于前沿抛 `ValueError`；
+  - **同序仅同摘要重放**：`seq` 相等且 `digest` 相同则视为重放，返回恢复的会话但不改动前沿；`seq` 相等而 `digest` 不同（同序号的另一张检查点）抛 `ValueError`；
+  - **高序推进**：`seq` 更高则生成并 MAC 新的 `BitFrontier`。
+- 验签、门控与更新在同一把锁内原子完成：任何失败（含恢复失败、低序、同序异摘要）都不改动前沿，并发恢复绝不可能把前沿回退。
+- 只读属性 `checkpoint: BitFrontier | None` 导出当前前沿（首次成功恢复前为 `None`）；返回的是冻结对象，外部无法借此改写内部状态。
+
+除参数类型错误抛 `TypeError` 外，其余失败一律抛 `ValueError`；旧接口（`resume_bits`/`start_bits`/`bits` 等）行为不变。
+
+```python
+guard = BitGuard(verifier)
+session = guard.resume(saved1)                 # seq=1，首次建立前沿
+saved2 = session.checkpoint()                  # 继续推进后的检查点
+guard.resume(saved2)                           # 高序：推进
+persisted = guard.checkpoint.to_bytes()        # 调用方自行持久化
+
+# ... 重启后：
+guard = BitGuard(verifier, checkpoint=persisted)
+guard.resume(saved2)                           # 同序同摘要：重放，接受
+guard.resume(saved_old)                        # 低序：ValueError，前沿不变
 ```
 
 ### 批量判定 `assess`

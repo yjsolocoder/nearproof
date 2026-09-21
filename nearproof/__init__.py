@@ -1,6 +1,7 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: AttestedObservation / BitEvidence / BitRound / BitSession /
+Public API: AttestedObservation / BitEvidence / BitFrontier / BitGuard /
+BitRound / BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
@@ -33,6 +34,8 @@ from typing import Callable, Optional
 __all__ = [
     "AttestedObservation",
     "BitEvidence",
+    "BitFrontier",
+    "BitGuard",
     "BitRound",
     "BitSession",
     "BitState",
@@ -116,6 +119,8 @@ _BIT_RESPONSE_PREFIX = b"NPFR1"
 _BIT_EVIDENCE_PREFIX = b"NPFB1"
 # Domain separation prefix for the resumable bit-session checkpoint MAC.
 _BIT_STATE_PREFIX = b"NPBS1"
+# Domain separation prefix for the rollback-protection bit-session frontier MAC.
+_BIT_FRONTIER_PREFIX = b"NPBF1"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -2924,6 +2929,304 @@ class BitState:
         if record.to_bytes() != data:
             raise ValueError("bit state encoding is not canonical")
         return record
+
+
+_BIT_FRONTIER_FIELDS = ("version", "seq", "digest", "mac")
+
+
+def _bit_frontier_payload(frontier: "BitFrontier") -> dict:
+    """The JSON-ready frontier fields except ``mac``, in field order."""
+    return {
+        "version": frontier.version,
+        "seq": frontier.seq,
+        "digest": frontier.digest.hex(),
+    }
+
+
+def _bit_frontier_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPBF1"`` plus the canonical encoding without mac.
+
+    The prefix and the encoding are concatenated directly with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        key, _BIT_FRONTIER_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+def _parse_bit_frontier_hex(value: object, name: str) -> bytes:
+    """Lowercase round-tripping hex for the frontier byte fields.
+
+    Mirrors the split TypeError/ValueError records: the wrong value type
+    raises :class:`TypeError`, an invalid or wrong-length hex string raises
+    :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"bit frontier {name} must be a lowercase hex string")
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"bit frontier {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        raise ValueError(f"bit frontier {name} must be a lowercase hex string")
+    return raw
+
+
+class _OrderedBitFrontierObject(json.JSONDecoder):
+    """JSON decoder rejecting duplicate/out-of-order BitFrontier object keys."""
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys == list(_BIT_FRONTIER_FIELDS):
+            return dict(pairs)
+        raise ValueError(
+            "bit frontier JSON keys must be exactly version, seq, digest and"
+            " mac in field order"
+        )
+
+
+@dataclass(frozen=True)
+class BitFrontier:
+    """A key-MAC'd, rollback-resistant checkpoint of the bit-session frontier.
+
+    ``version`` is always ``1``; ``seq`` a non-bool unsigned 64-bit integer
+    (the accepted :class:`BitState` sequence); ``digest`` exactly 32 bytes —
+    ``SHA256(x.body)`` over the carried checkpoint body; ``mac`` exactly
+    32 bytes —
+    ``HMAC-SHA256(key, b"NPBF1" + encoding)`` over the canonical compact
+    encoding of every field except ``mac`` itself, the prefix and the
+    encoding concatenated directly with no separator or length prefix.
+    Instances are frozen, constructed positionally in field order and
+    compare equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    seq: int
+    digest: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("bit frontier version must be an integer")
+        if self.version != 1:
+            raise ValueError("bit frontier version must be 1")
+        if isinstance(self.seq, bool) or type(self.seq) is not int:
+            raise TypeError("bit frontier seq must be a non-bool integer")
+        if not 0 <= self.seq <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "bit frontier seq must fit in an unsigned 64-bit integer"
+            )
+        for name in ("digest", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(f"bit frontier {name} must be bytes")
+            if len(value) != 32:
+                raise ValueError(f"bit frontier {name} must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order
+        ``version, seq, digest, mac``, ``digest`` and ``mac`` as lowercase
+        hex, no whitespace, no length prefix."""
+        payload = _bit_frontier_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BitFrontier":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and for
+        fields of the wrong type; raises :class:`ValueError` for anything
+        that does not satisfy the value contract: an object with exactly
+        the keys ``version, seq, digest, mac`` once each in that order
+        (missing, extra, duplicated or out-of-order keys are rejected),
+        ``version == 1``, a non-bool u64 ``seq``, and ``digest``/``mac``
+        lowercase hex strings decoding to exactly 32 bytes each. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for byte,
+        so formatted JSON, whitespace and any non-canonical spelling are
+        rejected too. The MAC is not verified here — pass the encoding to
+        :class:`BitGuard` (or recompute :func:`_bit_frontier_mac` with the
+        shared key) for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("bit frontier data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedBitFrontierObject)
+        except ValueError as error:
+            raise ValueError(f"bit frontier is not valid JSON: {error}") from error
+        if not isinstance(obj, dict) or list(obj) != list(_BIT_FRONTIER_FIELDS):
+            raise ValueError(
+                "bit frontier must be a JSON object with exactly the version,"
+                " seq, digest and mac fields in field order"
+            )
+        if type(obj["version"]) is not int:
+            raise TypeError("bit frontier version must be an integer")
+        version = obj["version"]
+        if version != 1:
+            raise ValueError("bit frontier version must be 1")
+        if type(obj["seq"]) is not int:
+            raise TypeError("bit frontier seq must be a non-bool integer")
+        seq = obj["seq"]
+        if not 0 <= seq <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "bit frontier seq must fit in an unsigned 64-bit integer"
+            )
+        digest = _parse_bit_frontier_hex(obj["digest"], "digest")
+        if len(digest) != 32:
+            raise ValueError(
+                "bit frontier digest must decode to exactly 32 bytes"
+            )
+        mac = _parse_bit_frontier_hex(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError("bit frontier mac must decode to exactly 32 bytes")
+        record = cls(version=version, seq=seq, digest=digest, mac=mac)
+        if record.to_bytes() != data:
+            raise ValueError("bit frontier encoding is not canonical")
+        return record
+
+
+class BitGuard:
+    """Stateful bit-session resumption gate that refuses sequence rollback.
+
+    ``verifier`` is the :class:`Verifier` holding the shared key (and clock
+    and speed) every resumed session is restored with. ``checkpoint`` is
+    keyword-only: ``None`` (the default) starts from the empty frontier;
+    otherwise it must be a :class:`BitFrontier` or its canonical
+    :meth:`BitFrontier.to_bytes` encoding, and its MAC is recomputed with
+    the verifier's shared key and compared in constant time (a wrong-typed
+    argument raises :class:`TypeError`; a malformed encoding or MAC
+    mismatch raises :class:`ValueError`). Across a restart the caller must
+    pass the value previously exported at :attr:`checkpoint`; nothing is
+    persisted by the guard itself.
+
+    Each :meth:`resume` accepts a :class:`BitState` or its canonical
+    :meth:`BitState.to_bytes` bytes, exactly like
+    :meth:`Verifier.resume_bits`, which runs first: the checkpoint MAC is
+    verified and the carried session recovered and recomputed from
+    scratch. Only after that succeeds is the carried ``seq`` and
+    ``SHA256(body)`` compared against the frontier under a lock: a lower
+    ``seq`` is rejected, an equal ``seq`` is accepted solely as a replay of
+    the identical body, and a higher ``seq`` advances the frontier, which
+    is MAC'd as ``HMAC-SHA256(key, b"NPBF1" + encoding)``. The verify,
+    gate and update are atomic: a rejected state never changes the
+    frontier and concurrent resumes can never move it backwards. A
+    wrong-typed argument raises :class:`TypeError`; every other failure —
+    a malformed encoding, a bad MAC, a failed recovery or a rejected
+    rollback — raises :class:`ValueError` and leaves the frontier
+    untouched.
+    """
+
+    def __init__(self, verifier: object, *, checkpoint: object = None) -> None:
+        if not isinstance(verifier, Verifier):
+            raise TypeError("verifier must be a Verifier instance")
+        self._verifier = verifier
+        self._key = verifier._key
+        self._lock = threading.Lock()
+        self._frontier: "Optional[BitFrontier]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, BitFrontier):
+            frontier = checkpoint
+        elif isinstance(checkpoint, bytes):
+            frontier = BitFrontier.from_bytes(checkpoint)
+        else:
+            raise TypeError(
+                "checkpoint must be a BitFrontier instance, its canonical"
+                " bytes, or None"
+            )
+        if not hmac.compare_digest(
+            _bit_frontier_mac(self._key, _bit_frontier_payload(frontier)),
+            frontier.mac,
+        ):
+            raise ValueError("checkpoint mac does not match the verifier key")
+        self._frontier = frontier
+
+    @property
+    def checkpoint(self) -> "Optional[BitFrontier]":
+        """The current frontier :class:`BitFrontier`, or ``None`` before the
+        first successfully resumed state. The returned object is frozen and
+        the property read-only; persist its :meth:`BitFrontier.to_bytes`
+        output and pass it back to a new guard to survive a restart."""
+        return self._frontier
+
+    def resume(self, x: object) -> "BitSession":
+        """Verify and resume ``x``, enforcing monotone checkpoint progress.
+
+        ``x`` must be a :class:`BitState` or its canonical
+        :meth:`BitState.to_bytes` encoding — any other type raises
+        :class:`TypeError`. Recovery runs exactly as
+        :meth:`Verifier.resume_bits` (the ``NPBS1`` MAC is verified in
+        constant time and every carried value is recomputed from scratch),
+        then the seq/digest gate and the frontier update are serialized
+        under the guard lock: lower ``seq`` rejected, equal ``seq``
+        accepted only with the identical ``SHA256(body)`` as a replay that
+        leaves the frontier untouched, higher ``seq`` advancing it to a
+        fresh ``NPBF1``-MAC'd :class:`BitFrontier`. Every failure raises
+        :class:`ValueError` and changes no state. On success the restored
+        active :class:`BitSession` is returned.
+        """
+        state = self._coerce_state(x)
+        # The cryptographic recovery is a pure check, but it runs inside the
+        # same lock as the gate and the update so that verification, gating
+        # and the frontier advance are one atomic step: no concurrent resume
+        # can observe or interleave a half-checked frontier.
+        with self._lock:
+            session = self._verifier.resume_bits(state)
+            current = self._frontier
+            digest = hashlib.sha256(state.body).digest()
+            if current is not None:
+                if state.seq < current.seq:
+                    raise ValueError(
+                        "bit state seq is below the guarded frontier"
+                    )
+                if state.seq == current.seq:
+                    if not hmac.compare_digest(digest, current.digest):
+                        raise ValueError(
+                            "bit state carries a different body at the"
+                            " frontier seq"
+                        )
+                    # Identical body: an accepted replay, nothing to advance.
+                    return session
+            candidate = BitFrontier(
+                version=1,
+                seq=state.seq,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._frontier = replace(
+                candidate,
+                mac=_bit_frontier_mac(
+                    self._key, _bit_frontier_payload(candidate)
+                ),
+            )
+            return session
+
+    @staticmethod
+    def _coerce_state(x: object) -> "BitState":
+        if isinstance(x, BitState):
+            return x
+        if isinstance(x, bytes):
+            try:
+                return BitState.from_bytes(x)
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value error,
+                # exactly as in Verifier.resume_bits.
+                raise ValueError(
+                    "x does not satisfy the bit state field contract"
+                ) from error
+        raise TypeError(
+            "x must be a BitState instance or its canonical bytes"
+        )
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
