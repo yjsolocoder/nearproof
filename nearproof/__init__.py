@@ -1,7 +1,7 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: AttestedObservation / BitEvidence / BitFrontier / BitGuard /
-BitRound / BitSession /
+Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
+BitGuard / BitMap / BitRound / BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
@@ -35,7 +35,9 @@ __all__ = [
     "AttestedObservation",
     "BitEvidence",
     "BitFrontier",
+    "BitGate",
     "BitGuard",
+    "BitMap",
     "BitRound",
     "BitSession",
     "BitState",
@@ -121,6 +123,8 @@ _BIT_EVIDENCE_PREFIX = b"NPFB1"
 _BIT_STATE_PREFIX = b"NPBS1"
 # Domain separation prefix for the rollback-protection bit-session frontier MAC.
 _BIT_FRONTIER_PREFIX = b"NPBF1"
+# Domain separation prefix for the partitioned rollback-protection table MAC.
+_BIT_MAP_PREFIX = b"NPBL1"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -3227,6 +3231,357 @@ class BitGuard:
         raise TypeError(
             "x must be a BitState instance or its canonical bytes"
         )
+
+
+def _bit_map_payload(entries: "tuple[tuple[bytes, int, bytes], ...]") -> list:
+    """The JSON-ready ``[1, E]`` array without ``mac``, in field order."""
+    return [1, [[sid.hex(), seq, digest.hex()] for sid, seq, digest in entries]]
+
+
+def _bit_map_mac(key: bytes, payload: list) -> bytes:
+    """HMAC-SHA256 over ``b"NPBL1"`` plus the canonical ``[1, E]`` encoding.
+
+    The prefix and the encoding are concatenated directly with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        key, _BIT_MAP_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+def _parse_bit_map_hex(value: object, name: str) -> bytes:
+    """Lowercase round-tripping hex for the table byte fields.
+
+    Mirrors the other split TypeError/ValueError records: the wrong value
+    type raises :class:`TypeError`, an invalid or non-lowercase hex string
+    raises :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"bit map {name} must be a lowercase hex string")
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"bit map {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        raise ValueError(f"bit map {name} must be a lowercase hex string")
+    return raw
+
+
+def _bit_state_sid(state: "BitState") -> bytes:
+    """The partition key of a checkpoint: ``SHA256(S)`` where ``S`` is the
+    canonical compact-JSON encoding of the body's first seven items
+    ``[t, C, D, O, R, T, V]`` — everything identifying the session itself,
+    with no per-round progress."""
+    (
+        transcript,
+        context,
+        digest,
+        opening,
+        rounds,
+        timeout,
+        speed,
+        _queries,
+        _previous,
+    ) = _parse_bit_state_body(state.body)
+    return hashlib.sha256(
+        _encode_payload(
+            [
+                transcript.hex(),
+                context.hex(),
+                digest.hex(),
+                opening.hex(),
+                rounds,
+                timeout,
+                speed,
+            ]
+        )
+    ).digest()
+
+
+@dataclass(frozen=True)
+class BitMap:
+    """A key-MAC'd, rollback-resistant table of per-session bit frontiers.
+
+    ``version`` is always ``1``; ``entries`` a tuple of
+    ``(sid, seq, hash)`` tuples ordered by strictly ascending ``sid``
+    (unique by construction), one per resumed session partition: ``sid``
+    exactly 32 bytes — ``SHA256(S)`` where ``S`` is the canonical
+    compact-JSON encoding of the checkpoint body's first seven items
+    ``[t, C, D, O, R, T, V]``; ``seq`` a non-bool unsigned 64-bit integer
+    (the accepted :class:`BitState` sequence, equal to its number of ``Q``
+    items); ``hash`` exactly 32 bytes — ``SHA256(body)`` over the carried
+    checkpoint body. ``mac`` is exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPBL1" + C)`` where ``C`` is the canonical compact
+    encoding of ``[1, E]`` (the version and the entries without ``mac``),
+    the prefix and ``C`` concatenated directly with no separator or length
+    prefix. Instances are frozen, constructed positionally in field order
+    and compare equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    entries: tuple
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("bit map version must be an integer")
+        if self.version != 1:
+            raise ValueError("bit map version must be 1")
+        if not isinstance(self.entries, tuple):
+            raise TypeError("bit map entries must be a tuple")
+        previous_sid: "Optional[bytes]" = None
+        for entry in self.entries:
+            if not isinstance(entry, tuple):
+                raise TypeError(
+                    "bit map each entry must be a (sid, seq, hash) tuple"
+                )
+            if len(entry) != 3:
+                raise ValueError(
+                    "bit map each entry must be a (sid, seq, hash) tuple"
+                )
+            sid, seq, digest = entry
+            for name, value in (("sid", sid), ("hash", digest)):
+                if not isinstance(value, bytes):
+                    raise TypeError(f"bit map entry {name} must be bytes")
+                if len(value) != 32:
+                    raise ValueError(
+                        f"bit map entry {name} must be exactly 32 bytes"
+                    )
+            if isinstance(seq, bool) or type(seq) is not int:
+                raise TypeError(
+                    "bit map entry seq must be a non-bool integer"
+                )
+            if not 0 <= seq <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    "bit map entry seq must fit in an unsigned 64-bit integer"
+                )
+            if previous_sid is not None and sid <= previous_sid:
+                raise ValueError(
+                    "bit map entries must be unique and ordered by"
+                    " ascending sid"
+                )
+            previous_sid = sid
+        if not isinstance(self.mac, bytes):
+            raise TypeError("bit map mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("bit map mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the array ``[1, E, M]`` where
+        ``E`` items are ``[sid, seq, hash]`` and ``sid``/``hash``/``M`` are
+        lowercase hex, no whitespace, no length prefix."""
+        return _encode_payload(
+            _bit_map_payload(self.entries) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BitMap":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, entries, mac]``, ``version == 1``, each entry
+        an array of exactly ``[sid, seq, hash]`` with ``sid``/``hash``
+        lowercase hex decoding to exactly 32 bytes each and ``seq`` a
+        non-bool u64, entries unique and ordered by ascending ``sid``, and
+        ``mac`` a lowercase hex string decoding to exactly 32 bytes. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for byte,
+        so formatted JSON, whitespace and any non-canonical spelling are
+        rejected too. The MAC is not verified here — pass the encoding to
+        :class:`BitGate` (or recompute :func:`_bit_map_mac` with the shared
+        key) for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("bit map data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(f"bit map is not valid JSON: {error}") from error
+        if not isinstance(outer, list) or len(outer) != 3:
+            raise ValueError(
+                "bit map must be a JSON array of exactly version, entries"
+                " and mac"
+            )
+        raw_version, raw_entries, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError("bit map version must be an integer")
+        if raw_version != 1:
+            raise ValueError("bit map version must be 1")
+        if not isinstance(raw_entries, list):
+            raise TypeError("bit map entries must be an array")
+        entries: "list[tuple[bytes, int, bytes]]" = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, list):
+                raise TypeError(
+                    "bit map each entry must be an array of exactly sid,"
+                    " seq and hash"
+                )
+            if len(raw_entry) != 3:
+                raise ValueError(
+                    "bit map each entry must be an array of exactly sid,"
+                    " seq and hash"
+                )
+            raw_sid, raw_seq, raw_hash = raw_entry
+            sid = _parse_bit_map_hex(raw_sid, "sid")
+            if len(sid) != 32:
+                raise ValueError(
+                    "bit map sid must decode to exactly 32 bytes"
+                )
+            digest = _parse_bit_map_hex(raw_hash, "hash")
+            if len(digest) != 32:
+                raise ValueError(
+                    "bit map hash must decode to exactly 32 bytes"
+                )
+            if type(raw_seq) is not int:
+                raise TypeError("bit map entry seq must be a non-bool integer")
+            if not 0 <= raw_seq <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    "bit map entry seq must fit in an unsigned 64-bit integer"
+                )
+            entries.append((sid, raw_seq, digest))
+        mac = _parse_bit_map_hex(raw_mac, "mac")
+        if len(mac) != 32:
+            raise ValueError("bit map mac must decode to exactly 32 bytes")
+        record = cls(version=1, entries=tuple(entries), mac=mac)
+        if record.to_bytes() != data:
+            raise ValueError("bit map encoding is not canonical")
+        return record
+
+
+class BitGate:
+    """Stateful bit-session resumption gate partitioning the anti-rollback
+    frontier by session.
+
+    Unlike :class:`BitGuard`, which tracks a single frontier, the gate
+    keeps one ``(sid, seq, hash)`` frontier per session partition, so
+    independent sessions interleaved on the same verifier each advance
+    their own monotone sequence. ``verifier`` is the :class:`Verifier`
+    holding the shared key (and clock and speed) every resumed session is
+    restored with. ``checkpoint`` is keyword-only: ``None`` (the default)
+    starts from the empty table; otherwise it must be a :class:`BitMap` or
+    its canonical :meth:`BitMap.to_bytes` encoding, and its MAC is
+    recomputed with the verifier's shared key and compared in constant
+    time (a wrong-typed argument raises :class:`TypeError`; a malformed
+    encoding or MAC mismatch raises :class:`ValueError`). Across a restart
+    the caller must pass the value previously exported at
+    :attr:`checkpoint`; nothing is persisted by the gate itself.
+
+    Each :meth:`resume` accepts a :class:`BitState` or its canonical
+    :meth:`BitState.to_bytes` bytes, exactly like
+    :meth:`Verifier.resume_bits`, which runs first: the checkpoint MAC is
+    verified and the carried session recovered and recomputed from
+    scratch. Only after that succeeds is the session's ``sid`` derived and
+    its ``seq``/``SHA256(body)`` compared against that partition's entry
+    under a lock: a lower ``seq`` is rejected, an equal ``seq`` is accepted
+    solely as a replay of the identical body, and a higher ``seq`` advances
+    the entry; a first-seen ``sid`` starts a new partition. The verify,
+    gate and update are atomic: a rejected state never changes the table
+    and concurrent resumes can never move an entry backwards or lose an
+    update. A wrong-typed argument raises :class:`TypeError`; every other
+    failure — a malformed encoding, a bad MAC, a failed recovery or a
+    rejected rollback — raises :class:`ValueError` and leaves the table
+    untouched.
+    """
+
+    def __init__(self, verifier: object, *, checkpoint: object = None) -> None:
+        if not isinstance(verifier, Verifier):
+            raise TypeError("verifier must be a Verifier instance")
+        self._verifier = verifier
+        self._key = verifier._key
+        self._lock = threading.Lock()
+        self._table: "Optional[BitMap]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, BitMap):
+            table = checkpoint
+        elif isinstance(checkpoint, bytes):
+            table = BitMap.from_bytes(checkpoint)
+        else:
+            raise TypeError(
+                "checkpoint must be a BitMap instance, its canonical"
+                " bytes, or None"
+            )
+        if not hmac.compare_digest(
+            _bit_map_mac(self._key, _bit_map_payload(table.entries)),
+            table.mac,
+        ):
+            raise ValueError("checkpoint mac does not match the verifier key")
+        self._table = table
+
+    @property
+    def checkpoint(self) -> "Optional[BitMap]":
+        """The current frontier :class:`BitMap`, or ``None`` before the
+        first successfully resumed state. The returned object is frozen and
+        the property read-only; persist its :meth:`BitMap.to_bytes` output
+        and pass it back to a new gate to survive a restart."""
+        return self._table
+
+    def resume(self, x: object) -> "BitSession":
+        """Verify and resume ``x``, enforcing monotone per-session progress.
+
+        ``x`` must be a :class:`BitState` or its canonical
+        :meth:`BitState.to_bytes` encoding — any other type raises
+        :class:`TypeError`. Recovery runs exactly as
+        :meth:`Verifier.resume_bits` (the ``NPBS1`` MAC is verified in
+        constant time and every carried value is recomputed from scratch),
+        then the session's ``sid`` is derived and the seq/hash gate and the
+        table update are serialized under the gate lock: lower ``seq``
+        rejected, equal ``seq`` accepted only with the identical
+        ``SHA256(body)`` as a replay that leaves the table untouched,
+        higher ``seq`` advancing the partition's entry, and a first-seen
+        ``sid`` inserting a new entry — the updated table is MAC'd as
+        ``HMAC-SHA256(key, b"NPBL1" + C)``. Every failure raises
+        :class:`ValueError` and changes no state. On success the restored
+        active :class:`BitSession` is returned.
+        """
+        state = BitGuard._coerce_state(x)
+        # The cryptographic recovery is a pure check, but it runs inside
+        # the same lock as the gate and the update so that verification,
+        # gating and the table advance are one atomic step: no concurrent
+        # resume can observe or interleave a half-checked table.
+        with self._lock:
+            session = self._verifier.resume_bits(state)
+            sid = _bit_state_sid(state)
+            digest = hashlib.sha256(state.body).digest()
+            current = self._table
+            entries = () if current is None else current.entries
+            index = 0
+            while index < len(entries) and entries[index][0] < sid:
+                index += 1
+            if index < len(entries) and entries[index][0] == sid:
+                _entry_sid, entry_seq, entry_hash = entries[index]
+                if state.seq < entry_seq:
+                    raise ValueError(
+                        "bit state seq is below the guarded frontier for"
+                        " its session"
+                    )
+                if state.seq == entry_seq:
+                    if not hmac.compare_digest(digest, entry_hash):
+                        raise ValueError(
+                            "bit state carries a different body at the"
+                            " frontier seq"
+                        )
+                    # Identical body: an accepted replay, nothing to advance.
+                    return session
+                entries = entries[:index] + entries[index + 1 :]
+            updated = (
+                entries[:index] + ((sid, state.seq, digest),)
+                + entries[index:]
+            )
+            candidate = BitMap(version=1, entries=updated, mac=b"\x00" * 32)
+            self._table = replace(
+                candidate,
+                mac=_bit_map_mac(
+                    self._key, _bit_map_payload(candidate.entries)
+                ),
+            )
+            return session
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:

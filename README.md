@@ -63,6 +63,11 @@ python3 -m nearproof
 - `BitGuard(verifier, *, checkpoint=None)` — 带状态、防回滚的位会话恢复门；`verifier` 必须是 `Verifier` 实例（错型抛 `TypeError`），用其共享密钥；`checkpoint` 收 `BitFrontier` 或其规范字节或 `None`，并以该共享密钥恒时验证 `NPBF1` MAC（见下）
   - `resume(x) -> BitSession` — 收 `BitState` 或其规范 bytes（余类型抛 `TypeError`）；复用 `resume_bits` 验签并恢复，再在锁内以 `seq` 与 `SHA256(body)` 门控：低序拒绝、同序仅同摘要重放、高序推进；验签、门控与更新原子完成，失败不改状态
   - 只读 `checkpoint` 属性导出当前 `BitFrontier | None`（首次成功恢复前为 `None`）
+- `BitMap(version, entries, mac)` — 按会话分区的防回滚冻结前沿表（`version=1`；`entries` 为按 `sid` 严格升序且唯一的 `(sid, seq, hash)` 元组，`sid`/`hash`/`mac` 各恰 32 字节；`sid=SHA256(S)`，`S` 为 body 前七项 `[t,C,D,O,R,T,V]` 的规范 JSON 字节；`hash=SHA256(body)`；`seq` 为 `Q` 项数、非布尔 u64；`mac=HMAC-SHA256(key, b"NPBL1"+C)`，`C` 为 `[1,E]` 编码，直拼无长度前缀；位置构造、冻结、按字段相等；字段错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
+  - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON **数组** `[1, E, M]`，`E` 项为 `[sid, seq, hash]`，bytes 字段小写 hex，无空白；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），其余不合契约（含非规范拼写、乱序或重复 `sid`）抛 `ValueError`，重编码须逐字节相等，不验 MAC
+- `BitGate(verifier, *, checkpoint=None)` — 带状态、按会话分区防回滚的位会话恢复门；`verifier` 必须是 `Verifier` 实例（错型抛 `TypeError`），用其共享密钥；`checkpoint` 收 `BitMap` 或其规范字节或 `None`，并以该共享密钥恒时验证 `NPBL1` MAC（见下）
+  - `resume(x) -> BitSession` — 收 `BitState` 或其规范 bytes（余类型抛 `TypeError`）；复用 `resume_bits` 验签并恢复，派生 `sid` 后在锁内对该分区门控：低序拒绝、同序仅同摘要重放、高序推进、首见 `sid` 新建分区；验签、门控与更新原子完成，失败不改状态，并发不丢更新
+  - 只读 `checkpoint` 属性导出当前 `BitMap | None`（首次成功恢复前为 `None`）
 - `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮已接受**上下文绑定**验证的防篡改记录（`version=1`，四个 bytes 字段均恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -358,6 +363,41 @@ persisted = guard.checkpoint.to_bytes()        # 调用方自行持久化
 guard = BitGuard(verifier, checkpoint=persisted)
 guard.resume(saved2)                           # 同序同摘要：重放，接受
 guard.resume(saved_old)                        # 低序：ValueError，前沿不变
+```
+
+### 分区防回滚表 `BitMap` 与 `BitGate`
+
+`BitGuard` 只跟踪单一前沿：同一验证者交错恢复多场独立位会话时，一场的高序号会把另一场的检查点误判为回滚。`BitMap` 与 `BitGate` 把前沿按**会话分区**——每场会话（由其 `t, C, D, O, R, T, V` 标识）各自维护一条单调前沿，互不干扰。
+
+`BitMap(version, entries, mac)` 是冻结的共享密钥 MAC **分区前沿表**：位置构造、按字段相等，字段契约、编码规则与其余记录一致——`version=1`；`entries` 为 `(sid, seq, hash)` 元组的元组，按 `sid` 严格升序（唯一由此保证），每项：`sid` 恰 32 字节，即 `SHA256(S)`，`S` 为所接受检查点 body 前七项 `[t, C, D, O, R, T, V]` 的规范紧凑 JSON 字节（标识会话本身，不含任何轮次进度）；`seq` 为非布尔 u64（所接受 `BitState.seq`，即其 `Q` 项数）；`hash` 恰 32 字节，即所接受检查点 `x.body` 的 `SHA256`。`mac` 恰 32 字节，`mac = HMAC-SHA256(key, b"NPBL1" + C)`——`C` 为 `[1, E]`（版本与去 mac 的条目）的紧凑 UTF-8 编码，前缀与 `C` 直接拼接、无定界符、无长度前缀。字段错型抛 `TypeError`，其余任何字段违约（含条目乱序、`sid` 重复）在构造时抛 `ValueError`，记录本身不含密钥。
+
+`to_bytes()` 输出紧凑 UTF-8 JSON **数组** `[1, E, M]`：`E` 每项为 `[sid, seq, hash]`，`sid`/`hash`/`M` 为小写 hex，无空白、无长度前缀。`from_bytes(data)` **仅收 `bytes`**（其他类型抛 `TypeError`）：外层必须恰为三元数组，每项条目恰为 `[sid, seq, hash]`，`version == 1`，`seq` 为非布尔 u64，三个 hex 字段须解码为恰好 32 字节，条目须按 `sid` 严格升序；解析后重编码须与输入逐字节相等；**不验 MAC**。
+
+`BitGate(verifier, *, checkpoint=None)` 持有当前分区表：
+
+- `verifier` 必须是 `Verifier` 实例（其余类型抛 `TypeError`）；恢复出的会话沿用该验证者的密钥、时钟与速度，检查点与分区表的 MAC 都用它的共享密钥复核。
+- `checkpoint` 仅限关键字。`None`（默认）为空表；否则收 `BitMap` 对象或其规范字节，字节先过 `BitMap.from_bytes` 契约，再以 verifier 的共享密钥恒时复核其 `NPBL1` MAC——错型抛 `TypeError`，编码不合契约或 MAC 不符抛 `ValueError`。守卫自身不做任何持久化：**重启时调用方必须把上次保存的最新表传回来**（取 `checkpoint` 属性、`to_bytes()` 落盘）。
+- `resume(x) -> BitSession` 收 `BitState` 或其规范 bytes（其余类型抛 `TypeError`）。先按与 `resume_bits` 完全相同的语义校验并恢复（恒时验证 `NPBS1` MAC、由原始字段重算 `D`/逐项应答/往返区间）；成功后才在锁内派生该检查点的 `sid`，以 `seq` 与 `SHA256(body)` 对该分区的条目比较并更新：
+  - **首见 `sid`**：以该 `seq` 与摘要新建分区条目（按 `sid` 升序插入）；
+  - **低序拒绝**：`seq` 低于该分区条目抛 `ValueError`；
+  - **同序仅同摘要重放**：`seq` 相等且 `hash` 相同则视为重放，返回恢复的会话但不改动表；`seq` 相等而 `hash` 不同抛 `ValueError`；
+  - **高序推进**：`seq` 更高则更新该条目，整表重新 MAC 为新的 `BitMap`。
+- 验签、门控与更新在同一把锁内原子完成：任何失败（含恢复失败、低序、同序异摘要）都不改动表，并发恢复绝不丢失更新、也绝不可能把任何条目回退。
+- 只读属性 `checkpoint: BitMap | None` 导出当前分区表（首次成功恢复前为 `None`）；返回的是冻结对象，外部无法借此改写内部状态。
+
+除参数类型错误抛 `TypeError` 外，其余失败一律抛 `ValueError`；旧接口（`resume_bits`/`start_bits`/`bits`/`BitGuard` 等）行为不变。
+
+```python
+gate = BitGate(verifier)
+sa = gate.resume(saved_a1)                   # 会话 A：seq=1，新建分区
+sb = gate.resume(saved_b3)                   # 会话 B：seq=3，独立分区
+persisted = gate.checkpoint.to_bytes()       # 调用方自行持久化
+
+# ... 重启后：
+gate = BitGate(verifier, checkpoint=persisted)
+gate.resume(saved_a1)                        # A 分区同序同摘要：重放，接受
+gate.resume(saved_a0)                        # A 分区低序：ValueError，表不变
+gate.resume(saved_b4)                        # B 分区高序：照常推进
 ```
 
 ### 批量判定 `assess`
