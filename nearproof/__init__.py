@@ -11,7 +11,8 @@ Measurement / Observation / ObservationRevocation / Prover / RangeDecision
 VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_b / audit_bound /
 audit_bound_policy /
-audit_cert_evidence / audit_crl / audit_map_update / audit_proof / cert / locate /
+audit_cert_evidence / audit_crl / audit_map_history / audit_map_update /
+audit_proof / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
 revoke_context / revoke_observation / revoke_trust.
@@ -73,6 +74,7 @@ __all__ = [
     "audit_bound_policy",
     "audit_cert_evidence",
     "audit_crl",
+    "audit_map_history",
     "audit_map_update",
     "audit_proof",
     "cert",
@@ -3752,13 +3754,15 @@ def audit_map_update(x: object, key: object) -> None:
     contract violation raises :class:`ValueError`. The proof's own MAC is
     recomputed as ``HMAC-SHA256(key, b"NPBU1" + C)`` and compared in
     constant time, and the ``NPBL1`` MAC of every table the proof carries
-    is verified against ``key`` the same way. The transition itself must
-    then be one of exactly three shapes, with every other entry of the
-    table unchanged: the table is identical before and after (an accepted
-    replay), exactly one entry is added, or exactly one entry keeps its
-    ``sid`` while its ``seq`` strictly increases and its ``hash`` changes.
-    Auditing is a pure check: it touches no gate state and returns
-    ``None``.
+    is verified against ``key`` the same way. When ``before`` is ``b""``
+    — no table existed yet — ``after`` must hold exactly one partition
+    entry; an empty or multi-entry ``after`` table is rejected. The
+    transition itself must then be one of exactly three shapes, with every
+    other entry of the table unchanged: the table is identical before and
+    after (an accepted replay), exactly one entry is added, or exactly one
+    entry keeps its ``sid`` while its ``seq`` strictly increases and its
+    ``hash`` changes. Auditing is a pure check: it touches no gate state
+    and returns ``None``.
     """
     if isinstance(x, BitMapUpdate):
         update = x
@@ -3799,6 +3803,14 @@ def audit_map_update(x: object, key: object) -> None:
     ):
         raise ValueError("bit map update after table mac does not match")
     after_entries = after_table.entries
+    if not update.before and len(after_entries) != 1:
+        # The initial boundary: no table existed before, so the transition
+        # must create exactly one partition entry — an empty after table
+        # is no replay of anything and several entries are no single
+        # insertion.
+        raise ValueError(
+            "bit map update from no table must create exactly one entry"
+        )
     if after_entries == before_entries:
         # The identical table: an accepted replay attested as a no-op.
         return None
@@ -3838,6 +3850,98 @@ def audit_map_update(x: object, key: object) -> None:
         "bit map update must keep the table, add exactly one entry or"
         " advance exactly one entry"
     )
+
+
+def audit_map_history(
+    updates: object, key: object, *, checkpoint: object = None
+) -> BitMap:
+    """Audit a contiguous :class:`BitMapUpdate` history and return its table.
+
+    ``updates`` must be a non-empty iterable whose elements are
+    :class:`BitMapUpdate` instances or their canonical
+    :meth:`BitMapUpdate.to_bytes` encodings, freely mixed, and ``key`` the
+    non-empty shared key. ``checkpoint`` is keyword-only: ``None`` (the
+    default) means the history starts from no table at all, so the first
+    update's ``before`` must be ``b""``; otherwise it must be a
+    :class:`BitMap` or its canonical :meth:`BitMap.to_bytes` encoding,
+    whose ``NPBL1`` MAC is recomputed with ``key`` and compared in
+    constant time, and its canonical ``to_bytes()`` encoding is the
+    starting point. Every update is first audited with
+    :func:`audit_map_update`; the first update's ``before`` must then
+    equal the starting point byte for byte and every later update's
+    ``before`` must equal the previous update's ``after`` byte for byte,
+    so a broken chain or out-of-order history is rejected. On success the
+    frozen :class:`BitMap` of the last update's ``after`` is returned.
+
+    Auditing is a pure check: it touches no gate state and returns no
+    partial result. A non-iterable ``updates``, a non-``bytes`` ``key``,
+    an element of the wrong type or a checkpoint of any other kind raises
+    :class:`TypeError`; an empty sequence, an empty key, non-canonical
+    bytes, a wrong MAC or any single failed audit raises
+    :class:`ValueError`.
+    """
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    try:
+        items = list(updates)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "updates must be an iterable of BitMapUpdate instances or"
+            " their canonical bytes"
+        ) from error
+    if not items:
+        raise ValueError("updates must be a non-empty sequence")
+    if checkpoint is None:
+        start = b""
+    else:
+        if isinstance(checkpoint, BitMap):
+            table = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                table = BitMap.from_bytes(checkpoint)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "checkpoint must be the canonical BitMap encoding"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be a BitMap instance, its canonical"
+                " bytes, or None"
+            )
+        if not hmac.compare_digest(
+            _bit_map_mac(key, _bit_map_payload(table.entries)), table.mac
+        ):
+            raise ValueError("checkpoint mac does not match the key")
+        start = table.to_bytes()
+    current = start
+    for item in items:
+        if isinstance(item, BitMapUpdate):
+            update = item
+        elif isinstance(item, bytes):
+            try:
+                update = BitMapUpdate.from_bytes(item)
+            except TypeError as error:
+                # The element had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value
+                # error, exactly as in audit_map_update.
+                raise ValueError(
+                    "updates elements do not satisfy the bit map update"
+                    " field contract"
+                ) from error
+        else:
+            raise TypeError(
+                "updates elements must be BitMapUpdate instances or their"
+                " canonical bytes"
+            )
+        audit_map_update(update, key)
+        if update.before != current:
+            raise ValueError(
+                "bit map update before does not match the previous after"
+            )
+        current = update.after
+    return BitMap.from_bytes(current)
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
