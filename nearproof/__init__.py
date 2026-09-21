@@ -1,7 +1,7 @@
 """nearproof - verifiable distance measurement and location proofs.
 
 Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
-BitGuard / BitMap / BitMapUpdate / BitRound / BitSession /
+BitGuard / BitMap / BitMapHistoryAuditor / BitMapUpdate / BitRound / BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
@@ -39,6 +39,7 @@ __all__ = [
     "BitGate",
     "BitGuard",
     "BitMap",
+    "BitMapHistoryAuditor",
     "BitMapUpdate",
     "BitRound",
     "BitSession",
@@ -3939,6 +3940,98 @@ def audit_map_history(
             )
         current = update.after
     return BitMap.from_bytes(current)
+
+
+class BitMapHistoryAuditor:
+    """Stateful auditor re-verifying :class:`BitMapUpdate` proofs in batches.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    shared key the tables and the update proofs are MAC'd with.
+    ``checkpoint`` is keyword-only: ``None`` (the default) starts from no
+    table at all; otherwise it must be a :class:`BitMap` or its canonical
+    :meth:`BitMap.to_bytes` encoding, parsed by the :class:`BitMap`
+    contract, and its ``NPBL1`` MAC is recomputed with ``key`` and compared
+    in constant time (a wrong-typed argument raises :class:`TypeError`; a
+    malformed encoding or MAC mismatch raises :class:`ValueError`). Across
+    a restart the caller must pass the value previously exported at
+    :attr:`checkpoint`; nothing is persisted by the auditor itself.
+
+    Each :meth:`audit` re-verifies a whole batch of updates with
+    :func:`audit_map_history` under the auditor lock, chaining from the
+    current checkpoint: the first ``before`` must equal the current
+    table's canonical encoding byte for byte (``b""`` when no table exists
+    yet) and every later ``before`` the previous ``after``. Only when the
+    entire batch passes is the checkpoint replaced by the final ``after``
+    table, which is returned frozen; any parse, MAC, transition or chain
+    failure raises and leaves the checkpoint untouched, returning no
+    partial result. Concurrent audits are serialized by lock-acquisition
+    order, so of competing batches built on the same starting table only
+    the one that chains onto the latest ``after`` can succeed, and a
+    successful update is never lost.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._table: "Optional[BitMap]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, BitMap):
+            table = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                table = BitMap.from_bytes(checkpoint)
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value error.
+                raise ValueError(
+                    "checkpoint does not satisfy the bit map field contract"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be a BitMap instance, its canonical"
+                " bytes, or None"
+            )
+        if not hmac.compare_digest(
+            _bit_map_mac(self._key, _bit_map_payload(table.entries)),
+            table.mac,
+        ):
+            raise ValueError("checkpoint mac does not match the key")
+        self._table = table
+
+    @property
+    def checkpoint(self) -> "Optional[BitMap]":
+        """The current frontier :class:`BitMap`, or ``None`` before the
+        first successfully audited batch. The returned object is frozen and
+        the property read-only; persist its :meth:`BitMap.to_bytes` output
+        and pass it back to a new auditor to survive a restart."""
+        return self._table
+
+    def audit(self, updates: object) -> "BitMap":
+        """Re-verify a batch of chained updates and advance the checkpoint.
+
+        ``updates`` must be a non-empty iterable whose items are each a
+        :class:`BitMapUpdate` or its canonical
+        :meth:`BitMapUpdate.to_bytes` encoding — a non-iterable argument
+        or a wrong-typed item raises :class:`TypeError`, an empty batch
+        and every other failure raise :class:`ValueError`. The whole batch
+        is audited with :func:`audit_map_history` against the auditor key
+        under the lock, chained from the current checkpoint; only on
+        success is the checkpoint replaced by the final ``after`` table,
+        which is returned as a frozen :class:`BitMap`. Every failure
+        leaves the checkpoint untouched and returns no partial result.
+        """
+        with self._lock:
+            result = audit_map_history(
+                updates, self._key, checkpoint=self._table
+            )
+            self._table = result
+            return result
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
