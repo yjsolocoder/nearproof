@@ -3,6 +3,7 @@
 Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
 BitGuard / BitMap / BitMapHistoryAuditor / BitMapHistoryEvidence /
 BitMapHistoryEvidenceAuditor / BitMapHistoryJournalAuditor /
+BitMapHistoryJournalBundle /
 BitMapHistoryJournalState / BitMapUpdate / BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
@@ -15,11 +16,13 @@ VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_b / audit_bound /
 audit_bound_policy /
 audit_cert_evidence / audit_crl / audit_map_history /
-audit_map_history_evidence / audit_map_update /
+audit_map_history_evidence / audit_map_history_journal_bundle /
+audit_map_update /
 audit_proof / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
-revoke_context / revoke_observation / revoke_trust / seal_map_history.
+revoke_context / revoke_observation / revoke_trust / seal_map_history /
+seal_map_history_journal_bundle.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ __all__ = [
     "BitMapHistoryEvidence",
     "BitMapHistoryEvidenceAuditor",
     "BitMapHistoryJournalAuditor",
+    "BitMapHistoryJournalBundle",
     "BitMapHistoryJournalState",
     "BitMapUpdate",
     "BitRound",
@@ -85,6 +89,7 @@ __all__ = [
     "audit_crl",
     "audit_map_history",
     "audit_map_history_evidence",
+    "audit_map_history_journal_bundle",
     "audit_map_update",
     "audit_proof",
     "cert",
@@ -100,6 +105,7 @@ __all__ = [
     "revoke_observation",
     "revoke_trust",
     "seal_map_history",
+    "seal_map_history_journal_bundle",
 ]
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
@@ -148,6 +154,8 @@ _BIT_MAP_HISTORY_PREFIX = b"NPBH1"
 # and the digest-chain step respectively.
 _BIT_MAP_HISTORY_JOURNAL_MAC_PREFIX = b"NPBJ1"
 _BIT_MAP_HISTORY_JOURNAL_DIGEST_PREFIX = b"NPBJ2"
+# Domain separation prefix for the history-journal bundle MAC.
+_BIT_MAP_HISTORY_JOURNAL_BUNDLE_PREFIX = b"NPBJ3"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -4831,6 +4839,359 @@ class BitMapHistoryJournalAuditor:
                 mac=_bit_map_history_journal_mac(self._key, candidate),
             )
             return self
+
+
+def _bit_map_history_journal_bundle_content(
+    bundle: "BitMapHistoryJournalBundle",
+) -> list:
+    """The JSON-ready first four bundle fields (everything but ``mac``)."""
+    return [
+        bundle.version,
+        bundle.start.hex(),
+        [evidence.hex() for evidence in bundle.evidences],
+        bundle.end.hex(),
+    ]
+
+
+def _bit_map_history_journal_bundle_content_bytes(
+    bundle: "BitMapHistoryJournalBundle",
+) -> bytes:
+    """The canonical compact encoding ``C`` of the first four bundle fields."""
+    return _encode_payload(_bit_map_history_journal_bundle_content(bundle))
+
+
+def _bit_map_history_journal_bundle_mac(
+    key: bytes, bundle: "BitMapHistoryJournalBundle"
+) -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ3" + C)`` where ``C`` is the canonical
+    encoding of the first four fields. The prefix and ``C`` are concatenated
+    directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _BIT_MAP_HISTORY_JOURNAL_BUNDLE_PREFIX
+        + _bit_map_history_journal_bundle_content_bytes(bundle),
+        hashlib.sha256,
+    ).digest()
+
+
+def _require_bit_map_history_journal_bundle_state(value: bytes, name: str) -> None:
+    """Enforce that a bundle state field is the canonical non-empty
+    :class:`BitMapHistoryJournalState` encoding. ``value`` is already known
+    to be ``bytes``; every violation — including the field-shape
+    :class:`TypeError` a malformed inner document would otherwise surface —
+    raises :class:`ValueError`."""
+    try:
+        BitMapHistoryJournalState.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"bit map history journal bundle {name} must be the canonical"
+            " BitMapHistoryJournalState encoding"
+        ) from error
+
+
+def _require_bit_map_history_journal_bundle_evidence(value: bytes) -> None:
+    """Enforce that a bundle evidence item is the canonical
+    :class:`BitMapHistoryEvidence` encoding. ``value`` is already known to
+    be ``bytes``; every violation raises :class:`ValueError`."""
+    try:
+        BitMapHistoryEvidence.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "bit map history journal bundle evidences items must be the"
+            " canonical BitMapHistoryEvidence encoding"
+        ) from error
+
+
+@dataclass(frozen=True)
+class BitMapHistoryJournalBundle:
+    """A key-MAC'd attestation of one contiguous journal segment chain.
+
+    ``version`` is always ``1``. ``start`` is the empty bytes — the chain
+    starts from no journal state at all — or the canonical
+    :meth:`BitMapHistoryJournalState.to_bytes` encoding of the state the
+    chain starts from. ``evidences`` is a non-empty ordered tuple of the
+    canonical :meth:`BitMapHistoryEvidence.to_bytes` encodings, one per
+    segment in chain order. ``end`` is the canonical
+    :meth:`BitMapHistoryJournalState.to_bytes` encoding of the journal
+    state the chain finishes at. ``mac`` is exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPBJ3" + C)`` where ``C`` is the canonical compact
+    encoding of the first four fields (the version, the lowercase-hex
+    ``start``, the array of lowercase-hex evidence encodings and the
+    lowercase-hex ``end``, without ``mac``), the prefix and ``C``
+    concatenated directly with no separator or length prefix. Instances are
+    frozen, constructed positionally in field order and compare equal by
+    their fields. A field of the wrong type raises :class:`TypeError`;
+    every other contract violation raises :class:`ValueError`. No key
+    material is stored.
+    """
+
+    version: int
+    start: bytes
+    evidences: tuple
+    end: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "bit map history journal bundle version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError("bit map history journal bundle version must be 1")
+        if not isinstance(self.start, bytes):
+            raise TypeError("bit map history journal bundle start must be bytes")
+        if self.start:
+            _require_bit_map_history_journal_bundle_state(self.start, "start")
+        if not isinstance(self.evidences, tuple):
+            raise TypeError(
+                "bit map history journal bundle evidences must be a tuple"
+            )
+        if not self.evidences:
+            raise ValueError(
+                "bit map history journal bundle evidences must be non-empty"
+            )
+        for evidence in self.evidences:
+            if not isinstance(evidence, bytes):
+                raise TypeError(
+                    "bit map history journal bundle evidences items must be"
+                    " bytes"
+                )
+            _require_bit_map_history_journal_bundle_evidence(evidence)
+        if not isinstance(self.end, bytes):
+            raise TypeError("bit map history journal bundle end must be bytes")
+        _require_bit_map_history_journal_bundle_state(self.end, "end")
+        if not isinstance(self.mac, bytes):
+            raise TypeError("bit map history journal bundle mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError(
+                "bit map history journal bundle mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, start, evidences, end, mac]`` where ``start``, ``end`` and
+        ``mac`` are lowercase hex and ``evidences`` is the array of
+        lowercase-hex evidence encodings, no whitespace, no length prefix."""
+        return _encode_payload(
+            _bit_map_history_journal_bundle_content(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BitMapHistoryJournalBundle":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and for
+        fields of the wrong type; raises :class:`ValueError` for anything
+        that does not satisfy the value contract: an array of exactly
+        ``[version, start, evidences, end, mac]`` in that order,
+        ``version == 1``, ``start`` a lowercase hex string that is empty or
+        decodes to the canonical :class:`BitMapHistoryJournalState`
+        encoding, ``evidences`` a non-empty array of lowercase hex strings
+        each decoding to the canonical :class:`BitMapHistoryEvidence`
+        encoding, ``end`` a lowercase hex string decoding to the canonical
+        :class:`BitMapHistoryJournalState` encoding and ``mac`` a lowercase
+        hex string decoding to exactly 32 bytes. After parsing and field
+        validation the record is re-encoded with :meth:`to_bytes` and the
+        result must equal the input byte for byte, so formatted JSON,
+        whitespace and any non-canonical spelling are rejected too. The MAC
+        is not verified here — pass the record to
+        :func:`audit_map_history_journal_bundle` with the shared key for
+        that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("bit map history journal bundle data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"bit map history journal bundle is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "bit map history journal bundle must be a JSON array of"
+                " exactly version, start, evidences, end and mac"
+            )
+        raw_version, raw_start, raw_evidences, raw_end, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "bit map history journal bundle version must be an integer"
+            )
+        if raw_version != 1:
+            raise ValueError("bit map history journal bundle version must be 1")
+        start = _parse_bit_map_hex(raw_start, "journal bundle start")
+        if not isinstance(raw_evidences, list):
+            raise TypeError(
+                "bit map history journal bundle evidences must be an array"
+            )
+        evidences = tuple(
+            _parse_bit_map_hex(raw_evidence, "journal bundle evidence")
+            for raw_evidence in raw_evidences
+        )
+        end = _parse_bit_map_hex(raw_end, "journal bundle end")
+        mac = _parse_bit_map_hex(raw_mac, "journal bundle mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "bit map history journal bundle mac must decode to exactly 32"
+                " bytes"
+            )
+        record = cls(
+            version=1,
+            start=start,
+            evidences=evidences,
+            end=end,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "bit map history journal bundle encoding is not canonical"
+            )
+        return record
+
+
+def _coerce_bit_map_history_journal_bundle(
+    x: object, name: str
+) -> "BitMapHistoryJournalBundle":
+    """Coerce a :class:`BitMapHistoryJournalBundle` or its canonical bytes,
+    splitting the TypeError/ValueError contract exactly as the public
+    auditors do: the wrong kind of argument raises :class:`TypeError`, a
+    field-shape failure surfacing while parsing byte content of the right
+    kind is a value error."""
+    if isinstance(x, BitMapHistoryJournalBundle):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return BitMapHistoryJournalBundle.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the bit map history journal bundle"
+                " field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a BitMapHistoryJournalBundle instance or its"
+        " canonical bytes"
+    )
+
+
+def seal_map_history_journal_bundle(
+    evidences: object, key: object, *, state: object = None
+) -> "BitMapHistoryJournalBundle":
+    """Audit a contiguous journal segment chain and seal it as a bundle.
+
+    ``evidences`` must be a non-empty iterable of
+    :class:`BitMapHistoryEvidence` instances or their canonical
+    :meth:`BitMapHistoryEvidence.to_bytes` encodings — a non-iterable or a
+    wrong-typed item raises :class:`TypeError`, an empty sequence or a
+    malformed item raises :class:`ValueError`. ``key`` must be non-empty
+    ``bytes`` — a non-bytes value raises :class:`TypeError`, an empty value
+    :class:`ValueError`. ``state`` is keyword-only: ``None`` (the default)
+    starts the chain from no journal state at all, so the bundle's ``start``
+    is the empty bytes; otherwise it must be a
+    :class:`BitMapHistoryJournalState` or its canonical
+    :meth:`BitMapHistoryJournalState.to_bytes` encoding (any other type
+    raises :class:`TypeError`), checked at both MAC layers exactly as
+    :class:`BitMapHistoryJournalAuditor` checks it. Every segment is
+    replayed in order through a :class:`BitMapHistoryJournalAuditor` — a
+    MAC mismatch, a failed carried update or a broken chain raises
+    :class:`ValueError` — and only on success is the bundle produced: the
+    canonical evidence encodings in chain order, ``end`` the canonical
+    encoding of the final journal state and ``mac`` computed as
+    ``HMAC-SHA256(key, b"NPBJ3" + C)``. Sealing touches no auditor state
+    beyond the throwaway replay.
+    """
+    try:
+        items = list(evidences)  # type: ignore[arg-type]
+    except TypeError:
+        raise TypeError(
+            "evidences must be an iterable of BitMapHistoryEvidence instances"
+            " or their canonical bytes"
+        ) from None
+    if not items:
+        raise ValueError("evidences must be a non-empty iterable")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    auditor = BitMapHistoryJournalAuditor(key, state=state)
+    coerced = [
+        _coerce_bit_map_history_evidence(item, "evidences items")
+        for item in items
+    ]
+    for evidence in coerced:
+        auditor.audit(evidence)
+    final = auditor.state
+    assert final is not None  # guaranteed: items is non-empty
+    if state is None:
+        start = b""
+    elif isinstance(state, BitMapHistoryJournalState):
+        start = state.to_bytes()
+    else:
+        # Canonical BitMapHistoryJournalState bytes, already validated.
+        start = state  # type: ignore[assignment]
+    candidate = BitMapHistoryJournalBundle(
+        version=1,
+        start=start,
+        evidences=tuple(evidence.to_bytes() for evidence in coerced),
+        end=final.to_bytes(),
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        candidate,
+        mac=_bit_map_history_journal_bundle_mac(key, candidate),
+    )
+
+
+def audit_map_history_journal_bundle(
+    x: object, key: object
+) -> "BitMapHistoryJournalState":
+    """Re-verify a :class:`BitMapHistoryJournalBundle` against ``key``.
+
+    ``x`` must be a :class:`BitMapHistoryJournalBundle` or its canonical
+    :meth:`BitMapHistoryJournalBundle.to_bytes` encoding and ``key`` the
+    non-empty shared ``bytes`` key — a wrong-typed argument raises
+    :class:`TypeError`, every other contract violation raises
+    :class:`ValueError`. The bundle MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPBJ3" + C)`` and compared in constant time, then
+    the carried ``start`` (when non-empty) and ``end`` states are each
+    checked at both MAC layers — the checkpoint table's ``NPBL1`` MAC and
+    the state's own ``NPBJ1`` MAC — exactly as
+    :class:`BitMapHistoryJournalAuditor` checks them. Finally the carried
+    segments are replayed in order through a fresh auditor, starting from
+    no journal state when ``start`` is empty and from the carried starting
+    state otherwise, and the recomputed final state must equal the bundle's
+    ``end`` byte for byte. Auditing is a pure check: it touches no auditor
+    state beyond the throwaway replay and returns no partial result — on
+    success the frozen :class:`BitMapHistoryJournalState` of the final
+    journal is returned.
+    """
+    bundle = _coerce_bit_map_history_journal_bundle(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _bit_map_history_journal_bundle_mac(key, bundle), bundle.mac
+    ):
+        raise ValueError("bit map history journal bundle mac does not match")
+    # Both MAC layers of the carried start and end states, always
+    # recomputed before the replay is consulted.
+    if bundle.start:
+        BitMapHistoryJournalAuditor(key, state=bundle.start)
+    BitMapHistoryJournalAuditor(key, state=bundle.end)
+    auditor = BitMapHistoryJournalAuditor(
+        key, state=bundle.start if bundle.start else None
+    )
+    for evidence in bundle.evidences:
+        auditor.audit(evidence)
+    final = auditor.state
+    assert final is not None  # guaranteed: evidences is non-empty
+    if final.to_bytes() != bundle.end:
+        raise ValueError(
+            "bit map history journal bundle end does not match the replayed"
+            " journal"
+        )
+    return final
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
