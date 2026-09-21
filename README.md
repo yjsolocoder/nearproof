@@ -67,7 +67,11 @@ python3 -m nearproof
   - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON **数组** `[1, E, M]`，`E` 项为 `[sid, seq, hash]`，bytes 字段小写 hex，无空白；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），其余不合契约（含非规范拼写、乱序或重复 `sid`）抛 `ValueError`，重编码须逐字节相等，不验 MAC
 - `BitGate(verifier, *, checkpoint=None)` — 带状态、按会话分区防回滚的位会话恢复门；`verifier` 必须是 `Verifier` 实例（错型抛 `TypeError`），用其共享密钥；`checkpoint` 收 `BitMap` 或其规范字节或 `None`，并以该共享密钥恒时验证 `NPBL1` MAC（见下）
   - `resume(x) -> BitSession` — 收 `BitState` 或其规范 bytes（余类型抛 `TypeError`）；复用 `resume_bits` 验签并恢复，派生 `sid` 后在锁内对该分区门控：低序拒绝、同序仅同摘要重放、高序推进、首见 `sid` 新建分区；验签、门控与更新原子完成，失败不改状态，并发不丢更新
+  - `resume_tx(x) -> (BitSession, BitMapUpdate)` — 同一把锁内跑与 `resume` 完全相同的原子验签/门控/更新，并额外返回见证本次表转移的 `BitMapUpdate` 凭证（重放时 `before == after`；首次事务 `before == b""`）
   - 只读 `checkpoint` 属性导出当前 `BitMap | None`（首次成功恢复前为 `None`）
+- `BitMapUpdate(version, before, after, mac)` — 一次**原子表转移**的密钥 MAC 冻结凭证（`version=1`；`before` 为 `b""`（门初始空表）或与 `after` 同为规范 `BitMap` 字节；`mac` 恰 32 字节，`mac=HMAC-SHA256(key, b"NPBU1"+C)`，`C` 为去 mac 四元 `[1,before,after]`（bytes 为小写 hex）的紧凑 UTF-8 JSON 编码，直拼无长度前缀；位置构造、冻结、按字段相等；字段错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
+  - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON **数组** `[1, before, after, mac]`，三 bytes 字段小写 hex（空前表为 `""`），无空白、无长度前缀；`from_bytes` 仅收 bytes（非 bytes 或顶层字段错型抛 `TypeError`），外层须恰为四元、`version == 1`、内嵌表须各自满足 `BitMap` 规范契约、`mac` hex 解出恰 32 字节，其余不合契约（含非规范拼写）抛 `ValueError`，重编码须逐字节相等，不验 MAC
+- `audit_map_update(x, key) -> None` — 收 `BitMapUpdate` 或其规范 bytes（余类型抛 `TypeError`），`key` 须非空 bytes（非 bytes 抛 `TypeError`、空抛 `ValueError`）；恒时复核凭证 `NPBU1` MAC 与存在表（非空 `before` 及 `after`）的 `NPBL1` MAC，并校验转移恰为：表相同（重放）、按序新增一项（首见分区）、或仅一项 `seq` 严格升高且 `hash` 改变而余项不变（推进）；`before == b""` 时 `after` 至多一项；其余不符抛 `ValueError`；纯校验、不改任何状态
 - `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮已接受**上下文绑定**验证的防篡改记录（`version=1`，四个 bytes 字段均恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -398,6 +402,32 @@ gate = BitGate(verifier, checkpoint=persisted)
 gate.resume(saved_a1)                        # A 分区同序同摘要：重放，接受
 gate.resume(saved_a0)                        # A 分区低序：ValueError，表不变
 gate.resume(saved_b4)                        # B 分区高序：照常推进
+```
+
+### 原子转移凭证 `BitMapUpdate`、`resume_tx` 与 `audit_map_update`
+
+`resume` 只返回恢复的会话；需要向外证明"这次恢复把表从什么状态原子地改成了什么状态"时，用 `BitGate.resume_tx(x) -> (BitSession, BitMapUpdate)`：它与 `resume` 走**同一条锁内路径**——同样的 `resume_bits` 验签门控、同样的分区比较与整表更新——只是在同一把锁内把本次转移额外封成一张凭证后一并返回。失败时同样不改动表；并发事务同样绝不丢失更新。
+
+`BitMapUpdate(version, before, after, mac)` 是冻结凭证：位置构造、按字段相等。`version=1`；`before` 为 `b""`（门尚无表时的首次事务）或与 `after` 一样是**规范 `BitMap.to_bytes()` 字节**（构造时即按 `BitMap` 契约校验，内嵌表不合契约抛 `ValueError`）；`mac` 恰 32 字节，`mac = HMAC-SHA256(key, b"NPBU1" + C)`，`C` 为去 mac 三元 `[1, before, after]`（两 bytes 字段为小写 hex；空前表为 `""`）的紧凑 UTF-8 JSON 编码，前缀与 `C` 直拼、无定界符、无长度前缀。字段错型抛 `TypeError`，其余违约抛 `ValueError`，记录本身不含密钥。
+
+`to_bytes()` 输出紧凑 UTF-8 JSON **数组** `[1, before, after, mac]`，三个 bytes 字段小写 hex，无空白、无长度前缀。`from_bytes(data)` 仅收 `bytes`（非 bytes 抛 `TypeError`）：外层须恰为四元数组、`version == 1`，`before`/`after` 为偶数位小写 hex 且内嵌表须各自满足 `BitMap.from_bytes` 契约（`before` 允许 `""`），`mac` 须解为恰好 32 字节；顶层字段错型抛 `TypeError`，其余（含内嵌表违约、非规范拼写）抛 `ValueError`；字段校验后重编码须与输入逐字节相等；**不验 MAC**。
+
+`audit_map_update(x, key) -> None` 是不持有门的第三方复核：
+
+- `x` 收 `BitMapUpdate` 对象或其规范字节，其余类型抛 `TypeError`；`key` 必须是非空 `bytes`（非 bytes 抛 `TypeError`、空抛 `ValueError`）。
+- 恒时复核三层 MAC：凭证本身的 `NPBU1` MAC，以及存在表（非空 `before` 与 `after`）内嵌的 `NPBL1` MAC——任一不符抛 `ValueError`。
+- 转移形状必须恰为以下之一，否则抛 `ValueError`：
+  - **表相同**（同序同体重放）；
+  - **新增一项**：`after` 恰多一个条目，按 `sid` 升序插入且其余条目逐一不变；
+  - **推进一项**：条目数与各 `sid` 不变，恰有一项 `seq` 严格升高**且** `hash` 改变，余项逐一不变。
+  - `before == b""` 时只允许建立至多一个条目的首表（不可能重放或推进）。
+- 纯函数：成功返回 `None`，不读取也不修改任何门状态。
+
+```python
+session, receipt = gate.resume_tx(saved_a1)    # 首次：receipt.before == b""
+assert receipt.after == gate.checkpoint.to_bytes()
+audit_map_update(receipt, verifier_key)        # 第三方恒时复核，通过
+audit_map_update(receipt.to_bytes(), verifier_key)  # 字节形式等价
 ```
 
 ### 批量判定 `assess`
