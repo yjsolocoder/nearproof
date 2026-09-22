@@ -93,6 +93,8 @@ __all__ = [
     "Prover",
     "RangeAuditor",
     "RangeBatchReceipt",
+    "RangeBatchReceiptAuditor",
+    "RangeBatchReceiptFrontier",
     "RangeDecision",
     "RangeFrontier",
     "RangeReceipt",
@@ -216,6 +218,10 @@ _RANGE_FRONTIER_DIGEST_PREFIX = b"NPBJ14"
 _RANGE_RECEIPT_BATCH_PREFIX = b"NPBJ15"
 # Domain separation prefix for the range-batch receipt MAC.
 _RANGE_BATCH_RECEIPT_PREFIX = b"NPBJ16"
+# Domain separation prefixes for the range-batch receipt frontier: the
+# frontier MAC and the batch digest-chain step respectively.
+_RANGE_BATCH_RECEIPT_FRONTIER_MAC_PREFIX = b"NPBJ17"
+_RANGE_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPBJ18"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -9848,6 +9854,432 @@ def audit_batch_receipt(
     # returning the frozen range frontier at the batch end (it itself
     # raises ValueError if the replayed frontier does not equal that end).
     return audit_range_receipt_batch(batch, key)
+
+
+def _range_batch_receipt_frontier_content(
+    frontier: "RangeBatchReceiptFrontier",
+) -> list:
+    """The JSON-ready first four range-batch-receipt-frontier fields
+    (everything but ``mac``)."""
+    return [
+        frontier.version,
+        frontier.sequence,
+        frontier.end.hex(),
+        frontier.digest.hex(),
+    ]
+
+
+def _range_batch_receipt_frontier_content_bytes(
+    frontier: "RangeBatchReceiptFrontier",
+) -> bytes:
+    """The canonical compact encoding ``C`` of the first four
+    range-batch-receipt-frontier fields."""
+    return _encode_payload(
+        _range_batch_receipt_frontier_content(frontier)
+    )
+
+
+def _range_batch_receipt_frontier_mac(
+    key: bytes, frontier: "RangeBatchReceiptFrontier"
+) -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ17" + C)`` where ``C`` is the canonical
+    encoding of the first four fields. The prefix and ``C`` are
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _RANGE_BATCH_RECEIPT_FRONTIER_MAC_PREFIX
+        + _range_batch_receipt_frontier_content_bytes(frontier),
+        hashlib.sha256,
+    ).digest()
+
+
+def _range_batch_receipt_frontier_next_digest(
+    previous: bytes, sequence: int, receipt: bytes
+) -> bytes:
+    """One range-batch digest-chain step:
+    ``SHA256(b"NPBJ18" + d + u64be(n) + R)``.
+
+    The prefix, the previous 32-byte digest, the fixed 8-byte big-endian
+    sequence and the canonical :class:`RangeBatchReceipt` bytes are
+    concatenated directly with no separator or length prefix."""
+    return hashlib.sha256(
+        _RANGE_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX
+        + previous
+        + _bit_map_history_journal_u64be(sequence)
+        + receipt
+    ).digest()
+
+
+def _require_range_batch_receipt_frontier_end(value: bytes) -> None:
+    """Enforce that a range-batch receipt frontier ``end`` is the
+    canonical non-empty :class:`RangeFrontier` encoding. ``value`` is
+    already known to be ``bytes``; :meth:`RangeFrontier.from_bytes`
+    enforces the full contract including its canonical re-encoding check,
+    and every violation — including the field-shape :class:`TypeError` a
+    malformed inner document would otherwise surface — raises
+    :class:`ValueError`."""
+    try:
+        RangeFrontier.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "range batch receipt frontier end must be the canonical"
+            " non-empty RangeFrontier encoding"
+        ) from error
+
+
+@dataclass(frozen=True)
+class RangeBatchReceiptFrontier:
+    """A key-MAC'd, digest-chained frontier over the audited
+    :class:`RangeBatchReceipt` commit stream.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer (the number of audited :class:`RangeBatchReceipt` commits);
+    ``end`` the canonical non-empty :meth:`RangeFrontier.to_bytes`
+    encoding of the range frontier the audited commit chain currently
+    ends at; ``digest`` exactly 32 bytes — the head of a hash chain with
+    ``d0`` fixed at 32 zero bytes and each accepted batch receipt
+    extending it as ``d' = SHA256(b"NPBJ18" + d + u64be(n) + R)`` where
+    ``n`` is the new sequence, ``u64be(n)`` its fixed 8-byte big-endian
+    encoding and ``R`` the canonical
+    :meth:`RangeBatchReceipt.to_bytes` bytes, every part concatenated
+    directly with no separator or length prefix; ``mac`` exactly 32
+    bytes — ``HMAC-SHA256(key, b"NPBJ17" + C)`` where ``C`` is the
+    canonical compact encoding of the first four fields (the version,
+    sequence, lowercase-hex end and lowercase-hex digest, without
+    ``mac``), the prefix and ``C`` concatenated directly with no
+    separator or length prefix. Instances are frozen, constructed
+    positionally in field order and compare equal by their fields. A
+    field of the wrong type raises :class:`TypeError`; every other
+    contract violation raises :class:`ValueError`. No key material is
+    stored.
+    """
+
+    version: int
+    sequence: int
+    end: bytes
+    digest: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "range batch receipt frontier version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError(
+                "range batch receipt frontier version must be 1"
+            )
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "range batch receipt frontier sequence must be a non-bool"
+                " integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "range batch receipt frontier sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        if not isinstance(self.end, bytes):
+            raise TypeError(
+                "range batch receipt frontier end must be bytes"
+            )
+        _require_range_batch_receipt_frontier_end(self.end)
+        for name in ("digest", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(
+                    f"range batch receipt frontier {name} must be bytes"
+                )
+            if len(value) != 32:
+                raise ValueError(
+                    f"range batch receipt frontier {name} must be exactly"
+                    " 32 bytes"
+                )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, sequence, end, digest, mac]`` where ``end``, ``digest`` and
+        ``mac`` are lowercase hex, no whitespace, no length prefix."""
+        return _encode_payload(
+            _range_batch_receipt_frontier_content(self)
+            + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "RangeBatchReceiptFrontier":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, sequence, end, digest, mac]`` in that order,
+        ``version == 1``, ``sequence`` a non-bool u64, ``end`` a
+        lowercase hex string decoding to the canonical non-empty
+        :class:`RangeFrontier` encoding, and ``digest``/``mac``
+        lowercase hex strings decoding to exactly 32 bytes each. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical
+        spelling are rejected too. No MAC is verified here — neither the
+        commit frontier MAC nor the MACs of the nested ``end`` range
+        frontier; pass the record to :class:`RangeBatchReceiptAuditor`
+        for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "range batch receipt frontier data must be bytes"
+            )
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                "range batch receipt frontier is not valid JSON:"
+                f" {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "range batch receipt frontier must be a JSON array of"
+                " exactly version, sequence, end, digest and mac"
+            )
+        raw_version, raw_sequence, raw_end, raw_digest, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "range batch receipt frontier version must be an integer"
+            )
+        if raw_version != 1:
+            raise ValueError(
+                "range batch receipt frontier version must be 1"
+            )
+        if type(raw_sequence) is not int:
+            raise TypeError(
+                "range batch receipt frontier sequence must be a non-bool"
+                " integer"
+            )
+        if not 0 <= raw_sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "range batch receipt frontier sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        end = _parse_bit_map_hex(
+            raw_end, "range batch receipt frontier end"
+        )
+        _require_range_batch_receipt_frontier_end(end)
+        digest = _parse_bit_map_hex(
+            raw_digest, "range batch receipt frontier digest"
+        )
+        if len(digest) != 32:
+            raise ValueError(
+                "range batch receipt frontier digest must decode to"
+                " exactly 32 bytes"
+            )
+        mac = _parse_bit_map_hex(
+            raw_mac, "range batch receipt frontier mac"
+        )
+        if len(mac) != 32:
+            raise ValueError(
+                "range batch receipt frontier mac must decode to exactly"
+                " 32 bytes"
+            )
+        record = cls(
+            version=1,
+            sequence=raw_sequence,
+            end=end,
+            digest=digest,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "range batch receipt frontier encoding is not canonical"
+            )
+        return record
+
+
+def _verify_range_batch_receipt_frontier_macs(
+    key: bytes, frontier: "RangeBatchReceiptFrontier"
+) -> None:
+    """Recompute all six MAC layers of a parsed range-batch commit
+    frontier — the commit frontier's own ``NPBJ17`` MAC over the
+    canonical encoding of its first four fields, and the five layers of
+    its ``end`` range frontier exactly as
+    :func:`_verify_range_frontier_macs` checks them: the range
+    frontier's own ``NPBJ13`` MAC, the nested commit frontier's own
+    ``NPBJ9`` MAC, that frontier's ``end`` receipt frontier's own
+    ``NPBJ5`` MAC, its ``end`` state's ``NPBJ1`` MAC and the state's
+    embedded checkpoint table's ``NPBL1`` MAC. All six layers are always
+    recomputed and each compared in constant time before any result is
+    consulted."""
+    frontier_mac_ok = hmac.compare_digest(
+        _range_batch_receipt_frontier_mac(key, frontier), frontier.mac
+    )
+    nested_ok = True
+    try:
+        _verify_range_frontier_macs(
+            key, RangeFrontier.from_bytes(frontier.end)
+        )
+    except (TypeError, ValueError):
+        nested_ok = False
+    if not frontier_mac_ok or not nested_ok:
+        raise ValueError(
+            "range batch receipt frontier mac does not match the key"
+        )
+
+
+class RangeBatchReceiptAuditor:
+    """Stateful auditor chaining committed :class:`RangeBatchReceipt`
+    receipts into one monotone, restartable, sequence-numbered
+    :class:`RangeBatchReceiptFrontier`.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the
+    same shared key the batches, receipts and frontiers are MAC'd with.
+    ``checkpoint`` is keyword-only: ``None`` (the default) starts from
+    sequence zero with no commit at all and the digest chain rooted at
+    ``d0`` (32 zero bytes); otherwise it must be a
+    :class:`RangeBatchReceiptFrontier` or its canonical
+    :meth:`RangeBatchReceiptFrontier.to_bytes` encoding (any other type
+    raises :class:`TypeError`). A supplied frontier is checked at six
+    MAC layers, all always recomputed and each compared in constant
+    time before any result is consulted: the commit frontier's own
+    ``NPBJ17`` MAC over the canonical encoding of its first four
+    fields, and the five layers of its ``end`` range frontier — the
+    range frontier's own ``NPBJ13`` MAC, the embedded commit frontier's
+    ``NPBJ9`` MAC, that frontier's ``end`` receipt frontier's ``NPBJ5``
+    MAC, the journal state's own ``NPBJ1`` MAC and the embedded
+    checkpoint table's ``NPBL1`` MAC. A malformed encoding or any MAC
+    mismatch raises :class:`ValueError`. Across a restart the caller
+    must pass the value previously exported at :attr:`state`; nothing
+    is persisted by the auditor itself.
+
+    Each :meth:`audit` accepts one :class:`RangeBatchReceipt` and the
+    :class:`RangeReceiptBatch` it attests (either as objects or as
+    their canonical bytes) and, under the auditor lock, first
+    re-verifies the pair exactly like :func:`audit_batch_receipt` —
+    the ``NPBJ16`` receipt MAC, the batch digest, the endpoint equality
+    and the whole batch verification — and then demands the receipt
+    starts exactly where the commit frontier currently stands: with no
+    frontier the receipt's ``start`` must be empty, and otherwise it
+    must equal the frontier ``end`` byte for byte. Only then does the
+    frontier advance: ``n`` is the old sequence plus one, the new
+    ``end`` is the receipt's ``end``, the new digest is
+    ``SHA256(b"NPBJ18" + d + u64be(n) + R)`` over the previous digest,
+    the fixed 8-byte big-endian ``n`` and the canonical receipt bytes,
+    and the new commit frontier is MAC'd as
+    ``HMAC-SHA256(key, b"NPBJ17" + C)``. Verification and the frontier
+    advance are one atomic step: a failed audit raises
+    :class:`ValueError` (and a wrong-typed argument :class:`TypeError`)
+    and leaves the frontier untouched, and concurrent audits linearize
+    in lock-acquisition order so a committed receipt is never lost.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._frontier: "Optional[RangeBatchReceiptFrontier]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, RangeBatchReceiptFrontier):
+            frontier = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                frontier = RangeBatchReceiptFrontier.from_bytes(checkpoint)
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value
+                # error.
+                raise ValueError(
+                    "checkpoint does not satisfy the range batch receipt"
+                    " frontier field contract"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be a RangeBatchReceiptFrontier"
+                " instance, its canonical bytes, or None"
+            )
+        _verify_range_batch_receipt_frontier_macs(self._key, frontier)
+        self._frontier = frontier
+
+    @property
+    def state(self) -> "Optional[RangeBatchReceiptFrontier]":
+        """The current :class:`RangeBatchReceiptFrontier`, or ``None``
+        before the first successfully audited commit. The returned
+        object is frozen and the property read-only; persist its
+        :meth:`RangeBatchReceiptFrontier.to_bytes` output and pass it
+        back to a new auditor to survive a restart."""
+        return self._frontier
+
+    def audit(
+        self, receipt: object, batch: object
+    ) -> "RangeBatchReceiptAuditor":
+        """Audit one committed :class:`RangeBatchReceipt` against its
+        :class:`RangeReceiptBatch` and advance.
+
+        ``receipt`` must be a :class:`RangeBatchReceipt` or its
+        canonical :meth:`RangeBatchReceipt.to_bytes` encoding and
+        ``batch`` the :class:`RangeReceiptBatch` it attests or its
+        canonical :meth:`RangeReceiptBatch.to_bytes` encoding — any
+        other type raises :class:`TypeError`; a malformed or
+        non-canonical encoding, a MAC or digest mismatch, endpoints
+        that do not match the batch, a batch that fails verification, a
+        sequence that would overflow u64, or a receipt ``start`` that
+        does not equal the current frontier ``end`` (empty when no
+        commit has happened yet) raises :class:`ValueError`. The pair is
+        re-verified exactly as :func:`audit_batch_receipt` verifies it
+        and the start matched against the frontier under the auditor
+        lock, and the sequence, digest-chain head, end frontier and
+        commit frontier MAC are all advanced in the same atomic step,
+        so a failed audit changes nothing and concurrent audits are
+        serialized in lock-acquisition order. Returns the auditor
+        itself.
+        """
+        with self._lock:
+            record = _coerce_range_batch_receipt(receipt, "receipt")
+            batch_record = _coerce_range_receipt_batch(batch, "batch")
+            # audit_batch_receipt is a pure check: the NPBJ16 receipt
+            # MAC, the batch digest, the endpoints and the whole carried
+            # batch chain, returning the frozen range frontier at the
+            # batch end.
+            audit_batch_receipt(record, batch_record, self._key)
+            current = b"" if self._frontier is None else self._frontier.end
+            if record.start != current:
+                raise ValueError(
+                    "range batch receipt start does not match the frontier"
+                    " end"
+                )
+            previous_sequence = (
+                0 if self._frontier is None else self._frontier.sequence
+            )
+            if previous_sequence >= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    "range batch receipt frontier sequence would overflow"
+                    " the unsigned 64-bit range"
+                )
+            sequence = previous_sequence + 1
+            previous_digest = (
+                b"\x00" * 32
+                if self._frontier is None
+                else self._frontier.digest
+            )
+            digest = _range_batch_receipt_frontier_next_digest(
+                previous_digest, sequence, record.to_bytes()
+            )
+            candidate = RangeBatchReceiptFrontier(
+                version=1,
+                sequence=sequence,
+                end=record.end,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._frontier = replace(
+                candidate,
+                mac=_range_batch_receipt_frontier_mac(
+                    self._key, candidate
+                ),
+            )
+            return self
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
