@@ -8756,9 +8756,30 @@ class RangeAuditor:
     argument, a non-pair item or a wrong-typed member raises
     :class:`TypeError`, while an empty batch, a failed audit, a replay,
     a broken link, a final-state mismatch or a u64 overflow raises
-    :class:`ValueError` and changes nothing. :meth:`audit` and
-    :meth:`audit_batch` share the auditor lock, so single pairs and
-    batches linearize together in lock-acquisition order.
+    :class:`ValueError` and changes nothing. :meth:`audit`,
+    :meth:`audit_batch` and :meth:`audit_batch_record` share the auditor
+    lock, so single pairs, in-memory batches and sealed
+    :class:`RangeReceiptBatch` records all linearize together in
+    lock-acquisition order.
+
+    :meth:`audit_batch_record` atomically commits one transferable
+    :class:`RangeReceiptBatch`: ``x`` must be the batch object or its
+    canonical :meth:`RangeReceiptBatch.to_bytes` encoding (any other type
+    raises :class:`TypeError`). The batch is decoded per its existing
+    contract and, before anything is replayed, the ``NPBJ15`` batch MAC and
+    all five MAC layers of each non-empty endpoint :class:`RangeFrontier`
+    are recomputed, every comparison in constant time. An empty auditor
+    accepts only a batch whose ``start`` is the empty string; otherwise
+    ``start`` must equal the current :attr:`state` encoding byte for byte,
+    which rejects an old fork and a replayed batch alike. The carried
+    ``items`` are then replayed in order on a temporary frontier, each pair
+    exactly like :func:`audit_receipt`, incrementing the non-bool u64
+    sequence and extending the digest per ``NPBJ14``; the live frontier is
+    replaced once, only when the replayed :meth:`RangeFrontier.to_bytes`
+    equals the batch's declared ``end``. A non-canonical encoding, a wrong
+    key, a MAC or digest mismatch, a broken link, an old fork, a batch
+    replayed twice, or a u64 overflow raises :class:`ValueError` and changes
+    no state; an empty batch can never decode in the first place.
     """
 
     def __init__(self, key: object, *, checkpoint: object = None) -> None:
@@ -8934,6 +8955,98 @@ class RangeAuditor:
             for receipt, record in coerced:
                 candidate.audit(receipt, record)
             self._frontier = candidate.state
+            return self
+
+    def audit_batch_record(self, x: object) -> "RangeAuditor":
+        """Atomically commit one transferable
+        :class:`RangeReceiptBatch` against the current frontier.
+
+        ``x`` must be a :class:`RangeReceiptBatch` or its canonical
+        :meth:`RangeReceiptBatch.to_bytes` encoding — any other type raises
+        :class:`TypeError`; a malformed or non-canonical encoding raises
+        :class:`ValueError`. Under the auditor lock the batch is first
+        verified independently of the live state: its ``NPBJ15`` MAC is
+        recomputed and compared in constant time, and each non-empty
+        endpoint :class:`RangeFrontier` (``start`` and ``end``) is checked
+        at five MAC layers — the range frontier's own ``NPBJ13`` MAC and
+        the four layers of its ``end`` commit frontier — all always
+        recomputed and each compared in constant time. Only after every
+        check passes is anything replayed: with no current frontier the
+        batch ``start`` must be the empty string, and otherwise it must
+        equal the current :attr:`state` :meth:`RangeFrontier.to_bytes`
+        encoding byte for byte, so an old fork and the same batch replayed
+        are both rejected. The carried ``items`` are then replayed in
+        order on a temporary frontier seeded with the matching starting
+        point, each pair re-verified exactly as :func:`audit_receipt`
+        verifies it and advanced per ``NPBJ14`` — the non-bool u64
+        sequence incrementing one step and the digest chain extending as
+        ``SHA256(b"NPBJ14" + d + u64be(n) + R)``. The live frontier is
+        replaced once, and only when the replayed frontier's
+        :meth:`RangeFrontier.to_bytes` equals the batch's declared ``end``
+        byte for byte; an empty batch can never be encoded and a
+        mid-replay failure, a broken link, a final-state mismatch or a u64
+        overflow therefore all raise :class:`ValueError` and change no
+        state. :meth:`audit`, :meth:`audit_batch` and this method share
+        the auditor lock and linearize together in lock-acquisition order.
+        Returns the auditor itself.
+        """
+        with self._lock:
+            # Decode per the existing batch contract: a non-batch argument
+            # is a TypeError; malformed or non-canonical byte content is a
+            # ValueError. Nothing has been replayed yet, so decoding
+            # failures cannot affect the frontier.
+            batch = _coerce_range_receipt_batch(x, "x")
+            # Independently recompute the NPBJ15 batch MAC and all five
+            # MAC layers of each non-empty endpoint frontier before any
+            # replay touches the temporary chain; every comparison is
+            # constant time and a mismatch raises ValueError.
+            if not hmac.compare_digest(
+                _range_receipt_batch_mac(self._key, batch), batch.mac
+            ):
+                raise ValueError(
+                    "range receipt batch mac does not match the key"
+                )
+            if batch.start:
+                _verify_range_frontier_macs(
+                    self._key, RangeFrontier.from_bytes(batch.start)
+                )
+            _verify_range_frontier_macs(
+                self._key, RangeFrontier.from_bytes(batch.end)
+            )
+            # The batch must extend exactly the current frontier: the
+            # empty start only for an auditor with no receipt yet,
+            # otherwise the current state encoding byte for byte. This is
+            # what rejects an old fork and the same batch replayed.
+            current = (
+                b""
+                if self._frontier is None
+                else self._frontier.to_bytes()
+            )
+            if batch.start != current:
+                raise ValueError(
+                    "range receipt batch start does not match the current"
+                    " range frontier"
+                )
+            # Replay the whole carried chain on a temporary frontier
+            # seeded with the matching starting point; each pair is
+            # re-verified through audit_receipt and linked/advanced
+            # exactly like audit. The live frontier is read but never
+            # mutated until it adopts the temporary frontier below.
+            candidate = RangeAuditor(
+                self._key,
+                checkpoint=(
+                    None if batch.start == b"" else batch.start
+                ),
+            )
+            for receipt, record in batch.items:
+                candidate.audit(receipt, record)
+            final = candidate.state
+            if final is None or final.to_bytes() != batch.end:
+                raise ValueError(
+                    "range receipt batch end does not match the replayed"
+                    " chain"
+                )
+            self._frontier = final
             return self
 
 
