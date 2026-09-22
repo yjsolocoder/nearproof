@@ -10175,6 +10175,17 @@ class RangeBatchReceiptAuditor:
     :class:`ValueError` (and a wrong-typed argument :class:`TypeError`)
     and leaves the frontier untouched, and concurrent audits linearize
     in lock-acquisition order so a committed receipt is never lost.
+
+    :meth:`audit_stream` accepts one :class:`ReceiptStream` (or its
+    canonical bytes) and, under the same lock, lets a long-running
+    receiver sync a whole contiguous run of committed batches in one
+    all-or-nothing step: the stream ``NPBJ19`` MAC is re-verified in
+    constant time first, the stream ``start`` must equal the current
+    frontier bytes (empty only before the first commit), the carried
+    pairs are replayed on a temporary auditor exactly as :meth:`audit`
+    replays them, and the live frontier is replaced once, and only when
+    every pair audits and the temporary final frontier equals the
+    stream ``end`` byte for byte.
     """
 
     def __init__(self, key: object, *, checkpoint: object = None) -> None:
@@ -10285,6 +10296,74 @@ class RangeBatchReceiptAuditor:
                     self._key, candidate
                 ),
             )
+            return self
+
+    def audit_stream(self, x: object) -> "RangeBatchReceiptAuditor":
+        """Atomically receive one :class:`ReceiptStream` and sync the
+        whole contiguous run of committed batches it carries.
+
+        ``x`` must be a :class:`ReceiptStream` or its canonical
+        :meth:`ReceiptStream.to_bytes` encoding — canonical bytes are
+        parsed with :meth:`ReceiptStream.from_bytes`, which enforces the
+        compact UTF-8 JSON ``[1,start,items,end,mac]`` shape, lowercase
+        hex and byte-for-byte canonical round trip but verifies no MAC —
+        any other type raises :class:`TypeError` and malformed or
+        non-canonical byte content raises :class:`ValueError`. Under the
+        auditor lock shared with :meth:`audit` the stream ``NPBJ19`` MAC
+        is always recomputed and compared in constant time first; then
+        the stream ``start`` must equal the current frontier bytes byte
+        for byte — with no frontier it must be empty, and otherwise it
+        must equal :meth:`RangeBatchReceiptFrontier.to_bytes` of the
+        current state — and the carried receipt/batch pairs are replayed
+        in order on a temporary auditor seeded from the stream
+        ``start``, each pair audited exactly as :meth:`audit` audits it
+        (the ``NPBJ16`` receipt MAC, the batch digest, the endpoints and
+        the whole carried batch chain) with the digest chain extending
+        per ``NPBJ18``. The live, read-only :attr:`state` is replaced
+        once, and only when every pair audits and the temporary final
+        frontier's canonical bytes equal the stream ``end`` byte for
+        byte; a wrong key, a tampered stream, a broken chain, a replay,
+        a start or end mismatch, or a sequence that would overflow u64
+        raises :class:`ValueError` and leaves the frontier exactly where
+        it stood, so the same stream is afterwards rejected on its
+        mismatching ``start``. Concurrent calls to :meth:`audit` and
+        :meth:`audit_stream` linearize together in lock-acquisition
+        order. Returns the auditor itself.
+        """
+        with self._lock:
+            stream = _coerce_receipt_stream(x, "x")
+            # The stream NPBJ19 MAC is always recomputed and compared in
+            # constant time before anything else is consulted.
+            if not hmac.compare_digest(
+                _receipt_stream_mac(self._key, stream), stream.mac
+            ):
+                raise ValueError(
+                    "receipt stream mac does not match the key"
+                )
+            current = (
+                b""
+                if self._frontier is None
+                else self._frontier.to_bytes()
+            )
+            if stream.start != current:
+                raise ValueError(
+                    "receipt stream start does not match the frontier"
+                )
+            # Replay the whole chain on a temporary auditor seeded from
+            # the stream start; the live frontier is read but never
+            # mutated until it adopts the replayed final frontier.
+            candidate = RangeBatchReceiptAuditor(
+                self._key,
+                checkpoint=stream.start if stream.start else None,
+            )
+            for receipt, batch in stream.items:
+                candidate.audit(receipt, batch)
+            final = candidate.state
+            if final is None or final.to_bytes() != stream.end:
+                raise ValueError(
+                    "receipt stream end does not match the replayed chain"
+                )
+            self._frontier = final
             return self
 
 
