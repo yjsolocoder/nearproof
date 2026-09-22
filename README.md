@@ -87,6 +87,10 @@ python3 -m nearproof
 - `BitMapHistoryJournalReceiptAuditor(key, *, checkpoint=None)` — 把已提交回执链接成带序号与摘要链的单调前沿的带状态审计器；`key` 为非空 `bytes`（错型抛 `TypeError`，空值抛 `ValueError`）；`checkpoint` 收 `BitMapHistoryJournalReceiptFrontier` 或其规范字节或 `None`，非空时恒时复核三层 MAC（前沿自身的 `NPBJ5` 与 `end` 状态的双层 `NPBL1`/`NPBJ1`，见下）
   - `audit(receipt, bundle) -> 本类` 收回执/包对象或各自规范字节（余类型抛 `TypeError`）；锁内先按 `audit_map_history_journal_receipt` 完整验回执与包，再要求回执 `start` 与当前前沿 `end` 逐字节相等（空前沿须为 `""`），然后令 `n = 旧sequence+1`、新 `end` 为回执 `end`、新摘要 `d' = SHA256(b"NPBJ6"+d+u64be(n)+R)`，并对前四项重新 MAC 为 `NPBJ5`；任何失败（含 u64 序号溢出）抛 `ValueError` 且不改状态，并发按取锁顺序线性化
   - 只读 `checkpoint` 属性导出当前 `BitMapHistoryJournalReceiptFrontier | None`（首次成功审计前为 `None`），重启时调用方须自行落盘并传回
+- `BitMapHistoryJournalReceiptBatch(version, start, items, end, mac)` — 把一段连续已提交回执（各带其所 attest 的包）连同其回执前沿起止封进一条记录的防篡改冻结批（`version=1`；`start` 为规范 `BitMapHistoryJournalReceiptFrontier` 字节或 `b""`（空前沿）；`items` 为非空有序 `(receipt, bundle)` 二元组元组，两侧各为规范回执/包字节；`end` 为规范非空 `BitMapHistoryJournalReceiptFrontier` 字节；`mac` 恰 32 字节，`mac=HMAC-SHA256(key, b"NPBJ7"+C)`，`C` 为前 4 项的字段序规范编码，直拼无长度前缀；位置构造、冻结、按字段相等；字段/项错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
+  - `to_bytes()` / `from_bytes(data)` — 字段序五元素紧凑 UTF-8 JSON 数组 `[1, start, items, end, mac]`，bytes 字段小写 hex（空前沿为 `""`），`items` 为 `[receipt, bundle]` 小写 hex 二元组数组，无空白；`from_bytes` 仅收 bytes（非 bytes 或字段/项错型抛 `TypeError`），其余不合契约（含各项非规范回执/包字节、非规范拼写）抛 `ValueError`，重编码须逐字节相等；**解析阶段不验任何 MAC**（批的 `NPBJ7`、前沿 `NPBJ5`、末态双层 MAC 都不验）
+- `seal_map_history_journal_receipt_batch(items, key, *, checkpoint=None) -> BitMapHistoryJournalReceiptBatch` — `items` 为非空 `(receipt, bundle)` 对可迭代（两侧可收对象或各自规范字节），`key` 为非空 bytes；`checkpoint` 收前沿对象/规范字节/`None`（非空时恒时复核其 `NPBJ5` 与末态双层 `NPBL1`/`NPBJ1`）；整条链先按 `BitMapHistoryJournalReceiptAuditor` 语义完整重放验链，成功才封装（见下）
+- `audit_map_history_journal_receipt_batch(x, key) -> BitMapHistoryJournalReceiptFrontier` — 恒时复核批的 `NPBJ7` MAC、非空 `start` 的 `NPBJ5` 及末态双层 MAC，再逐对重放（每对按 `audit_map_history_journal_receipt` 完整验回执/包并逐字节衔接）并核对重放末态与 `end` 逐字节相等，成功返回末态前沿（见下）
 - `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮已接受**上下文绑定**验证的防篡改记录（`version=1`，四个 bytes 字段均恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -528,6 +532,31 @@ auditor.audit(receipt2, bundle2)               # 后续 start 须逐字节等于
 
 blob = auditor.checkpoint.to_bytes()           # 调用方自行落盘
 restored = BitMapHistoryJournalReceiptAuditor(key, checkpoint=blob)   # 重启续审
+```
+
+### 回执批 `BitMapHistoryJournalReceiptBatch`、`seal_map_history_journal_receipt_batch` 与 `audit_map_history_journal_receipt_batch`
+
+有时需要把**一整段连续的已提交回执链**（连同每张回执所 attest 的包）一次性封成一条可传输、可独立复核的凭证，并让第三方在不维护审计器状态的情况下验证整链并得到末态前沿。`BitMapHistoryJournalReceiptBatch` 就是这样的冻结批，`seal_map_history_journal_receipt_batch` 制批、`audit_map_history_journal_receipt_batch` 独立验批。
+
+`BitMapHistoryJournalReceiptBatch(version, start, items, end, mac)` 是冻结的共享密钥 MAC **回执批**：位置构造、按字段相等，字段契约、编码规则与其余记录一致——`version=1`；`start` 为 `b""`（从空前沿出发）或**规范 `BitMapHistoryJournalReceiptFrontier` 字节**；`items` 为**非空有序元组**，每项是 `(receipt, bundle)` 二元组，两侧分别为规范 `BitMapHistoryJournalReceipt.to_bytes()` 与 `BitMapHistoryJournalBundle.to_bytes()` 字节，按序重放；`end` 为**规范非空 `BitMapHistoryJournalReceiptFrontier` 字节**，即该链重放后到达的回执前沿；`mac` 恰 32 字节。批 MAC 的定义为：
+
+- `mac = HMAC-SHA256(key, b"NPBJ7" + C)`，`C` 是**前 4 项**（`[1, start, items, end]`，bytes 字段小写 hex，`items` 为各 `[receipt, bundle]` 小写 hex 对，去掉 `mac`）的字段序紧凑 UTF-8 编码；域标签与 `C` 直接拼接、无定界符、无长度前缀。记录本身不含密钥。
+
+`to_bytes()` 输出字段序五元素紧凑 UTF-8 JSON **数组** `[1, start, items, end, mac]`：`start`/`end`/`mac` 为小写 hex（空前沿为 `""`），`items` 为各 `[receipt, bundle]` 小写 hex 规范字节对的数组，无空白、无长度前缀。`from_bytes(data)` **仅收 `bytes`**（其他类型或字段/项的类型错抛 `TypeError`）：外层必须恰为五元数组且字段序如上，`version == 1`，`start` 须为空或解码为规范前沿字节，`items` 须为非空数组且每项是恰含两个小写 hex 字符串的数组（前者解码为规范回执字节、后者解码为规范包字节），`end` 须解码为规范非空前沿字节，`mac` 须解码为恰好 32 字节；解析后重编码须与输入逐字节相等，故格式化 JSON、空白与任何非规范拼写一律抛 `ValueError`。**解析阶段不验任何 MAC**——既不验批的 `NPBJ7`，也不验起止前沿的 `NPBJ5`、末态日志状态的双层 `NPBL1`/`NPBJ1`，更不验各回执/包内部的 MAC。
+
+`seal_map_history_journal_receipt_batch(items, key, *, checkpoint=None)` 制批：`items` 必须是**非空可迭代**，每项为 `(receipt, bundle)` 对，两侧可收 `BitMapHistoryJournalReceipt`/`BitMapHistoryJournalBundle` 对象或各自规范字节（可混用）；`key` 为非空 `bytes`。`checkpoint` 仅限关键字：`None`（默认）表示从空前沿出发——序号 0、无任何回执、摘要链根植于 `d0`；否则必须是 `BitMapHistoryJournalReceiptFrontier` 对象或其规范字节，加载时按 `BitMapHistoryJournalReceiptAuditor` 构造器的语义**恒时复核三层 MAC**（前沿自身的 `NPBJ5` 与其 `end` 状态的 `NPBL1`/`NPBJ1`）。整条链先按 `BitMapHistoryJournalReceiptAuditor.audit` 的全部语义逐对完整重放（每张回执的 `NPBJ4` MAC、包摘要、起止逐字节相等、整包验证，以及回执起点与当前前沿的逐字节衔接、u64 序号与 `NPBJ6` 摘要推进），**全部通过才产出批**：`start` 为起点（`checkpoint=None` 时 `b""`，否则为其规范字节），`items` 为各对规范字节（按序），`end` 为最终前沿的规范字节，再以前四项算出 `NPBJ7` 批 MAC。制批不触碰任何审计器状态。`items` 非可迭代、`key` 非 bytes、`checkpoint` 种类错或某项种类/形状错抛 `TypeError`；序列为空、密钥为空、编码畸形或非规范、MAC 不符、重放失败、序号溢出或断链抛 `ValueError`。
+
+`audit_map_history_journal_receipt_batch(x, key)` 独立验批：`x` 收 `BitMapHistoryJournalReceiptBatch` 或其规范字节（其余类型抛 `TypeError`），`key` 为非空 `bytes`。先以 `key` 重算批的 `NPBJ7` MAC 并用 `hmac.compare_digest` 恒时比较；`start` 非空时再按 `BitMapHistoryJournalReceiptAuditor` 构造器的语义**恒时复核起点前沿三层 MAC**（前沿自身的 `NPBJ5` 与末态的 `NPBL1`/`NPBJ1`，各层都会重算且恒时比较后才统一判定）；随后把携带的各 `(receipt, bundle)` 对**逐对重放**——`start` 为空时从空前沿出发，否则从携带的起点前沿出发，完全按 `BitMapHistoryJournalReceiptAuditor.audit` 的语义审计每一对（含 `NPBJ4`、包摘要、回执/包起止相等、整包双层 MAC 与重放、前沿衔接、u64 序号与 `NPBJ6` 摘要推进）——重放的最终前沿必须与批的 `end` **逐字节相等**。任何一步失败抛 `ValueError`；验批是纯检查，不触碰任何审计器状态、不返回部分结果，成功时返回重放到达的冻结 `BitMapHistoryJournalReceiptFrontier`。旧接口行为不变。
+
+```python
+batch = seal_map_history_journal_receipt_batch(
+    [(receipt1, bundle1), (receipt2, bundle2)], key,
+)                                            # 从空前沿封批
+frontier = audit_map_history_journal_receipt_batch(batch, key)   # 独立验批，得到末态前沿
+
+later = seal_map_history_journal_receipt_batch(
+    [(receipt3, bundle3)], key, checkpoint=frontier,             # 从既有前沿续封
+)
 ```
 
 ### 批量判定 `assess`
