@@ -8735,6 +8735,24 @@ class RangeAuditor:
     :class:`ValueError` (and a wrong-typed argument :class:`TypeError`)
     and leaves the frontier untouched, and concurrent audits linearize in
     lock-acquisition order so a verified receipt is never lost.
+
+    :meth:`audit_batch` accepts a non-empty iterable of two-element
+    ``(receipt, range)`` tuples and commits the whole chain as one
+    transaction under the same lock: every pair is replayed in input
+    order on a temporary frontier, each re-verified exactly like
+    :func:`audit_receipt` and then advanced per ``NPBJ14`` — the sequence
+    increments by one u64 step and the digest chain extends as
+    ``SHA256(b"NPBJ14" + d + u64be(n) + R)`` — starting from the current
+    :attr:`state` (with no frontier the first receipt must start at the
+    empty string, and every later receipt's ``start`` must equal the
+    previous receipt's ``end`` byte for byte). The live frontier is
+    replaced once, and only when every pair passes; a non-iterable
+    argument, a non-pair item or a wrong-typed member raises
+    :class:`TypeError`, while an empty batch, a failed audit, a replay,
+    a broken link, a final-state mismatch or a u64 overflow raises
+    :class:`ValueError` and changes nothing. :meth:`audit` and
+    :meth:`audit_batch` share the auditor lock, so single pairs and
+    batches linearize together in lock-acquisition order.
     """
 
     def __init__(self, key: object, *, checkpoint: object = None) -> None:
@@ -8839,6 +8857,77 @@ class RangeAuditor:
                 candidate,
                 mac=_range_frontier_mac(self._key, candidate),
             )
+            return self
+
+    def audit_batch(self, items: object) -> "RangeAuditor":
+        """Audit a contiguous chain of attested
+        :class:`RangeReceipt`/:class:`CommitRange` pairs and commit the
+        whole chain as a single transaction.
+
+        ``items`` must be a non-empty iterable whose entries are each
+        exactly a two-element ``(receipt, range)`` tuple: the receipt a
+        :class:`RangeReceipt` or its canonical
+        :meth:`RangeReceipt.to_bytes` encoding and the range the attested
+        :class:`CommitRange` or its canonical
+        :meth:`CommitRange.to_bytes` encoding. A non-iterable ``items``,
+        an entry that is not a two-element tuple, or a wrong-typed
+        receipt or range raises :class:`TypeError`; an empty batch, a
+        malformed or non-canonical encoding, a wrong key, a MAC or digest
+        mismatch, a receipt ``start`` that does not equal the current
+        frontier ``end`` (the empty string when no receipt has happened
+        yet) or a later receipt whose ``start`` does not equal the
+        previous receipt's ``end`` byte for byte, a final state that does
+        not match the replayed range, or a sequence that would overflow
+        u64 raises :class:`ValueError`. Under the auditor lock every pair
+        is replayed in input order on a temporary frontier, each
+        re-verified exactly as :func:`audit_receipt` verifies it and then
+        advanced per ``NPBJ14`` — the sequence incrementing one u64 step
+        and the digest chain extending as
+        ``SHA256(b"NPBJ14" + d + u64be(n) + R)`` — starting from the
+        current :attr:`state`. The live frontier is replaced once, and
+        only when every pair passes, so a mid-batch failure, a replay, a
+        broken link, a final-state mismatch or an overflow changes no
+        state. :meth:`audit` and :meth:`audit_batch` share the auditor
+        lock and linearize together in lock-acquisition order. Returns
+        the auditor itself.
+        """
+        with self._lock:
+            try:
+                raw_items = list(items)  # type: ignore[arg-type]
+            except TypeError:
+                raise TypeError(
+                    "items must be an iterable of (receipt, range) pairs"
+                ) from None
+            if not raw_items:
+                raise ValueError("items must be a non-empty sequence")
+            coerced = []
+            for item in raw_items:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    raise TypeError(
+                        "items entries must be (receipt, range) pairs"
+                    )
+                raw_receipt, raw_range = item
+                coerced.append(
+                    (
+                        _coerce_range_receipt(
+                            raw_receipt, "items receipts"
+                        ),
+                        _coerce_commit_range(raw_range, "items ranges"),
+                    )
+                )
+            # Replay the whole chain on a temporary frontier seeded with
+            # the current one; each pair is re-verified through
+            # audit_receipt and linked/advanced exactly like audit. The
+            # live frontier is read but never mutated until it adopts the
+            # temporary frontier below, so any failure leaves the state
+            # untouched and the same batch replayed is afterwards rejected
+            # on its mismatching start.
+            candidate = RangeAuditor(
+                self._key, checkpoint=self._frontier
+            )
+            for receipt, record in coerced:
+                candidate.audit(receipt, record)
+            self._frontier = candidate.state
             return self
 
 
