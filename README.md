@@ -80,7 +80,12 @@ python3 -m nearproof
 - `seal_map_history_journal_bundle(evidences, key, *, state=None) -> BitMapHistoryJournalBundle` — 先按日志语义完整验链再封包；`state=None` 为空起点；错型抛 `TypeError`，余错抛 `ValueError`（见下）
 - `audit_map_history_journal_bundle(x, key) -> BitMapHistoryJournalState` — 恒时复核包的 `NPBJ3` MAC 与起止状态的双层 MAC，再逐段重放至 `end`（见下）
 - `BitMapHistoryJournalReceipt(version, start, bundle_digest, end, mac)` — 一次已提交整包审计的防篡改冻结回执（`version=1`；`start` 为规范 `BitMapHistoryJournalState` 字节或 `b""`（空起点）；`bundle_digest` 恰 32 字节，`D=SHA256(bundle.to_bytes())`；`end` 为规范非空 `BitMapHistoryJournalState` 字节；`mac` 恰 32 字节，`mac=HMAC-SHA256(key, b"NPBJ4"+C)`，`C` 为前 4 项 `[1,S,D,E]` 的字段序规范编码，域标签与 `C` 直拼无长度前缀；位置构造、冻结、按字段相等；字段错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
-  - `to_bytes()` / `from_bytes(data)` — 字段序五元素紧凑 UTF-8 JSON 数组 `[1, start, bundle_digest, end, mac]`，bytes 字段小写 hex（空起点为 `""`），无空白；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），其余不合契约（含非规范拼写）抛 `ValueError`，重编码须逐字节相等；不验 MAC
+  - `to_bytes()` / `from_bytes(data)` — 字段序五元素紧凑 UTF-8 JSON 数组 `[1, start, bundle_digest, end, mac]`，四个 bytes 字段小写 hex（空起点为 `""`），无空白；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），其余不合契约（含非规范拼写）抛 `ValueError`，重编码须逐字节相等；不验任何 MAC
+- `BitMapHistoryJournalReceiptFrontier(version, sequence, end, digest, mac)` — 已审计回执提交流的防回滚、摘要链式冻结前沿（`version=1`；`sequence` 为非布尔 u64；`end` 为规范**非空** `BitMapHistoryJournalState` 字节（即上一份回执的 `end`，也是下一份回执 `start` 须逐字节相等之处）；`digest`/`mac` 各恰 32 字节；摘要链根 `d0` 为 32 个零字节，每接受一份回执推进 `d' = SHA256(b"NPBJ6"+d+u64be(n)+R)`（`R` 为回执规范字节，8 字节大端序号，直拼无长度前缀）；`mac=HMAC-SHA256(key, b"NPBJ5"+C)`，`C` 为前 4 项 `[1,sequence,end,digest]` 的字段序规范编码，直拼无长度前缀；位置构造、冻结、按字段相等；字段错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
+  - `to_bytes()` / `from_bytes(data)` — 字段序五元素紧凑 UTF-8 JSON 数组 `[1, sequence, end, digest, mac]`，三个 bytes 字段小写 hex，无空白；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），其余不合契约（含 `end` 非规范状态字节、非规范拼写）抛 `ValueError`，重编码须逐字节相等；不验 MAC（无论 `end` 内状态的 `NPBJ1`/`NPBL1`、摘要链还是前沿 `NPBJ5` 都不验）
+- `BitMapHistoryJournalReceiptAuditor(key, *, checkpoint=None)` — 把独立复核通过的回执提交链接成带序号与摘要链的单调前沿的带状态审计器；`key` 为非空 `bytes`（错型抛 `TypeError`，空值抛 `ValueError`）；`checkpoint` 收 `BitMapHistoryJournalReceiptFrontier` 或其规范字节或 `None`，非空时恒时复核双层 MAC（其 `end` 携带状态的 `NPBJ1` 与内嵌 `BitMap` 的 `NPBL1`，以及前沿自身的 `NPBJ5`）
+  - `audit(receipt, bundle) -> 本类` 收回执/包对象或各自规范字节（余类型抛 `TypeError`）；锁内先按 `audit_map_history_journal_receipt` 的全部语义验回执与包（`NPBJ4`、包摘要、起止逐字节、`NPBJ3`、两端双层 MAC、整链重放），再要求回执 `start` 与当前前沿逐字节相等（首份须为 `""`，后续须等于前沿 `end`），然后令 `n = 旧sequence+1`、新 `end` 为验讫包到达的末态规范字节（即回执 `end`）、新摘要 `d' = SHA256(b"NPBJ6"+d+u64be(n)+R)`（`d0` 为 32 零字节，8 字节大端序号，直拼无长度前缀），并对前四项重新 MAC 为 `NPBJ5`；任何失败（含 u64 溢出）抛 `ValueError` 且不改状态，并发按取锁顺序线性化
+  - 只读 `checkpoint` 属性导出当前 `BitMapHistoryJournalReceiptFrontier` 或 `None`；审计器不做持久化，重启时调用方须把上次导出的前沿传回
 - `audit_map_history_journal_receipt(receipt, bundle, key) -> BitMapHistoryJournalState` — 收回执/包对象或各自规范字节及非空 bytes 密钥；恒时复核回执的 `NPBJ4` MAC 与包摘要 `D`，核对回执起止与包起止逐字节相等，再按 `audit_map_history_journal_bundle` 验包，成功返回末态（见下）
 - `BoundEvidence(version, evidence, context, digest, opening, mac)` — 一轮已接受**上下文绑定**验证的防篡改记录（`version=1`，四个 bytes 字段均恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
@@ -499,6 +504,34 @@ receipt = auditor.audit_bundle_receipt(bundle)   # 原子提交并制证
 
 # 第三方凭回执 + 原包 + 密钥独立复核：
 final = audit_map_history_journal_receipt(receipt, bundle, key)
+```
+
+### 回执提交前沿 `BitMapHistoryJournalReceiptFrontier` 与 `BitMapHistoryJournalReceiptAuditor`
+
+回执的独立复核函数是无状态的：它只证明"这张回执对这个包成立"，不记得此前已接受过哪些回执。需要把一次次回执提交串成一条**单调、可重启、带序号**的流（防重放、防回滚、可断点续传）时，使用 `BitMapHistoryJournalReceiptFrontier` 冻结前沿与 `BitMapHistoryJournalReceiptAuditor` 带状态审计器。
+
+`BitMapHistoryJournalReceiptFrontier(version, sequence, end, digest, mac)` 是冻结的共享密钥 MAC **回执前沿**：位置构造、按字段相等，字段契约、编码规则与其余记录一致——`version=1`；`sequence` 为非布尔 u64（已审计回执提交的计数）；`end` 为**规范非空** `BitMapHistoryJournalState` 字节，即最近一份验讫回执对应包到达的末态（也就是下一份回执 `start` 必须逐字节相等之处）；`digest`/`mac` 各恰 32 字节。两条链定义为：
+
+- 摘要链：根 `d0` 固定为 32 个零字节，每接受一份回执推进一次
+  `d' = SHA256(b"NPBJ6" + d + u64be(n) + R)`，其中 `u64be(n)` 是新序号 `n` 的**固定 8 字节大端**编码、`R` 是该回执的规范字节（`BitMapHistoryJournalReceipt.to_bytes()`）；前缀、旧摘要、序号、回执字节**直接拼接，无定界符、无长度前缀**。
+- 前沿 MAC：`mac = HMAC-SHA256(key, b"NPBJ5" + C)`，`C` 是**前 4 项**（`[1, sequence, end, digest]`，bytes 字段小写 hex，去掉 `mac`）的字段序紧凑 UTF-8 编码；前缀与 `C` 直接拼接、无定界符、无长度前缀。记录本身不含密钥。
+
+`to_bytes()` 输出字段序五元素紧凑 UTF-8 JSON **数组** `[1, sequence, end, digest, mac]`：`end`/`digest`/`mac` 为小写 hex，无空白、无长度前缀。`from_bytes(data)` **仅收 `bytes`**（其他类型或字段错型抛 `TypeError`）：外层必须恰为五元数组且字段序如上，`version == 1`，`sequence` 为非布尔 u64，`end` 须解码为规范非空 `BitMapHistoryJournalState` 字节（完整过 `BitMapHistoryJournalState.from_bytes` 契约），`digest`/`mac` 各解码为恰好 32 字节；解析后重编码须与输入逐字节相等，故格式化 JSON、空白与任何非规范拼写一律抛 `ValueError`。它**不验任何 MAC**——既不验 `end` 内状态的 `NPBJ1`/`NPBL1` 双层 MAC、不验摘要链，也不验前沿自身的 `NPBJ5` MAC。
+
+`BitMapHistoryJournalReceiptAuditor(key, *, checkpoint=None)` 是带状态审计器：
+
+- `key` 为非空 `bytes`（错型抛 `TypeError`，空值抛 `ValueError`），与回执、包、日志状态和前沿共用同一把密钥。
+- `checkpoint` 仅限关键字。`None`（默认）为空前沿：`sequence=0`、无 `end`，摘要链根为 `d0`；否则收 `BitMapHistoryJournalReceiptFrontier` 对象或其规范字节（其余类型抛 `TypeError`，字节内容不合字段契约折算为 `ValueError`）。加载检查点时**恒时验两层 MAC**：其 `end` 携带的日志状态按完整契约解析并以 `key` 重算双层 MAC（内嵌 `BitMap` 的 `NPBL1` 与状态自身的 `NPBJ1`），前沿自身的 `NPBJ5` MAC 也按前四项重算；各层均重算并以 `hmac.compare_digest` 恒时比较后才统一判定，任一不符抛 `ValueError`。审计器自身不做任何持久化：**重启时调用方必须把上次导出的最新前沿传回来**（取只读 `checkpoint` 属性、`to_bytes()` 落盘；首次成功审计前该属性为 `None`）。
+- `audit(receipt, bundle) -> 本类` 的两个参数各收回执对象/其规范 bytes 与包对象/其规范 bytes（其余类型抛 `TypeError`）。在同一把锁内先按 `audit_map_history_journal_receipt` 的**全部语义**复核：重算回执的 `NPBJ4` MAC 与包摘要 `D`、核对回执起止与包起止逐字节相等、重算包的 `NPBJ3` MAC、对包的两端状态各重算双层 MAC、逐段重放整链至 `end`；全部通过后再要求回执 `start` 与当前前沿**逐字节相等**——空前沿要求 `start == b""`（即首份提交必须从空日志出发），非空前沿要求等于前沿的 `end`。匹配后令 `n = 旧sequence+1`（`n` 溢出 u64 时抛 `ValueError`）、新 `end` 为验讫包到达的末态规范字节（也就是回执的 `end`）、新摘要按上式 `SHA256(b"NPBJ6"+d+u64be(n)+R)` 推进，并对前四项重新 MAC 出新的 `NPBJ5` 前沿回存。验证与前沿推进是同一个原子步骤：任何失败抛 `ValueError` 且**不改变前沿**，同一回执/包重复提交因 `start` 已不匹配而被拒，并发 `audit` 调用按取锁顺序线性化，已提交的回执永不丢失。
+
+```python
+frontier_auditor = BitMapHistoryJournalReceiptAuditor(key)
+frontier_auditor.audit(receipt1, bundle1)   # 首份：start 必须为 b""
+frontier_auditor.audit(receipt2, bundle2)   # 后续：start 必须等于上一份的 end
+
+saved = frontier_auditor.checkpoint.to_bytes()   # 落盘的只是冻结前沿
+# 重启：加载时恒时重验 end 的 NPBJ1/NPBL1 与前沿自身的 NPBJ5
+restarted = BitMapHistoryJournalReceiptAuditor(key, checkpoint=saved)
 ```
 
 ### 批量判定 `assess`
