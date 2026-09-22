@@ -10,7 +10,7 @@ BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
-ChallengeStateError / CommitRange / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
+ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
 Evidence /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
 JournalBatchReceiptFrontier /
@@ -72,6 +72,7 @@ __all__ = [
     "Challenge",
     "ChallengeStateError",
     "CommitRange",
+    "CommitRangeAuditor",
     "Consensus",
     "ContextRevocation",
     "CrlProof",
@@ -7975,6 +7976,139 @@ def audit_range(
             "commit range end does not match the replayed chain"
         )
     return final
+
+
+class CommitRangeAuditor:
+    """Stateful auditor chaining verified :class:`CommitRange` proofs into
+    one monotone, restartable :class:`JournalBatchReceiptFrontier`.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    shared key the commit frontiers, commits, batches, receipts, bundles and
+    states are MAC'd with. ``checkpoint`` is keyword-only: ``None`` (the
+    default) starts from sequence zero with no commit at all and the digest
+    chain rooted at ``d0`` (32 zero bytes); otherwise it must be a
+    :class:`JournalBatchReceiptFrontier` or its canonical
+    :meth:`JournalBatchReceiptFrontier.to_bytes` encoding (any other type
+    raises :class:`TypeError`). A supplied frontier is checked at load at
+    four MAC layers, all always recomputed and each compared in constant
+    time before any result is consulted: the commit frontier's own ``NPBJ9``
+    MAC over the canonical encoding of its first four fields, and the three
+    layers of its ``end`` receipt frontier — the embedded checkpoint table's
+    ``NPBL1`` MAC, the journal state's own ``NPBJ1`` MAC and the receipt
+    frontier's own ``NPBJ5`` MAC. A malformed encoding or any MAC mismatch
+    raises :class:`ValueError`. Across a restart the caller must pass the
+    value previously exported at :attr:`checkpoint`; nothing is persisted by
+    the auditor itself.
+
+    Each :meth:`audit` accepts one :class:`CommitRange` (the object or its
+    canonical :meth:`CommitRange.to_bytes` encoding) and, under the auditor
+    lock, reuses :func:`audit_range` to verify the whole range exactly: the
+    ``NPBJ11`` range MAC and the replay of every carried ``[R, B]`` pair
+    from the body's ``[S, I, E]`` — each pair re-verified per ``NPBJ10`` and
+    the replayed final frontier required to equal the body's ``E`` byte for
+    byte (a carried non-empty ``S`` has its four MAC layers recomputed on
+    load as well). On top of that pure check the range must continue exactly
+    where this auditor currently stands: with no frontier the body's ``S``
+    must be the empty string, and otherwise ``S`` must equal the current
+    :meth:`JournalBatchReceiptFrontier.to_bytes` output byte for byte, and
+    the sequence at ``E`` must be strictly above the current sequence. Only
+    then is the frozen frontier replaced atomically with the one returned by
+    :func:`audit_range`. An old range, a same-endpoint replay, a same
+    -sequence/different-digest proof, a fork, an end that does not match the
+    replayed chain or a sequence that would overflow u64 is therefore
+    rejected. Verification and the frontier advance are one atomic step: a
+    wrong-typed argument raises :class:`TypeError`, every other failure — an
+    empty key, a non-canonical encoding, a MAC, digest or chain-link
+    mismatch, or a gate failure — raises :class:`ValueError`, the frontier
+    is left untouched and no partial result is returned, and concurrent
+    audits linearize in lock-acquisition order.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._frontier: "Optional[JournalBatchReceiptFrontier]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, JournalBatchReceiptFrontier):
+            frontier = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                frontier = JournalBatchReceiptFrontier.from_bytes(checkpoint)
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value error.
+                raise ValueError(
+                    "checkpoint does not satisfy the journal batch receipt"
+                    " frontier field contract"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be a JournalBatchReceiptFrontier instance,"
+                " its canonical bytes, or None"
+            )
+        _verify_journal_batch_receipt_frontier_macs(self._key, frontier)
+        self._frontier = frontier
+
+    @property
+    def checkpoint(self) -> "Optional[JournalBatchReceiptFrontier]":
+        """The current :class:`JournalBatchReceiptFrontier`, or ``None``
+        before the first successfully audited range. The returned object is
+        frozen and the property read-only; persist its
+        :meth:`JournalBatchReceiptFrontier.to_bytes` output and pass it back
+        to a new auditor to survive a restart."""
+        return self._frontier
+
+    def audit(self, x: object) -> "CommitRangeAuditor":
+        """Audit one :class:`CommitRange` and advance the frontier.
+
+        ``x`` must be a :class:`CommitRange` or its canonical
+        :meth:`CommitRange.to_bytes` encoding — any other type raises
+        :class:`TypeError`; a malformed or non-canonical encoding, a range
+        MAC mismatch, a failed per-commit replay, a carried-checkpoint MAC
+        mismatch, a replayed end that does not equal the body's ``E``, a
+        u64 sequence overflow, a body ``S`` that does not equal the current
+        checkpoint bytes (the empty string when no commit has happened yet),
+        or an ``E`` whose sequence is not strictly above the current one
+        raises :class:`ValueError`. The full range is re-verified under the
+        auditor lock via :func:`audit_range`, the start matched against the
+        current checkpoint and the frozen frontier replaced only after every
+        check — including the strict sequence advance — has passed, so a
+        failed audit changes nothing and concurrent audits are serialized in
+        lock-acquisition order. Returns the auditor itself.
+        """
+        with self._lock:
+            record = _coerce_commit_range(x, "x")
+            # audit_range is a pure check: the NPBJ11 range MAC, the carried
+            # checkpoint's MAC layers, every NPBJ10 commit step and the
+            # final equality with E, returning the frozen frontier at E.
+            final = audit_range(record, self._key)
+            start, _, _ = _parse_commit_range_body(record.body)
+            current = (
+                b""
+                if self._frontier is None
+                else self._frontier.to_bytes()
+            )
+            if start != current:
+                raise ValueError(
+                    "commit range start does not match the auditor"
+                    " checkpoint"
+                )
+            current_sequence = (
+                0 if self._frontier is None else self._frontier.sequence
+            )
+            if final.sequence <= current_sequence:
+                raise ValueError(
+                    "commit range end sequence must be strictly above the"
+                    " current checkpoint sequence"
+                )
+            self._frontier = final
+            return self
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
