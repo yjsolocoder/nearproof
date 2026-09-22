@@ -6006,6 +6006,15 @@ class BitMapHistoryJournalReceiptAuditor:
     advance are one atomic step: a failed audit raises :class:`ValueError`
     and leaves the frontier untouched, and concurrent audits linearize in
     lock-acquisition order so a committed receipt is never lost.
+
+    :meth:`audit_batch` commits a whole sealed
+    :class:`BitMapHistoryJournalReceiptBatch` as one transaction against
+    the same frontier and under the same lock: the batch MAC, the batch
+    endpoint frontier MACs and the carried chain are all verified on a
+    temporary frontier first, and only when the replayed temporary
+    frontier equals the batch ``end`` byte for byte does the checkpoint
+    advance — a failed batch changes nothing, and a replayed batch is
+    rejected because its ``start`` no longer matches.
     """
 
     def __init__(self, key: object, *, checkpoint: object = None) -> None:
@@ -6138,6 +6147,90 @@ class BitMapHistoryJournalReceiptAuditor:
                     self._key, candidate
                 ),
             )
+            return self
+
+    def audit_batch(
+        self, x: object
+    ) -> "BitMapHistoryJournalReceiptAuditor":
+        """Commit one sealed batch of contiguous receipts as a transaction.
+
+        ``x`` must be a :class:`BitMapHistoryJournalReceiptBatch` or its
+        canonical :meth:`BitMapHistoryJournalReceiptBatch.to_bytes`
+        encoding — any other type raises :class:`TypeError`; a malformed
+        or non-canonical encoding, a MAC mismatch, a ``start`` that does
+        not match the current checkpoint, a failed receipt audit, a
+        sequence that would overflow u64, or an ``end`` that does not
+        equal the replayed chain raises :class:`ValueError`. Under the
+        auditor lock — shared with :meth:`audit`, so single receipts and
+        batches linearize in lock-acquisition order — the batch MAC is
+        first recomputed as ``HMAC-SHA256(key, b"NPBJ7" + C)`` and
+        compared in constant time; then each non-empty endpoint frontier
+        is checked at three MAC layers, all always recomputed and each
+        compared in constant time before any result is consulted: the
+        frontier's own ``NPBJ5`` MAC and the two layers of its ``end``
+        state, the embedded checkpoint table's ``NPBL1`` MAC and the
+        state's own ``NPBJ1`` MAC. No replay happens before every layer
+        passes. The batch ``start`` must then equal the current
+        checkpoint byte for byte — ``b""`` when no receipt has committed
+        yet, else the canonical
+        :meth:`BitMapHistoryJournalReceiptFrontier.to_bytes` encoding of
+        the current frontier. Only then is the carried chain replayed on
+        a temporary frontier, each ``(receipt, bundle)`` pair audited in
+        order exactly as :meth:`audit` audits it — the ``NPBJ4`` receipt
+        MAC, the bundle verification, the start linkage and the
+        ``SHA256(b"NPBJ6" + d + u64be(n) + R)`` digest-chain step with
+        ``n`` the old sequence plus one. The checkpoint is replaced in
+        one atomic step only when every item passes and the temporary
+        frontier's canonical encoding equals the batch ``end`` byte for
+        byte; any failure leaves the auditor untouched, so a replayed
+        batch is rejected because its ``start`` no longer matches.
+        Returns the auditor itself.
+        """
+        with self._lock:
+            batch = _coerce_bit_map_history_journal_receipt_batch(x, "x")
+            if not hmac.compare_digest(
+                _bit_map_history_journal_receipt_batch_mac(
+                    self._key, batch
+                ),
+                batch.mac,
+            ):
+                raise ValueError(
+                    "bit map history journal receipt batch mac does not"
+                    " match"
+                )
+            if batch.start:
+                _verify_bit_map_history_journal_receipt_frontier_macs(
+                    self._key,
+                    BitMapHistoryJournalReceiptFrontier.from_bytes(
+                        batch.start
+                    ),
+                    "start",
+                )
+            _verify_bit_map_history_journal_receipt_frontier_macs(
+                self._key,
+                BitMapHistoryJournalReceiptFrontier.from_bytes(batch.end),
+                "end",
+            )
+            current = (
+                b"" if self._frontier is None else self._frontier.to_bytes()
+            )
+            if batch.start != current:
+                raise ValueError(
+                    "bit map history journal receipt batch start does not"
+                    " match the current checkpoint"
+                )
+            replay = BitMapHistoryJournalReceiptAuditor(
+                self._key, checkpoint=batch.start if batch.start else None
+            )
+            for receipt, bundle in batch.items:
+                replay.audit(receipt, bundle)
+            final = replay.checkpoint
+            if final is None or final.to_bytes() != batch.end:
+                raise ValueError(
+                    "bit map history journal receipt batch end does not"
+                    " match the replayed chain"
+                )
+            self._frontier = final
             return self
 
 
