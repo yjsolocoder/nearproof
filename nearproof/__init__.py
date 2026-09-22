@@ -10,7 +10,8 @@ BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
-ChallengeStateError / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
+ChallengeStateError / CommitRange / Consensus / ContextRevocation /
+CrlProof / CrlProofAuditor / CrlState /
 Evidence /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
 JournalBatchReceiptFrontier /
@@ -23,11 +24,11 @@ audit_cert_evidence / audit_crl / audit_map_history /
 audit_map_history_evidence / audit_map_history_journal_bundle /
 audit_map_history_journal_receipt /
 audit_map_update /
-audit_proof / cert / locate /
+audit_proof / audit_range / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
 revoke_context / revoke_observation / revoke_trust / seal_map_history /
-seal_map_history_journal_bundle.
+seal_map_history_journal_bundle / seal_range.
 """
 
 from __future__ import annotations
@@ -71,6 +72,7 @@ __all__ = [
     "CertifiedConsensusEvidence",
     "Challenge",
     "ChallengeStateError",
+    "CommitRange",
     "Consensus",
     "ContextRevocation",
     "CrlProof",
@@ -107,6 +109,7 @@ __all__ = [
     "audit_map_history_journal_receipt_batch",
     "audit_map_update",
     "audit_proof",
+    "audit_range",
     "cert",
     "locate",
     "locate_attested",
@@ -122,6 +125,7 @@ __all__ = [
     "seal_map_history",
     "seal_map_history_journal_bundle",
     "seal_map_history_journal_receipt_batch",
+    "seal_range",
 ]
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
@@ -186,6 +190,8 @@ _BIT_MAP_HISTORY_JOURNAL_BATCH_RECEIPT_PREFIX = b"NPBJ8"
 # frontier MAC and the commit digest-chain step respectively.
 _BIT_MAP_HISTORY_JOURNAL_BATCH_RECEIPT_FRONTIER_MAC_PREFIX = b"NPBJ9"
 _BIT_MAP_HISTORY_JOURNAL_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPBJ10"
+# Domain separation prefix for the commit-range proof MAC.
+_COMMIT_RANGE_PREFIX = b"NPBJ11"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -7554,6 +7560,376 @@ class JournalBatchReceiptAuditor:
                 ),
             )
             return self
+
+
+def _parse_commit_range_hex(value: object, name: str) -> bytes:
+    """Lowercase round-tripping hex inside a commit-range body; every
+    violation — including the wrong value type — raises
+    :class:`ValueError`."""
+    try:
+        return _parse_bit_map_hex(value, name)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"commit range body {name} must be a lowercase hex string"
+        ) from error
+
+
+def _require_commit_range_frontier_encoding(
+    value: bytes, name: str, allow_empty: bool
+) -> None:
+    """Enforce the canonical-:class:`JournalBatchReceiptFrontier`-bytes
+    contract of a commit-range body endpoint.
+
+    ``value`` is already known to be ``bytes``; when ``allow_empty`` holds,
+    ``b""`` (no commit had happened yet) is also accepted. Every violation
+    raises :class:`ValueError`, including the field-shape
+    :class:`TypeError` a malformed inner document would otherwise
+    surface."""
+    if allow_empty and value == b"":
+        return
+    try:
+        JournalBatchReceiptFrontier.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"commit range body {name} must be the canonical"
+            " JournalBatchReceiptFrontier encoding"
+        ) from error
+
+
+def _require_commit_range_body(body: bytes) -> None:
+    """Enforce the canonical-body contract of a :class:`CommitRange`.
+
+    ``body`` is already known to be ``bytes`` and must be the canonical
+    compact UTF-8 JSON encoding of ``[start, items, end]``: ``start`` the
+    empty string (no commit had happened yet) or the lowercase hex of the
+    canonical starting :class:`JournalBatchReceiptFrontier` encoding,
+    ``items`` a non-empty array of ``[receipt, batch]`` pairs whose
+    members are lowercase hex strings decoding to the canonical
+    :class:`JournalBatchReceipt` and
+    :class:`BitMapHistoryJournalReceiptBatch` encodings, and ``end`` the
+    lowercase hex of the canonical final
+    :class:`JournalBatchReceiptFrontier` encoding. Every violation raises
+    :class:`ValueError`, including the field-shape :class:`TypeError` a
+    malformed inner document would otherwise surface. The chain itself —
+    contiguity, per-commit validity and that ``end`` is the final commit
+    frontier — is not checked here; :func:`audit_range` recomputes it.
+    """
+    try:
+        outer = json.loads(body)
+    except ValueError as error:
+        raise ValueError(
+            f"commit range body is not valid JSON: {error}"
+        ) from error
+    if not isinstance(outer, list) or len(outer) != 3:
+        raise ValueError(
+            "commit range body must be an array of exactly start, items"
+            " and end"
+        )
+    raw_start, raw_items, raw_end = outer
+    start = _parse_commit_range_hex(raw_start, "start")
+    _require_commit_range_frontier_encoding(start, "start", allow_empty=True)
+    if not isinstance(raw_items, list):
+        raise ValueError("commit range body items must be an array")
+    if not raw_items:
+        raise ValueError("commit range body items must be non-empty")
+    for raw_item in raw_items:
+        if not isinstance(raw_item, list) or len(raw_item) != 2:
+            raise ValueError(
+                "commit range body item must be a [receipt, batch] pair"
+            )
+        raw_receipt, raw_batch = raw_item
+        receipt = _parse_commit_range_hex(raw_receipt, "receipt")
+        try:
+            JournalBatchReceipt.from_bytes(receipt)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "commit range body receipt must be the canonical"
+                " JournalBatchReceipt encoding"
+            ) from error
+        batch = _parse_commit_range_hex(raw_batch, "batch")
+        try:
+            BitMapHistoryJournalReceiptBatch.from_bytes(batch)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "commit range body batch must be the canonical"
+                " BitMapHistoryJournalReceiptBatch encoding"
+            ) from error
+    end = _parse_commit_range_hex(raw_end, "end")
+    _require_commit_range_frontier_encoding(end, "end", allow_empty=False)
+    if _encode_payload(outer) != body:
+        raise ValueError("commit range body encoding is not canonical")
+
+
+def _commit_range_body_parts(
+    body: bytes,
+) -> "tuple[bytes, list[tuple[bytes, bytes]], bytes]":
+    """Split an already-validated commit-range body into start, the
+    ``(receipt, batch)`` encoding pairs and end."""
+    raw_start, raw_items, raw_end = json.loads(body)
+    return (
+        bytes.fromhex(raw_start),
+        [
+            (bytes.fromhex(raw_receipt), bytes.fromhex(raw_batch))
+            for raw_receipt, raw_batch in raw_items
+        ],
+        bytes.fromhex(raw_end),
+    )
+
+
+def _commit_range_mac(key: bytes, body: bytes) -> bytes:
+    """HMAC-SHA256 over ``b"NPBJ11"`` plus the body, concatenated directly
+    with no separator or length prefix."""
+    return hmac.new(key, _COMMIT_RANGE_PREFIX + body, hashlib.sha256).digest()
+
+
+@dataclass(frozen=True)
+class CommitRange:
+    """A key-MAC'd, transferable attestation of one contiguous
+    :class:`JournalBatchReceipt` commit range.
+
+    ``version`` is always ``1``. ``body`` is the canonical compact UTF-8
+    JSON encoding of ``[start, items, end]``: ``start`` the empty string —
+    no commit had happened yet — or the lowercase hex of the canonical
+    :class:`JournalBatchReceiptFrontier` encoding the range starts from,
+    ``items`` a non-empty array of ``[receipt, batch]`` pairs whose
+    members are the lowercase hex of the canonical
+    :class:`JournalBatchReceipt` and
+    :class:`BitMapHistoryJournalReceiptBatch` encodings, and ``end`` the
+    lowercase hex of the canonical :class:`JournalBatchReceiptFrontier`
+    encoding of the final commit frontier. ``mac`` is exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPBJ11" + body)``, the prefix and the body
+    concatenated directly with no separator or length prefix. Instances
+    are frozen, constructed positionally in field order and compare equal
+    by their fields. A field of the wrong type raises :class:`TypeError`;
+    every other contract violation raises :class:`ValueError`. No key
+    material is stored.
+    """
+
+    version: int
+    body: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("commit range version must be an integer")
+        if self.version != 1:
+            raise ValueError("commit range version must be 1")
+        if not isinstance(self.body, bytes):
+            raise TypeError("commit range body must be bytes")
+        _require_commit_range_body(self.body)
+        if not isinstance(self.mac, bytes):
+            raise TypeError("commit range mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("commit range mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the array ``[1, B, M]`` where
+        ``B``/``M`` are the lowercase hex of the body and the MAC, no
+        whitespace, no length prefix."""
+        return _encode_payload([1, self.body.hex(), self.mac.hex()])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "CommitRange":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, body, mac]``, ``version == 1``, ``body`` a
+        lowercase hex string decoding to the canonical commit-range body
+        and ``mac`` a lowercase hex string decoding to exactly 32 bytes.
+        After parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical spelling
+        are rejected too. The MAC is not verified here — pass the record
+        to :func:`audit_range` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("commit range data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"commit range is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 3:
+            raise ValueError(
+                "commit range must be a JSON array of exactly version,"
+                " body and mac"
+            )
+        raw_version, raw_body, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError("commit range version must be an integer")
+        if raw_version != 1:
+            raise ValueError("commit range version must be 1")
+        body = _parse_bit_map_hex(raw_body, "commit range body")
+        mac = _parse_bit_map_hex(raw_mac, "commit range mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "commit range mac must decode to exactly 32 bytes"
+            )
+        record = cls(version=1, body=body, mac=mac)
+        if record.to_bytes() != data:
+            raise ValueError("commit range encoding is not canonical")
+        return record
+
+
+def _coerce_commit_range(x: object, name: str) -> "CommitRange":
+    """Coerce a :class:`CommitRange` or its canonical bytes, splitting the
+    TypeError/ValueError contract exactly as the public auditors do: the
+    wrong kind of argument raises :class:`TypeError`, a field-shape
+    failure surfacing while parsing byte content of the right kind is a
+    value error."""
+    if isinstance(x, CommitRange):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return CommitRange.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the commit range field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a CommitRange instance or its canonical bytes"
+    )
+
+
+def seal_range(
+    items: object, key: object, *, checkpoint: object = None
+) -> "CommitRange":
+    """Audit a contiguous :class:`JournalBatchReceipt` commit chain and
+    seal it as a transferable :class:`CommitRange` proof.
+
+    ``items`` must be a non-empty iterable of ``(receipt, batch)`` pairs
+    whose receipt is each a :class:`JournalBatchReceipt` or its canonical
+    :meth:`JournalBatchReceipt.to_bytes` encoding and whose batch the
+    attested :class:`BitMapHistoryJournalReceiptBatch` or its canonical
+    :meth:`BitMapHistoryJournalReceiptBatch.to_bytes` encoding, and
+    ``key`` the non-empty shared ``bytes`` key. ``checkpoint`` is
+    keyword-only: ``None`` (the default) starts the chain with no commit
+    at all — sequence zero, the digest chain rooted at ``d0`` — otherwise
+    it must be a :class:`JournalBatchReceiptFrontier` or its canonical
+    :meth:`JournalBatchReceiptFrontier.to_bytes` encoding. A non-iterable
+    ``items``, a non-``bytes`` ``key``, a wrong-typed pair member or a
+    wrong-kind ``checkpoint`` raises :class:`TypeError`; an empty
+    sequence, an empty key, a malformed or non-canonical encoding, a MAC
+    mismatch, a failed commit audit, a sequence overflow or a broken chain
+    raises :class:`ValueError`. The whole chain is verified first —
+    exactly as :class:`JournalBatchReceiptAuditor` audits it, starting
+    from the supplied checkpoint — and only on success is the proof
+    produced: the body carries the starting point (``""`` when
+    ``checkpoint`` is ``None``, else the hex of its canonical
+    :class:`JournalBatchReceiptFrontier` encoding), the canonical encoding
+    pair of every receipt and its batch in order and the hex of the final
+    commit frontier, MAC'd as ``HMAC-SHA256(key, b"NPBJ11" + body)``.
+    Sealing touches no auditor state.
+    """
+    try:
+        pairs = list(items)  # type: ignore[arg-type]
+    except TypeError:
+        raise TypeError(
+            "items must be an iterable of (receipt, batch) pairs"
+        ) from None
+    auditor = JournalBatchReceiptAuditor(key, checkpoint=checkpoint)
+    coerced = []
+    for pair in pairs:
+        try:
+            raw_receipt, raw_batch = pair
+        except TypeError:
+            raise TypeError(
+                "items items must be (receipt, batch) pairs"
+            ) from None
+        except ValueError:
+            raise ValueError(
+                "items items must be (receipt, batch) pairs"
+            ) from None
+        coerced.append(
+            (
+                _coerce_bit_map_history_journal_batch_receipt(
+                    raw_receipt, "items receipts"
+                ),
+                _coerce_bit_map_history_journal_receipt_batch(
+                    raw_batch, "items batches"
+                ),
+            )
+        )
+    if not coerced:
+        raise ValueError("items must be a non-empty sequence")
+    for receipt, batch in coerced:
+        auditor.audit(receipt, batch)
+    if checkpoint is None:
+        start = b""
+    elif isinstance(checkpoint, JournalBatchReceiptFrontier):
+        start = checkpoint.to_bytes()
+    else:
+        # Canonical JournalBatchReceiptFrontier bytes, already validated
+        # by the auditor constructor.
+        start = checkpoint  # type: ignore[assignment]
+    final = auditor.state
+    body = _encode_payload(
+        [
+            start.hex(),
+            [
+                [receipt.to_bytes().hex(), batch.to_bytes().hex()]
+                for receipt, batch in coerced
+            ],
+            final.to_bytes().hex(),  # type: ignore[union-attr]
+        ]
+    )
+    return CommitRange(
+        version=1,
+        body=body,
+        mac=_commit_range_mac(key, body),
+    )
+
+
+def audit_range(x: object, key: object) -> "JournalBatchReceiptFrontier":
+    """Re-verify a :class:`CommitRange` against ``key``, independently
+    replaying the carried commit chain.
+
+    ``x`` must be a :class:`CommitRange` or its canonical
+    :meth:`CommitRange.to_bytes` encoding and ``key`` the non-empty shared
+    ``bytes`` key — a wrong-typed argument raises :class:`TypeError`,
+    every other contract violation raises :class:`ValueError`. The proof
+    MAC is recomputed as ``HMAC-SHA256(key, b"NPBJ11" + body)`` and
+    compared in constant time, then every carried ``(receipt, batch)``
+    pair is re-audited in order with :func:`audit_commit` and the commit
+    frontier advanced exactly as :class:`JournalBatchReceiptAuditor`
+    advances it — the ``NPBJ8`` receipt MAC, the batch digest, the
+    endpoint equality and the whole batch verification for every pair,
+    the digest chain stepped as ``SHA256(b"NPBJ10" + d + u64be(n) + R)``
+    and the frontier re-MAC'd as ``HMAC-SHA256(key, b"NPBJ9" + C)`` —
+    starting from no commit at all when the body's ``start`` is empty and
+    from the carried starting frontier otherwise. The chain must be
+    contiguous from that starting point and the replayed final frontier
+    must equal the body's ``end`` byte for byte. Auditing is a pure
+    check: it touches no auditor state and returns no partial result — on
+    success the frozen final :class:`JournalBatchReceiptFrontier` is
+    returned.
+    """
+    commit_range = _coerce_commit_range(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _commit_range_mac(key, commit_range.body), commit_range.mac
+    ):
+        raise ValueError("commit range mac does not match")
+    start, pairs, end = _commit_range_body_parts(commit_range.body)
+    auditor = JournalBatchReceiptAuditor(
+        key, checkpoint=start if start else None
+    )
+    for receipt, batch in pairs:
+        auditor.audit(receipt, batch)
+    final = auditor.state
+    if final.to_bytes() != end:  # type: ignore[union-attr]
+        raise ValueError(
+            "commit range end does not match the audited chain"
+        )
+    return final  # type: ignore[return-value]
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
