@@ -76,6 +76,8 @@ __all__ = [
     "CrlState",
     "Evidence",
     "JournalBatchReceipt",
+    "JournalBatchReceiptAuditor",
+    "JournalBatchReceiptFrontier",
     "Measurement",
     "Observation",
     "ObservationRevocation",
@@ -178,6 +180,10 @@ _BIT_MAP_HISTORY_JOURNAL_FRONTIER_DIGEST_PREFIX = b"NPBJ6"
 _BIT_MAP_HISTORY_JOURNAL_RECEIPT_BATCH_PREFIX = b"NPBJ7"
 # Domain separation prefix for the batch-commit receipt MAC.
 _BIT_MAP_HISTORY_JOURNAL_BATCH_RECEIPT_PREFIX = b"NPBJ8"
+# Domain separation prefixes for the batch-commit-receipt frontier: the
+# frontier MAC and the digest-chain step respectively.
+_JOURNAL_BATCH_RECEIPT_FRONTIER_MAC_PREFIX = b"NPBJ9"
+_JOURNAL_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPBJ10"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -7114,6 +7120,434 @@ def audit_commit(r: object, b: object, key: object) -> "BitMapHistoryJournalRece
     # returning the frozen frontier at the batch end (it itself raises
     # ValueError if the replayed frontier does not equal that end).
     return audit_map_history_journal_receipt_batch(batch, key)
+
+
+def _journal_batch_receipt_frontier_content(
+    frontier: "JournalBatchReceiptFrontier",
+) -> list:
+    """The JSON-ready first four batch-commit-receipt frontier fields
+    (everything but ``mac``)."""
+    return [
+        frontier.version,
+        frontier.sequence,
+        frontier.end.hex(),
+        frontier.digest.hex(),
+    ]
+
+
+def _journal_batch_receipt_frontier_content_bytes(
+    frontier: "JournalBatchReceiptFrontier",
+) -> bytes:
+    """The canonical compact encoding ``C`` of the first four frontier
+    fields."""
+    return _encode_payload(
+        _journal_batch_receipt_frontier_content(frontier)
+    )
+
+
+def _journal_batch_receipt_frontier_mac(
+    key: bytes, frontier: "JournalBatchReceiptFrontier"
+) -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ9" + C)`` where ``C`` is the canonical
+    encoding of the first four fields. The prefix and ``C`` are concatenated
+    directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _JOURNAL_BATCH_RECEIPT_FRONTIER_MAC_PREFIX
+        + _journal_batch_receipt_frontier_content_bytes(frontier),
+        hashlib.sha256,
+    ).digest()
+
+
+def _journal_batch_receipt_frontier_next_digest(
+    previous: bytes, sequence: int, receipt: bytes
+) -> bytes:
+    """One digest-chain step: ``SHA256(b"NPBJ10" + d + u64be(n) + R)``.
+
+    The prefix, the previous 32-byte digest, the fixed 8-byte big-endian
+    sequence and the canonical receipt bytes are concatenated directly with
+    no separator or length prefix."""
+    return hashlib.sha256(
+        _JOURNAL_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX
+        + previous
+        + _bit_map_history_journal_u64be(sequence)
+        + receipt
+    ).digest()
+
+
+def _require_journal_batch_receipt_frontier_end(
+    value: bytes,
+) -> None:
+    """Enforce that a frontier ``end`` is the canonical non-empty
+    :class:`BitMapHistoryJournalReceiptFrontier` encoding. ``value`` is
+    already known to be ``bytes``;
+    :meth:`BitMapHistoryJournalReceiptFrontier.from_bytes` enforces the full
+    contract including its canonical re-encoding check, and every violation
+    — including the field-shape :class:`TypeError` a malformed inner
+    document would otherwise surface — raises :class:`ValueError`."""
+    try:
+        BitMapHistoryJournalReceiptFrontier.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "journal batch receipt frontier end must be the canonical"
+            " BitMapHistoryJournalReceiptFrontier encoding"
+        ) from error
+
+
+@dataclass(frozen=True)
+class JournalBatchReceiptFrontier:
+    """A key-MAC'd, digest-chained frontier over the audited
+    batch-commit-receipt stream.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer (the number of audited :class:`JournalBatchReceipt` commits);
+    ``end`` the canonical non-empty
+    :meth:`BitMapHistoryJournalReceiptFrontier.to_bytes` encoding of the
+    receipt frontier the audited batch-commit chain currently ends at;
+    ``digest`` exactly 32 bytes — the head of a hash chain with ``d0``
+    fixed at 32 zero bytes and each accepted receipt extending it as
+    ``d' = SHA256(b"NPBJ10" + d + u64be(n) + R)`` where ``n`` is the new
+    sequence, ``u64be(n)`` its fixed 8-byte big-endian encoding and ``R``
+    the canonical :meth:`JournalBatchReceipt.to_bytes` bytes, every part
+    concatenated directly with no separator or length prefix; ``mac``
+    exactly 32 bytes — ``HMAC-SHA256(key, b"NPBJ9" + C)`` where ``C`` is
+    the canonical compact encoding of the first four fields (the version,
+    sequence, lowercase-hex end and lowercase-hex digest, without ``mac``),
+    the prefix and ``C`` concatenated directly with no separator or length
+    prefix. Instances are frozen, constructed positionally in field order
+    and compare equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    sequence: int
+    end: bytes
+    digest: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "journal batch receipt frontier version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError(
+                "journal batch receipt frontier version must be 1"
+            )
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "journal batch receipt frontier sequence must be a non-bool"
+                " integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "journal batch receipt frontier sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        if not isinstance(self.end, bytes):
+            raise TypeError(
+                "journal batch receipt frontier end must be bytes"
+            )
+        _require_journal_batch_receipt_frontier_end(self.end)
+        for name in ("digest", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(
+                    f"journal batch receipt frontier {name} must be bytes"
+                )
+            if len(value) != 32:
+                raise ValueError(
+                    f"journal batch receipt frontier {name} must be exactly"
+                    " 32 bytes"
+                )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, sequence, end, digest, mac]`` where ``end``, ``digest`` and
+        ``mac`` are lowercase hex, no whitespace, no length prefix."""
+        return _encode_payload(
+            _journal_batch_receipt_frontier_content(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "JournalBatchReceiptFrontier":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, sequence, end, digest, mac]`` in that order,
+        ``version == 1``, ``sequence`` a non-bool u64, ``end`` a lowercase
+        hex string decoding to the canonical non-empty
+        :class:`BitMapHistoryJournalReceiptFrontier` encoding, and
+        ``digest``/``mac`` lowercase hex strings decoding to exactly 32
+        bytes each. After parsing and field validation the record is
+        re-encoded with :meth:`to_bytes` and the result must equal the
+        input byte for byte, so formatted JSON, whitespace and any
+        non-canonical spelling are rejected too. No MAC is verified here —
+        neither the frontier MAC nor the MACs of the ``end`` frontier;
+        pass the record to :class:`JournalBatchReceiptAuditor` for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "journal batch receipt frontier data must be bytes"
+            )
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                "journal batch receipt frontier is not valid JSON:"
+                f" {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "journal batch receipt frontier must be a JSON array of"
+                " exactly version, sequence, end, digest and mac"
+            )
+        raw_version, raw_sequence, raw_end, raw_digest, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "journal batch receipt frontier version must be an integer"
+            )
+        if raw_version != 1:
+            raise ValueError(
+                "journal batch receipt frontier version must be 1"
+            )
+        if type(raw_sequence) is not int:
+            raise TypeError(
+                "journal batch receipt frontier sequence must be a non-bool"
+                " integer"
+            )
+        if not 0 <= raw_sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "journal batch receipt frontier sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        end = _parse_bit_map_hex(raw_end, "journal batch receipt frontier end")
+        _require_journal_batch_receipt_frontier_end(end)
+        digest = _parse_bit_map_hex(
+            raw_digest, "journal batch receipt frontier digest"
+        )
+        if len(digest) != 32:
+            raise ValueError(
+                "journal batch receipt frontier digest must decode to"
+                " exactly 32 bytes"
+            )
+        mac = _parse_bit_map_hex(raw_mac, "journal batch receipt frontier mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "journal batch receipt frontier mac must decode to exactly"
+                " 32 bytes"
+            )
+        record = cls(
+            version=1,
+            sequence=raw_sequence,
+            end=end,
+            digest=digest,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "journal batch receipt frontier encoding is not canonical"
+            )
+        return record
+
+
+class JournalBatchReceiptAuditor:
+    """Stateful auditor chaining committed :class:`JournalBatchReceipt`
+    batch-commit receipts into one monotone, restartable, sequence-numbered
+    frontier.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    shared key the tables, journal states, bundles, receipts, batches and
+    commit receipts are MAC'd with. ``checkpoint`` is keyword-only:
+    ``None`` (the default) starts from sequence zero and no commit receipt
+    at all, with the digest chain rooted at ``d0`` (32 zero bytes);
+    otherwise it must be a :class:`JournalBatchReceiptFrontier` or its
+    canonical :meth:`JournalBatchReceiptFrontier.to_bytes` encoding (any
+    other type raises :class:`TypeError`). A supplied frontier is checked
+    at four MAC layers, all always recomputed and each compared in constant
+    time before any result is consulted: the frontier's own ``NPBJ9`` MAC
+    over the canonical encoding of its first four fields, and the three
+    layers of its ``end`` receipt frontier — that frontier's own ``NPBJ5``
+    MAC, its end state's ``NPBJ1`` MAC and the embedded checkpoint table's
+    ``NPBL1`` MAC. A malformed encoding or any MAC mismatch raises
+    :class:`ValueError`. Across a restart the caller must pass the value
+    previously exported at :attr:`checkpoint`; nothing is persisted by the
+    auditor itself.
+
+    Each :meth:`audit` accepts one :class:`JournalBatchReceipt` and the
+    :class:`BitMapHistoryJournalReceiptBatch` it attests (either as objects
+    or as their canonical bytes) and, under the auditor lock, re-verifies
+    the pair exactly like :func:`audit_commit` — the ``NPBJ8`` receipt MAC,
+    the batch digest, the endpoint equality and the whole batch
+    verification — and then demands the receipt starts exactly where the
+    frontier currently stands: with no frontier the receipt's ``start``
+    must be the empty string, and otherwise it must equal the frontier
+    ``end`` byte for byte. Only then does the frontier advance: ``n`` is
+    the old sequence plus one, the new ``end`` is the receipt's ``end``,
+    the new digest is ``SHA256(b"NPBJ10" + d + u64be(n) + R)`` over the
+    previous digest, the fixed 8-byte big-endian ``n`` and the canonical
+    receipt bytes, and the new frontier is MAC'd as
+    ``HMAC-SHA256(key, b"NPBJ9" + C)``. Verification and the frontier
+    advance are one atomic step: a failed audit raises :class:`ValueError`
+    and leaves the frontier untouched, and concurrent audits linearize in
+    lock-acquisition order so a committed receipt is never lost.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._frontier: "Optional[JournalBatchReceiptFrontier]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, JournalBatchReceiptFrontier):
+            frontier = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                frontier = JournalBatchReceiptFrontier.from_bytes(checkpoint)
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value error.
+                raise ValueError(
+                    "checkpoint does not satisfy the journal batch receipt"
+                    " frontier field contract"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be a JournalBatchReceiptFrontier instance,"
+                " its canonical bytes, or None"
+            )
+        # Four MAC layers, all always recomputed and each compared in
+        # constant time before any result is consulted: the frontier's own
+        # NPBJ9 MAC and the three layers of its end receipt frontier — the
+        # NPBJ5 frontier MAC, the end state's NPBJ1 MAC and the embedded
+        # table's NPBL1 MAC.
+        end_frontier = BitMapHistoryJournalReceiptFrontier.from_bytes(
+            frontier.end
+        )
+        end_state = BitMapHistoryJournalState.from_bytes(end_frontier.end)
+        table = BitMap.from_bytes(end_state.checkpoint)
+        checkpoint_mac_ok = hmac.compare_digest(
+            _bit_map_mac(self._key, _bit_map_payload(table.entries)),
+            table.mac,
+        )
+        state_mac_ok = hmac.compare_digest(
+            _bit_map_history_journal_mac(self._key, end_state), end_state.mac
+        )
+        end_frontier_mac_ok = hmac.compare_digest(
+            _bit_map_history_journal_receipt_frontier_mac(
+                self._key, end_frontier
+            ),
+            end_frontier.mac,
+        )
+        frontier_mac_ok = hmac.compare_digest(
+            _journal_batch_receipt_frontier_mac(self._key, frontier),
+            frontier.mac,
+        )
+        if not (
+            checkpoint_mac_ok
+            and state_mac_ok
+            and end_frontier_mac_ok
+            and frontier_mac_ok
+        ):
+            raise ValueError(
+                "journal batch receipt frontier mac does not match the key"
+            )
+        self._frontier = frontier
+
+    @property
+    def checkpoint(self) -> "Optional[JournalBatchReceiptFrontier]":
+        """The current :class:`JournalBatchReceiptFrontier`, or ``None``
+        before the first successfully audited commit receipt. The returned
+        object is frozen and the property read-only; persist its
+        :meth:`JournalBatchReceiptFrontier.to_bytes` output and pass it
+        back to a new auditor to survive a restart."""
+        return self._frontier
+
+    @property
+    def state(self) -> "Optional[JournalBatchReceiptFrontier]":
+        """Alias of :attr:`checkpoint`: the current
+        :class:`JournalBatchReceiptFrontier`, or ``None`` before the first
+        successfully audited commit receipt. Read-only."""
+        return self._frontier
+
+    def audit(
+        self, receipt: object, batch: object
+    ) -> "JournalBatchReceiptAuditor":
+        """Audit one committed batch-commit receipt against its batch and
+        advance.
+
+        ``receipt`` must be a :class:`JournalBatchReceipt` or its canonical
+        :meth:`JournalBatchReceipt.to_bytes` encoding and ``batch`` the
+        :class:`BitMapHistoryJournalReceiptBatch` it attests or its
+        canonical :meth:`BitMapHistoryJournalReceiptBatch.to_bytes`
+        encoding — any other type raises :class:`TypeError`; a malformed
+        or non-canonical encoding, a MAC or digest mismatch, endpoints
+        that do not match the batch, a batch that fails verification, a
+        sequence that would overflow u64, or a receipt ``start`` that does
+        not equal the current frontier ``end`` (the empty string when no
+        commit receipt has audited yet) raises :class:`ValueError`. The
+        pair is re-verified exactly as :func:`audit_commit` verifies it
+        and the start matched against the frontier under the auditor lock,
+        and the sequence, digest-chain head, end frontier and frontier MAC
+        are all advanced in the same atomic step, so a failed audit
+        changes nothing and concurrent audits are serialized in
+        lock-acquisition order. Returns the auditor itself.
+        """
+        with self._lock:
+            receipt = _coerce_bit_map_history_journal_batch_receipt(
+                receipt, "receipt"
+            )
+            batch = _coerce_bit_map_history_journal_receipt_batch(
+                batch, "batch"
+            )
+            audit_commit(receipt, batch, self._key)
+            current = (
+                b"" if self._frontier is None else self._frontier.end
+            )
+            if receipt.start != current:
+                raise ValueError(
+                    "journal batch receipt start does not match the"
+                    " frontier end"
+                )
+            previous_sequence = (
+                0 if self._frontier is None else self._frontier.sequence
+            )
+            if previous_sequence >= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    "journal batch receipt frontier sequence would overflow"
+                    " the unsigned 64-bit range"
+                )
+            sequence = previous_sequence + 1
+            previous_digest = (
+                b"\x00" * 32
+                if self._frontier is None
+                else self._frontier.digest
+            )
+            digest = _journal_batch_receipt_frontier_next_digest(
+                previous_digest, sequence, receipt.to_bytes()
+            )
+            candidate = JournalBatchReceiptFrontier(
+                version=1,
+                sequence=sequence,
+                end=receipt.end,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._frontier = replace(
+                candidate,
+                mac=_journal_batch_receipt_frontier_mac(
+                    self._key, candidate
+                ),
+            )
+            return self
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
