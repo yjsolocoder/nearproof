@@ -14,8 +14,9 @@ ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus / ContextRevo
 Evidence /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
 JournalBatchReceiptFrontier /
-Measurement / Observation / ObservationRevocation / Prover / RangeDecision
-/ RangeReceipt / SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList
+Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
+RangeDecision
+/ RangeFrontier / RangeReceipt / SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList
 / Verifier /
 VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_b / audit_bound /
@@ -87,7 +88,9 @@ __all__ = [
     "Observation",
     "ObservationRevocation",
     "Prover",
+    "RangeAuditor",
     "RangeDecision",
+    "RangeFrontier",
     "RangeReceipt",
     "SPEED_OF_LIGHT_MPS",
     "TrustRevocation",
@@ -197,6 +200,10 @@ _BIT_MAP_HISTORY_JOURNAL_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPBJ10"
 _COMMIT_RANGE_PREFIX = b"NPBJ11"
 # Domain separation prefix for the commit-range receipt MAC.
 _RANGE_RECEIPT_PREFIX = b"NPBJ12"
+# Domain separation prefixes for the range frontier: the range frontier
+# MAC and the range digest-chain step respectively.
+_RANGE_FRONTIER_MAC_PREFIX = b"NPBJ13"
+_RANGE_FRONTIER_DIGEST_PREFIX = b"NPBJ14"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -8434,6 +8441,400 @@ def audit_receipt(
     # frontier at the range end (it itself raises ValueError if the
     # replayed frontier does not equal that end).
     return audit_range(record, key)
+
+
+def _range_frontier_content(frontier: "RangeFrontier") -> list:
+    """The JSON-ready first four range-frontier fields (everything but
+    ``mac``)."""
+    return [
+        frontier.version,
+        frontier.sequence,
+        frontier.end.hex(),
+        frontier.digest.hex(),
+    ]
+
+
+def _range_frontier_content_bytes(frontier: "RangeFrontier") -> bytes:
+    """The canonical compact encoding ``C`` of the first four range-frontier
+    fields."""
+    return _encode_payload(_range_frontier_content(frontier))
+
+
+def _range_frontier_mac(key: bytes, frontier: "RangeFrontier") -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ13" + C)`` where ``C`` is the canonical
+    encoding of the first four fields. The prefix and ``C`` are concatenated
+    directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _RANGE_FRONTIER_MAC_PREFIX + _range_frontier_content_bytes(frontier),
+        hashlib.sha256,
+    ).digest()
+
+
+def _range_frontier_next_digest(
+    previous: bytes, sequence: int, receipt: bytes
+) -> bytes:
+    """One range digest-chain step:
+    ``SHA256(b"NPBJ14" + d + u64be(n) + R)``.
+
+    The prefix, the previous 32-byte digest, the fixed 8-byte big-endian
+    sequence and the canonical receipt bytes are concatenated directly with
+    no separator or length prefix."""
+    return hashlib.sha256(
+        _RANGE_FRONTIER_DIGEST_PREFIX
+        + previous
+        + _bit_map_history_journal_u64be(sequence)
+        + receipt
+    ).digest()
+
+
+@dataclass(frozen=True)
+class RangeFrontier:
+    """A key-MAC'd, digest-chained frontier over the audited
+    :class:`RangeReceipt` commit stream.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer (the number of audited :class:`RangeReceipt` commits); ``end``
+    the canonical non-empty
+    :meth:`JournalBatchReceiptFrontier.to_bytes` encoding of the commit
+    frontier the audited range-receipt chain currently ends at; ``digest``
+    exactly 32 bytes — the head of a hash chain with ``d0`` fixed at 32 zero
+    bytes and each accepted range receipt extending it as
+    ``d' = SHA256(b"NPBJ14" + d + u64be(n) + R)`` where ``n`` is the new
+    sequence, ``u64be(n)`` its fixed 8-byte big-endian encoding and ``R``
+    the canonical :meth:`RangeReceipt.to_bytes` bytes, every part
+    concatenated directly with no separator or length prefix; ``mac``
+    exactly 32 bytes — ``HMAC-SHA256(key, b"NPBJ13" + C)`` where ``C`` is
+    the canonical compact encoding of the first four fields (the version,
+    sequence, lowercase-hex end and lowercase-hex digest, without ``mac``),
+    the prefix and ``C`` concatenated directly with no separator or length
+    prefix. Instances are frozen, constructed positionally in field order
+    and compare equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    sequence: int
+    end: bytes
+    digest: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("range frontier version must be an integer")
+        if self.version != 1:
+            raise ValueError("range frontier version must be 1")
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "range frontier sequence must be a non-bool integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "range frontier sequence must fit in an unsigned 64-bit"
+                " integer"
+            )
+        if not isinstance(self.end, bytes):
+            raise TypeError("range frontier end must be bytes")
+        _require_range_frontier_end(self.end)
+        for name in ("digest", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(f"range frontier {name} must be bytes")
+            if len(value) != 32:
+                raise ValueError(
+                    f"range frontier {name} must be exactly 32 bytes"
+                )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, sequence, end, digest, mac]`` where ``end``, ``digest`` and
+        ``mac`` are lowercase hex, no whitespace, no length prefix."""
+        return _encode_payload(
+            _range_frontier_content(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "RangeFrontier":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, sequence, end, digest, mac]`` in that order,
+        ``version == 1``, ``sequence`` a non-bool u64, ``end`` a lowercase
+        hex string decoding to the canonical non-empty
+        :class:`JournalBatchReceiptFrontier` encoding, and
+        ``digest``/``mac`` lowercase hex strings decoding to exactly 32
+        bytes each. After parsing and field validation the record is
+        re-encoded with :meth:`to_bytes` and the result must equal the
+        input byte for byte, so formatted JSON, whitespace and any
+        non-canonical spelling are rejected too. No MAC is verified here —
+        neither the range frontier MAC nor the MACs of the commit frontier
+        at ``end``; pass the record to :class:`RangeAuditor` for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("range frontier data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"range frontier is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "range frontier must be a JSON array of exactly version,"
+                " sequence, end, digest and mac"
+            )
+        raw_version, raw_sequence, raw_end, raw_digest, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError("range frontier version must be an integer")
+        if raw_version != 1:
+            raise ValueError("range frontier version must be 1")
+        if type(raw_sequence) is not int:
+            raise TypeError(
+                "range frontier sequence must be a non-bool integer"
+            )
+        if not 0 <= raw_sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "range frontier sequence must fit in an unsigned 64-bit"
+                " integer"
+            )
+        end = _parse_bit_map_hex(raw_end, "range frontier end")
+        _require_range_frontier_end(end)
+        digest = _parse_bit_map_hex(raw_digest, "range frontier digest")
+        if len(digest) != 32:
+            raise ValueError(
+                "range frontier digest must decode to exactly 32 bytes"
+            )
+        mac = _parse_bit_map_hex(raw_mac, "range frontier mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "range frontier mac must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            sequence=raw_sequence,
+            end=end,
+            digest=digest,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError("range frontier encoding is not canonical")
+        return record
+
+
+def _require_range_frontier_end(value: bytes) -> None:
+    """Enforce that a range frontier ``end`` is the canonical non-empty
+    :class:`JournalBatchReceiptFrontier` encoding. ``value`` is already
+    known to be ``bytes``;
+    :meth:`JournalBatchReceiptFrontier.from_bytes` enforces the full
+    contract including its canonical re-encoding check, and every
+    violation — including the field-shape :class:`TypeError` a malformed
+    inner document would otherwise surface — raises :class:`ValueError`."""
+    try:
+        JournalBatchReceiptFrontier.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "range frontier end must be the canonical"
+            " JournalBatchReceiptFrontier encoding"
+        ) from error
+
+
+def _verify_range_frontier_macs(
+    key: bytes, frontier: "RangeFrontier"
+) -> None:
+    """Recompute all five MAC layers of a parsed range frontier — the
+    range frontier's own ``NPBJ13`` MAC and the four layers of its ``end``
+    commit frontier: that frontier's own ``NPBJ9`` MAC and the three
+    layers of its ``end`` receipt frontier: that frontier's own ``NPBJ5``
+    MAC, its ``end`` state's ``NPBJ1`` MAC and the state's embedded
+    checkpoint table's ``NPBL1`` MAC. All layers are always recomputed and
+    each compared in constant time before any result is consulted."""
+    commit_frontier = JournalBatchReceiptFrontier.from_bytes(frontier.end)
+    end_frontier = BitMapHistoryJournalReceiptFrontier.from_bytes(
+        commit_frontier.end
+    )
+    end_state = BitMapHistoryJournalState.from_bytes(end_frontier.end)
+    table = BitMap.from_bytes(end_state.checkpoint)
+    checkpoint_mac_ok = hmac.compare_digest(
+        _bit_map_mac(key, _bit_map_payload(table.entries)),
+        table.mac,
+    )
+    state_mac_ok = hmac.compare_digest(
+        _bit_map_history_journal_mac(key, end_state), end_state.mac
+    )
+    end_frontier_mac_ok = hmac.compare_digest(
+        _bit_map_history_journal_receipt_frontier_mac(key, end_frontier),
+        end_frontier.mac,
+    )
+    commit_frontier_mac_ok = hmac.compare_digest(
+        _bit_map_history_journal_batch_receipt_frontier_mac(
+            key, commit_frontier
+        ),
+        commit_frontier.mac,
+    )
+    frontier_mac_ok = hmac.compare_digest(
+        _range_frontier_mac(key, frontier), frontier.mac
+    )
+    if (
+        not checkpoint_mac_ok
+        or not state_mac_ok
+        or not end_frontier_mac_ok
+        or not commit_frontier_mac_ok
+        or not frontier_mac_ok
+    ):
+        raise ValueError("range frontier mac does not match the key")
+
+
+class RangeAuditor:
+    """Stateful auditor chaining verified :class:`RangeReceipt` commits
+    into one monotone, restartable, sequence-numbered
+    :class:`RangeFrontier`.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    shared key the receipts, ranges and all their frontiers are MAC'd
+    with. ``checkpoint`` is keyword-only: ``None`` (the default) starts
+    from sequence zero with no commit at all and the range digest chain
+    rooted at ``d0`` (32 zero bytes); otherwise it must be a
+    :class:`RangeFrontier` or its canonical
+    :meth:`RangeFrontier.to_bytes` encoding (any other type raises
+    :class:`TypeError`). A supplied frontier is checked at five MAC
+    layers, all always recomputed and each compared in constant time
+    before any result is consulted: the range frontier's own ``NPBJ13``
+    MAC over the canonical encoding of its first four fields, its ``end``
+    commit frontier's own ``NPBJ9`` MAC, and the three layers of that
+    commit frontier's ``end`` receipt frontier — the embedded checkpoint
+    table's ``NPBL1`` MAC, the journal state's own ``NPBJ1`` MAC and the
+    receipt frontier's own ``NPBJ5`` MAC. A malformed encoding or any MAC
+    mismatch raises :class:`ValueError`. Across a restart the caller must
+    pass the value previously exported at :attr:`frontier`; nothing is
+    persisted by the auditor itself.
+
+    Each :meth:`audit` accepts one :class:`RangeReceipt` and the
+    :class:`CommitRange` it attests (either as objects or as their
+    canonical bytes) and, under the auditor lock, re-verifies the pair
+    exactly like :func:`audit_receipt` — the ``NPBJ12`` receipt MAC, the
+    range digest, the endpoint equality and the whole range verification
+    — and then demands the receipt starts exactly where the range
+    frontier currently stands: with no frontier the receipt's ``start``
+    must be the empty string, and otherwise it must equal the frontier
+    ``end`` byte for byte. Only then does the frontier advance: ``n`` is
+    the old sequence plus one, the new ``end`` is the receipt's ``end``,
+    the new digest is
+    ``SHA256(b"NPBJ14" + d + u64be(n) + R)`` over the previous digest,
+    the fixed 8-byte big-endian ``n`` and the canonical receipt bytes,
+    and the new range frontier is MAC'd as
+    ``HMAC-SHA256(key, b"NPBJ13" + C)``. Verification and the frontier
+    advance are one atomic step: a failed audit raises :class:`ValueError`
+    (and a wrong-typed argument :class:`TypeError`) and leaves the
+    frontier untouched, and concurrent audits linearize in
+    lock-acquisition order so a committed receipt is never lost.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._frontier: "Optional[RangeFrontier]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, RangeFrontier):
+            frontier = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                frontier = RangeFrontier.from_bytes(checkpoint)
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value error.
+                raise ValueError(
+                    "checkpoint does not satisfy the range frontier field"
+                    " contract"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be a RangeFrontier instance, its canonical"
+                " bytes, or None"
+            )
+        _verify_range_frontier_macs(self._key, frontier)
+        self._frontier = frontier
+
+    @property
+    def frontier(self) -> "Optional[RangeFrontier]":
+        """The current :class:`RangeFrontier`, or ``None`` before the first
+        successfully audited range receipt. The returned object is frozen
+        and the property read-only; persist its
+        :meth:`RangeFrontier.to_bytes` output and pass it back to a new
+        auditor to survive a restart."""
+        return self._frontier
+
+    def audit(self, r: object, x: object) -> "RangeAuditor":
+        """Audit one committed :class:`RangeReceipt` against its
+        :class:`CommitRange` and advance.
+
+        ``r`` must be a :class:`RangeReceipt` or its canonical
+        :meth:`RangeReceipt.to_bytes` encoding and ``x`` the attested
+        :class:`CommitRange` or its canonical
+        :meth:`CommitRange.to_bytes` encoding — any other type raises
+        :class:`TypeError`; a malformed or non-canonical encoding, a MAC
+        or digest mismatch, endpoints that do not match the range, a
+        range that fails verification, a sequence that would overflow
+        u64, or a receipt ``start`` that does not equal the current
+        frontier ``end`` (the empty string when no receipt has been
+        audited yet) raises :class:`ValueError`. The pair is re-verified
+        exactly as :func:`audit_receipt` verifies it and the start matched
+        against the frontier under the auditor lock, and the sequence,
+        digest-chain head, end and range frontier MAC are all advanced in
+        the same atomic step, so a failed audit changes nothing and
+        concurrent audits are serialized in lock-acquisition order.
+        Returns the auditor itself.
+        """
+        with self._lock:
+            receipt = _coerce_range_receipt(r, "r")
+            # audit_receipt is a pure check: the NPBJ12 receipt MAC, the
+            # range digest, the endpoints and the whole carried range
+            # chain, returning the frozen commit frontier at the range
+            # end.
+            audit_receipt(receipt, x, self._key)
+            current = b"" if self._frontier is None else self._frontier.end
+            if receipt.start != current:
+                raise ValueError(
+                    "range receipt start does not match the frontier end"
+                )
+            previous_sequence = (
+                0 if self._frontier is None else self._frontier.sequence
+            )
+            if previous_sequence >= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    "range frontier sequence would overflow the unsigned"
+                    " 64-bit range"
+                )
+            sequence = previous_sequence + 1
+            previous_digest = (
+                b"\x00" * 32
+                if self._frontier is None
+                else self._frontier.digest
+            )
+            digest = _range_frontier_next_digest(
+                previous_digest, sequence, receipt.to_bytes()
+            )
+            candidate = RangeFrontier(
+                version=1,
+                sequence=sequence,
+                end=receipt.end,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._frontier = replace(
+                candidate,
+                mac=_range_frontier_mac(self._key, candidate),
+            )
+            return self
+
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
