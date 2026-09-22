@@ -3,7 +3,8 @@
 Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
 BitGuard / BitMap / BitMapHistoryAuditor / BitMapHistoryEvidence /
 BitMapHistoryEvidenceAuditor / BitMapHistoryJournalAuditor /
-BitMapHistoryJournalBundle / BitMapHistoryJournalState / BitMapUpdate /
+BitMapHistoryJournalBundle / BitMapHistoryJournalReceipt /
+BitMapHistoryJournalState / BitMapUpdate /
 BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
@@ -17,7 +18,7 @@ attest_observation_for_point / audit / audit_b / audit_bound /
 audit_bound_policy /
 audit_cert_evidence / audit_crl / audit_map_history /
 audit_map_history_evidence / audit_map_history_journal_bundle /
-audit_map_update /
+audit_map_history_journal_receipt / audit_map_update /
 audit_proof / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
@@ -51,6 +52,7 @@ __all__ = [
     "BitMapHistoryEvidenceAuditor",
     "BitMapHistoryJournalAuditor",
     "BitMapHistoryJournalBundle",
+    "BitMapHistoryJournalReceipt",
     "BitMapHistoryJournalState",
     "BitMapUpdate",
     "BitRound",
@@ -90,6 +92,7 @@ __all__ = [
     "audit_map_history",
     "audit_map_history_evidence",
     "audit_map_history_journal_bundle",
+    "audit_map_history_journal_receipt",
     "audit_map_update",
     "audit_proof",
     "cert",
@@ -156,6 +159,8 @@ _BIT_MAP_HISTORY_JOURNAL_MAC_PREFIX = b"NPBJ1"
 _BIT_MAP_HISTORY_JOURNAL_DIGEST_PREFIX = b"NPBJ2"
 # Domain separation prefix for the history-evidence journal bundle MAC.
 _BIT_MAP_HISTORY_JOURNAL_BUNDLE_PREFIX = b"NPBJ3"
+# Domain separation prefix for the post-commit bundle receipt MAC.
+_BIT_MAP_HISTORY_JOURNAL_RECEIPT_PREFIX = b"NPBJ4"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -4739,7 +4744,10 @@ class BitMapHistoryJournalAuditor:
     its entire evidence chain as a single atomic step under the same lock,
     replaying onto a tentative state and replacing :attr:`state` only once
     every segment has verified and the replayed final state equals the
-    bundle's ``end`` byte for byte.
+    bundle's ``end`` byte for byte. :meth:`audit_bundle_receipt` runs that
+    very same commit under the same lock and, only after it commits, mints a
+    :class:`BitMapHistoryJournalReceipt` covering the bundle; a failed commit
+    raises before any receipt exists and leaves the state untouched.
     """
 
     def __init__(self, key: object, *, state: object = None) -> None:
@@ -4888,44 +4896,88 @@ class BitMapHistoryJournalAuditor:
         lost or partially applied. Returns the auditor itself.
         """
         with self._lock:
-            bundle = _coerce_bit_map_history_journal_bundle(x, "x")
-            if not hmac.compare_digest(
-                _bit_map_history_journal_bundle_mac(self._key, bundle),
-                bundle.mac,
-            ):
-                raise ValueError(
-                    "bit map history journal bundle mac does not match"
-                )
-            start_state: "Optional[BitMapHistoryJournalState]" = None
-            if bundle.start:
-                start_state = BitMapHistoryJournalState.from_bytes(
-                    bundle.start
-                )
-                _verify_bit_map_history_journal_state_macs(
-                    self._key, start_state, "start"
-                )
-            end_state = BitMapHistoryJournalState.from_bytes(bundle.end)
-            _verify_bit_map_history_journal_state_macs(
-                self._key, end_state, "end"
-            )
-            current = (
-                b"" if self._state is None else self._state.to_bytes()
-            )
-            if bundle.start != current:
-                raise ValueError(
-                    "bit map history journal bundle start does not match"
-                    " the journal state"
-                )
-            candidate = _replay_bit_map_history_journal_bundle(
-                self._key, start_state, bundle.evidences
-            )
-            if candidate.to_bytes() != bundle.end:
-                raise ValueError(
-                    "bit map history journal bundle end does not match the"
-                    " replayed chain"
-                )
-            self._state = candidate
+            self._commit_bundle_locked(x)
             return self
+
+    def audit_bundle_receipt(
+        self, x: object
+    ) -> "BitMapHistoryJournalReceipt":
+        """Atomically audit and commit one whole
+        :class:`BitMapHistoryJournalBundle` exactly like
+        :meth:`audit_bundle`, then return the post-commit
+        :class:`BitMapHistoryJournalReceipt`.
+
+        ``x`` must be a :class:`BitMapHistoryJournalBundle` or its canonical
+        :meth:`BitMapHistoryJournalBundle.to_bytes` encoding — any other
+        type raises :class:`TypeError`; every other contract violation
+        raises :class:`ValueError`. The commit is the same locked atomic
+        step :meth:`audit_bundle` performs, so :meth:`audit`,
+        :meth:`audit_bundle` and :meth:`audit_bundle_receipt` all serialize
+        on the auditor lock in acquisition order. The receipt is minted only
+        after the commit succeeds: it copies the committed bundle's
+        ``start``/``end``, carries ``bundle_digest =
+        SHA256(bundle.to_bytes())`` and is MAC'd as
+        ``HMAC-SHA256(key, b"NPBJ4" + C)``. A failed verification raises
+        :class:`ValueError` before any receipt is produced and leaves the
+        state untouched.
+        """
+        with self._lock:
+            bundle = self._commit_bundle_locked(x)
+            return _make_bit_map_history_journal_receipt(self._key, bundle)
+
+    def _commit_bundle_locked(
+        self, x: object
+    ) -> "BitMapHistoryJournalBundle":
+        """The locked core shared by :meth:`audit_bundle` and
+        :meth:`audit_bundle_receipt`. The caller must hold :attr:`_lock`.
+
+        Parses the bundle per its canonical contract, recomputes and
+        constant-time-compares its ``NPBJ3`` MAC, verifies both MAC layers
+        of both endpoints before any replay, demands the bundle ``start``
+        equal the current journal state byte for byte, replays every
+        carried segment onto a tentative state and replaces :attr:`state`
+        only once the tentative final state's canonical bytes equal the
+        bundle ``end``. Returns the committed bundle; every failure raises
+        :class:`ValueError` and leaves the state untouched.
+        """
+        bundle = _coerce_bit_map_history_journal_bundle(x, "x")
+        if not hmac.compare_digest(
+            _bit_map_history_journal_bundle_mac(self._key, bundle),
+            bundle.mac,
+        ):
+            raise ValueError(
+                "bit map history journal bundle mac does not match"
+            )
+        start_state: "Optional[BitMapHistoryJournalState]" = None
+        if bundle.start:
+            start_state = BitMapHistoryJournalState.from_bytes(
+                bundle.start
+            )
+            _verify_bit_map_history_journal_state_macs(
+                self._key, start_state, "start"
+            )
+        end_state = BitMapHistoryJournalState.from_bytes(bundle.end)
+        _verify_bit_map_history_journal_state_macs(
+            self._key, end_state, "end"
+        )
+        current = (
+            b"" if self._state is None else self._state.to_bytes()
+        )
+        if bundle.start != current:
+            raise ValueError(
+                "bit map history journal bundle start does not match"
+                " the journal state"
+            )
+        candidate = _replay_bit_map_history_journal_bundle(
+            self._key, start_state, bundle.evidences
+        )
+        if candidate.to_bytes() != bundle.end:
+            raise ValueError(
+                "bit map history journal bundle end does not match the"
+                " replayed chain"
+            )
+        self._state = candidate
+        return bundle
 
 
 def _require_bit_map_history_journal_state_encoding(
@@ -5388,6 +5440,303 @@ def audit_map_history_journal_bundle(
             " chain"
         )
     return final
+
+
+def _bit_map_history_journal_receipt_content(
+    receipt: "BitMapHistoryJournalReceipt",
+) -> list:
+    """The JSON-ready first four receipt fields (everything but ``mac``)."""
+    return [
+        receipt.version,
+        receipt.start.hex(),
+        receipt.bundle_digest.hex(),
+        receipt.end.hex(),
+    ]
+
+
+def _bit_map_history_journal_receipt_content_bytes(
+    receipt: "BitMapHistoryJournalReceipt",
+) -> bytes:
+    """The canonical compact encoding ``C`` of the first four receipt
+    fields — ``[1, start, bundle_digest, end]`` with bytes fields lowercase
+    hex."""
+    return _encode_payload(_bit_map_history_journal_receipt_content(receipt))
+
+
+def _bit_map_history_journal_receipt_mac(
+    key: bytes, receipt: "BitMapHistoryJournalReceipt"
+) -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ4" + C)`` where ``C`` is the canonical
+    encoding ``[1, start, bundle_digest, end]`` of the first four fields.
+    The prefix and ``C`` are concatenated directly with no separator or
+    length prefix."""
+    return hmac.new(
+        key,
+        _BIT_MAP_HISTORY_JOURNAL_RECEIPT_PREFIX
+        + _bit_map_history_journal_receipt_content_bytes(receipt),
+        hashlib.sha256,
+    ).digest()
+
+
+def _bit_map_history_journal_bundle_digest(
+    bundle: "BitMapHistoryJournalBundle",
+) -> bytes:
+    """``SHA256(bundle.to_bytes())`` — the digest of the bundle's canonical
+    compact encoding."""
+    return hashlib.sha256(bundle.to_bytes()).digest()
+
+
+def _make_bit_map_history_journal_receipt(
+    key: bytes, bundle: "BitMapHistoryJournalBundle"
+) -> "BitMapHistoryJournalReceipt":
+    """Mint the post-commit receipt for an already audited bundle: its
+    ``start``/``end`` mirror the bundle endpoints, ``bundle_digest`` is
+    ``SHA256(bundle.to_bytes())`` and ``mac`` is the ``NPBJ4`` MAC over the
+    canonical first four fields."""
+    placeholder = BitMapHistoryJournalReceipt(
+        version=1,
+        start=bundle.start,
+        bundle_digest=_bit_map_history_journal_bundle_digest(bundle),
+        end=bundle.end,
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        placeholder, mac=_bit_map_history_journal_receipt_mac(key, placeholder)
+    )
+
+
+@dataclass(frozen=True)
+class BitMapHistoryJournalReceipt:
+    """A key-MAC'd, post-commit receipt for one audited
+    :class:`BitMapHistoryJournalBundle`.
+
+    ``version`` is always ``1``. ``start`` copies the committed bundle's
+    ``start``: ``b""`` when the chain started from the empty journal or the
+    canonical non-empty :meth:`BitMapHistoryJournalState.to_bytes` encoding
+    otherwise. ``bundle_digest`` is exactly 32 bytes —
+    ``SHA256(bundle.to_bytes())`` over the bundle's canonical compact
+    encoding. ``end`` is the canonical non-empty
+    :meth:`BitMapHistoryJournalState.to_bytes` encoding the committed chain
+    ended at. ``mac`` is exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPBJ4" + C)`` where ``C`` is the canonical compact
+    encoding of the first four fields (the version, the lowercase-hex start,
+    the lowercase-hex bundle digest and the lowercase-hex end, without
+    ``mac``), the prefix and ``C`` concatenated directly with no separator
+    or length prefix. Instances are frozen, constructed positionally in
+    field order and compare equal by their fields. A field of the wrong
+    type raises :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    start: bytes
+    bundle_digest: bytes
+    end: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "bit map history journal receipt version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError(
+                "bit map history journal receipt version must be 1"
+            )
+        if not isinstance(self.start, bytes):
+            raise TypeError(
+                "bit map history journal receipt start must be bytes"
+            )
+        _require_bit_map_history_journal_state_encoding(
+            self.start, "start", allow_empty=True
+        )
+        if not isinstance(self.bundle_digest, bytes):
+            raise TypeError(
+                "bit map history journal receipt bundle_digest must be bytes"
+            )
+        if len(self.bundle_digest) != 32:
+            raise ValueError(
+                "bit map history journal receipt bundle_digest must be exactly"
+                " 32 bytes"
+            )
+        if not isinstance(self.end, bytes):
+            raise TypeError("bit map history journal receipt end must be bytes")
+        _require_bit_map_history_journal_state_encoding(
+            self.end, "end", allow_empty=False
+        )
+        if not isinstance(self.mac, bytes):
+            raise TypeError("bit map history journal receipt mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError(
+                "bit map history journal receipt mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, start, bundle_digest, end, mac]`` where ``start``,
+        ``bundle_digest``, ``end`` and ``mac`` are lowercase hex (an empty
+        ``start`` is ``""``), no whitespace, no length prefix."""
+        return _encode_payload(
+            _bit_map_history_journal_receipt_content(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BitMapHistoryJournalReceipt":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and for
+        fields of the wrong type; raises :class:`ValueError` for anything
+        that does not satisfy the value contract: an array of exactly
+        ``[version, start, bundle_digest, end, mac]`` in that order,
+        ``version == 1``, ``start`` a lowercase hex string that is empty or
+        decodes to the canonical :class:`BitMapHistoryJournalState` encoding,
+        ``bundle_digest`` a lowercase hex string decoding to exactly 32
+        bytes, ``end`` a lowercase hex string decoding to the canonical
+        non-empty :class:`BitMapHistoryJournalState` encoding and ``mac`` a
+        lowercase hex string decoding to exactly 32 bytes. After parsing and
+        field validation the record is re-encoded with :meth:`to_bytes` and
+        the result must equal the input byte for byte, so formatted JSON,
+        whitespace and any non-canonical spelling are rejected too. No MAC
+        or digest is verified here — pass the record to
+        :func:`audit_map_history_journal_receipt` with the bundle and the
+        shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "bit map history journal receipt data must be bytes"
+            )
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"bit map history journal receipt is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "bit map history journal receipt must be a JSON array of"
+                " exactly version, start, bundle_digest, end and mac"
+            )
+        (
+            raw_version,
+            raw_start,
+            raw_bundle_digest,
+            raw_end,
+            raw_mac,
+        ) = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "bit map history journal receipt version must be an integer"
+            )
+        if raw_version != 1:
+            raise ValueError(
+                "bit map history journal receipt version must be 1"
+            )
+        start = _parse_bit_map_hex(raw_start, "journal receipt start")
+        _require_bit_map_history_journal_state_encoding(
+            start, "start", allow_empty=True
+        )
+        bundle_digest = _parse_bit_map_hex(
+            raw_bundle_digest, "journal receipt bundle_digest"
+        )
+        if len(bundle_digest) != 32:
+            raise ValueError(
+                "bit map history journal receipt bundle_digest must decode to"
+                " exactly 32 bytes"
+            )
+        end = _parse_bit_map_hex(raw_end, "journal receipt end")
+        _require_bit_map_history_journal_state_encoding(
+            end, "end", allow_empty=False
+        )
+        mac = _parse_bit_map_hex(raw_mac, "journal receipt mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "bit map history journal receipt mac must decode to exactly 32"
+                " bytes"
+            )
+        record = cls(
+            version=1,
+            start=start,
+            bundle_digest=bundle_digest,
+            end=end,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "bit map history journal receipt encoding is not canonical"
+            )
+        return record
+
+
+def _coerce_bit_map_history_journal_receipt(
+    x: object, name: str
+) -> "BitMapHistoryJournalReceipt":
+    """Coerce a :class:`BitMapHistoryJournalReceipt` or its canonical bytes,
+    splitting the TypeError/ValueError contract exactly as the other
+    auditors do: the wrong kind of argument raises :class:`TypeError`, a
+    field-shape failure surfacing while parsing byte content of the right
+    kind is a value error."""
+    if isinstance(x, BitMapHistoryJournalReceipt):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return BitMapHistoryJournalReceipt.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the bit map history journal receipt"
+                " field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a BitMapHistoryJournalReceipt instance or its"
+        " canonical bytes"
+    )
+
+
+def audit_map_history_journal_receipt(
+    receipt: object, bundle: object, key: object
+) -> "BitMapHistoryJournalState":
+    """Re-verify a :class:`BitMapHistoryJournalReceipt` against the
+    :class:`BitMapHistoryJournalBundle` it was minted for and ``key``.
+
+    ``receipt`` must be a :class:`BitMapHistoryJournalReceipt` or its
+    canonical :meth:`BitMapHistoryJournalReceipt.to_bytes` encoding,
+    ``bundle`` a :class:`BitMapHistoryJournalBundle` or its canonical
+    :meth:`BitMapHistoryJournalBundle.to_bytes` encoding and ``key`` the
+    non-empty shared ``bytes`` key — a wrong-typed argument raises
+    :class:`TypeError`, an empty key or every other contract violation
+    raises :class:`ValueError`. The receipt's bundle digest is recomputed
+    as ``SHA256(bundle.to_bytes())`` and its ``NPBJ4`` MAC as
+    ``HMAC-SHA256(key, b"NPBJ4" + C)``, and each is compared in constant
+    time; the receipt's ``start`` and ``end`` are likewise compared in
+    constant time against the bundle's endpoints. Only once all four
+    comparisons pass is the bundle itself audited exactly as
+    :func:`audit_map_history_journal_bundle` audits it — the ``NPBJ3``
+    bundle MAC, both endpoint state MAC layers and the full segment replay
+    to the bundle ``end``. Auditing is a pure check: it touches no auditor
+    state, and on success returns the frozen
+    :class:`BitMapHistoryJournalState` the committed chain ends at.
+    """
+    record = _coerce_bit_map_history_journal_receipt(receipt, "receipt")
+    sealed = _coerce_bit_map_history_journal_bundle(bundle, "bundle")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    digest_ok = hmac.compare_digest(
+        _bit_map_history_journal_bundle_digest(sealed), record.bundle_digest
+    )
+    mac_ok = hmac.compare_digest(
+        _bit_map_history_journal_receipt_mac(key, record), record.mac
+    )
+    start_ok = hmac.compare_digest(sealed.start, record.start)
+    end_ok = hmac.compare_digest(sealed.end, record.end)
+    if not digest_ok or not mac_ok or not start_ok or not end_ok:
+        raise ValueError(
+            "bit map history journal receipt does not match the bundle and"
+            " key"
+        )
+    return audit_map_history_journal_bundle(sealed, key)
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
