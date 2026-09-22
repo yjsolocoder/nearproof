@@ -15,7 +15,7 @@ Evidence /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
 JournalBatchReceiptFrontier /
 Measurement / Observation / ObservationRevocation / Prover / RangeDecision
-/ SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList / Verifier /
+/ RangeReceipt / SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList / Verifier /
 VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_b / audit_bound /
 audit_bound_policy /
@@ -23,7 +23,7 @@ audit_cert_evidence / audit_crl / audit_map_history /
 audit_map_history_evidence / audit_map_history_journal_bundle /
 audit_map_history_journal_receipt /
 audit_map_update /
-audit_proof / audit_range / cert / locate /
+audit_proof / audit_range / audit_receipt / cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
 revoke_context / revoke_observation / revoke_trust / seal_map_history /
@@ -87,6 +87,7 @@ __all__ = [
     "ObservationRevocation",
     "Prover",
     "RangeDecision",
+    "RangeReceipt",
     "SPEED_OF_LIGHT_MPS",
     "TrustRevocation",
     "TrustRevocationList",
@@ -110,6 +111,7 @@ __all__ = [
     "audit_map_update",
     "audit_proof",
     "audit_range",
+    "audit_receipt",
     "cert",
     "locate",
     "locate_attested",
@@ -192,6 +194,8 @@ _BIT_MAP_HISTORY_JOURNAL_BATCH_RECEIPT_FRONTIER_MAC_PREFIX = b"NPBJ9"
 _BIT_MAP_HISTORY_JOURNAL_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPBJ10"
 # Domain separation prefix for the transferable commit-range proof MAC.
 _COMMIT_RANGE_PREFIX = b"NPBJ11"
+# Domain separation prefix for the commit range receipt MAC.
+_RANGE_RECEIPT_MAC_PREFIX = b"NPBJ12"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -7978,6 +7982,195 @@ def audit_range(
     return final
 
 
+def _range_receipt_content(receipt: "RangeReceipt") -> list:
+    """The JSON-ready first four range-receipt fields (everything but
+    ``mac``)."""
+    return [
+        receipt.version,
+        receipt.start.hex(),
+        receipt.digest.hex(),
+        receipt.end.hex(),
+    ]
+
+
+def _range_receipt_content_bytes(receipt: "RangeReceipt") -> bytes:
+    """The canonical compact encoding ``C`` of the first four range-receipt
+    fields."""
+    return _encode_payload(_range_receipt_content(receipt))
+
+
+def _range_receipt_mac(key: bytes, receipt: "RangeReceipt") -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ12" + C)`` where ``C`` is the canonical
+    encoding of the first four fields. The prefix and ``C`` are concatenated
+    directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _RANGE_RECEIPT_MAC_PREFIX + _range_receipt_content_bytes(receipt),
+        hashlib.sha256,
+    ).digest()
+
+
+def _require_range_receipt_frontier(
+    value: bytes, name: str, allow_empty: bool
+) -> None:
+    """Enforce the canonical-:class:`JournalBatchReceiptFrontier`-bytes
+    contract of a range-receipt endpoint.
+
+    ``value`` is already known to be ``bytes``; when ``allow_empty`` holds,
+    ``b""`` (the range starts with no commit at all) is also accepted.
+    :meth:`JournalBatchReceiptFrontier.from_bytes` enforces the full contract
+    including its canonical re-encoding check, and every violation —
+    including the field-shape :class:`TypeError` a malformed inner document
+    would otherwise surface — raises :class:`ValueError`."""
+    if allow_empty and value == b"":
+        return
+    try:
+        JournalBatchReceiptFrontier.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        suffix = " or empty" if allow_empty else ""
+        raise ValueError(
+            f"range receipt {name} must be the canonical"
+            f" JournalBatchReceiptFrontier encoding{suffix}"
+        ) from error
+
+
+@dataclass(frozen=True)
+class RangeReceipt:
+    """A key-MAC'd commit receipt attesting one audited :class:`CommitRange`
+    and the commit frontier it ends at.
+
+    ``version`` is always ``1``. ``start`` is the canonical
+    :meth:`JournalBatchReceiptFrontier.to_bytes` encoding of the commit
+    frontier the range started from, or the empty byte string when it
+    started from nothing (sequence zero, the commit digest chain rooted at
+    ``d0``); ``end`` is the canonical non-empty
+    :class:`JournalBatchReceiptFrontier` encoding the range ends at.
+    ``digest`` is exactly 32 bytes — ``SHA256(x.to_bytes())`` over the
+    canonical :meth:`CommitRange.to_bytes` encoding of the audited range.
+    ``mac`` is exactly 32 bytes — ``HMAC-SHA256(key, b"NPBJ12" + C)`` where
+    ``C`` is the canonical compact encoding of the first four fields (the
+    version, lowercase-hex start, lowercase-hex digest and lowercase-hex
+    end, without ``mac``), the prefix and ``C`` concatenated directly with
+    no separator or length prefix. Instances are frozen, constructed
+    positionally in field order and compare equal by their fields. A field
+    of the wrong type raises :class:`TypeError`; every other contract
+    violation raises :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    start: bytes
+    digest: bytes
+    end: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("range receipt version must be an integer")
+        if self.version != 1:
+            raise ValueError("range receipt version must be 1")
+        if not isinstance(self.start, bytes):
+            raise TypeError("range receipt start must be bytes")
+        _require_range_receipt_frontier(self.start, "start", allow_empty=True)
+        if not isinstance(self.digest, bytes):
+            raise TypeError("range receipt digest must be bytes")
+        if len(self.digest) != 32:
+            raise ValueError("range receipt digest must be exactly 32 bytes")
+        if not isinstance(self.end, bytes):
+            raise TypeError("range receipt end must be bytes")
+        _require_range_receipt_frontier(self.end, "end", allow_empty=False)
+        if not isinstance(self.mac, bytes):
+            raise TypeError("range receipt mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("range receipt mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, start, digest, end, mac]`` where ``start``, ``digest``,
+        ``end`` and ``mac`` are lowercase hex, no whitespace, no length
+        prefix."""
+        return _encode_payload(_range_receipt_content(self) + [self.mac.hex()])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "RangeReceipt":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, start, digest, end, mac]`` in that order,
+        ``version == 1``, ``start`` a lowercase hex string that is empty or
+        decodes to the canonical non-empty
+        :class:`JournalBatchReceiptFrontier` encoding, ``end`` a non-empty
+        lowercase hex string decoding to the canonical non-empty
+        :class:`JournalBatchReceiptFrontier` encoding, and ``digest``/``mac``
+        lowercase hex strings decoding to exactly 32 bytes each. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for byte,
+        so formatted JSON, whitespace and any non-canonical spelling are
+        rejected too. No MAC is verified here — neither the receipt MAC nor
+        the MACs of the carried checkpoints; pass the record to
+        :func:`audit_receipt` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("range receipt data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"range receipt is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "range receipt must be a JSON array of exactly version,"
+                " start, digest, end and mac"
+            )
+        raw_version, raw_start, raw_digest, raw_end, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError("range receipt version must be an integer")
+        if raw_version != 1:
+            raise ValueError("range receipt version must be 1")
+        start = _parse_bit_map_hex(raw_start, "range receipt start")
+        _require_range_receipt_frontier(start, "start", allow_empty=True)
+        digest = _parse_bit_map_hex(raw_digest, "range receipt digest")
+        if len(digest) != 32:
+            raise ValueError(
+                "range receipt digest must decode to exactly 32 bytes"
+            )
+        end = _parse_bit_map_hex(raw_end, "range receipt end")
+        _require_range_receipt_frontier(end, "end", allow_empty=False)
+        mac = _parse_bit_map_hex(raw_mac, "range receipt mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "range receipt mac must decode to exactly 32 bytes"
+            )
+        record = cls(version=1, start=start, digest=digest, end=end, mac=mac)
+        if record.to_bytes() != data:
+            raise ValueError("range receipt encoding is not canonical")
+        return record
+
+
+def _coerce_range_receipt(x: object, name: str) -> "RangeReceipt":
+    """Coerce a :class:`RangeReceipt` or its canonical bytes, splitting the
+    TypeError/ValueError contract exactly as the public auditors do: the
+    wrong kind of argument raises :class:`TypeError`, a field-shape failure
+    surfacing while parsing byte content of the right kind is a value
+    error."""
+    if isinstance(x, RangeReceipt):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return RangeReceipt.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the range receipt field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a RangeReceipt instance or its canonical bytes"
+    )
+
+
 class CommitRangeAuditor:
     """Stateful auditor chaining verified :class:`CommitRange` proofs into
     one monotone, restartable :class:`JournalBatchReceiptFrontier`
@@ -8022,6 +8215,16 @@ class CommitRangeAuditor:
     :class:`TypeError`), leaves the checkpoint untouched and returns no
     partial result, and concurrent audits linearize in lock-acquisition
     order.
+
+    :meth:`commit` performs the same locked audit and atomic advance and,
+    only once the checkpoint replacement has succeeded, seals the committed
+    range as a :class:`RangeReceipt` — carrying the range's start (the
+    empty byte string when the range started from nothing), the
+    ``SHA256`` of the range's canonical
+    :meth:`CommitRange.to_bytes` encoding, the canonical encoding of the
+    new checkpoint frontier and the ``NPBJ12`` receipt MAC — so the
+    commitment can be re-checked later with :func:`audit_receipt`. A failed
+    commit changes nothing and produces no receipt.
     """
 
     def __init__(self, key: object, *, checkpoint: object = None) -> None:
@@ -8063,6 +8266,41 @@ class CommitRangeAuditor:
         back to a new auditor to survive a restart."""
         return self._frontier
 
+    def _advance_locked(self, record: "CommitRange") -> "tuple[bytes, JournalBatchReceiptFrontier]":
+        """Re-verify ``record`` and atomically replace the checkpoint.
+
+        Must be called with the auditor lock held. Returns the range's
+        start bytes (the empty byte string when it started from nothing)
+        and the new checkpoint frontier at the range's end. On any failure
+        the checkpoint is left untouched."""
+        # audit_range is a pure check: the NPBJ11 range MAC, every
+        # carried commit pair replayed per NPBJ10 from the body's S,
+        # and the replayed final frontier matched against E.
+        final = audit_range(record, self._key)
+        start, _, _ = _parse_commit_range_body(record.body)
+        current = (
+            b"" if self._frontier is None else self._frontier.to_bytes()
+        )
+        if start != current:
+            raise ValueError(
+                "commit range start does not match the checkpoint"
+            )
+        current_sequence = (
+            0 if self._frontier is None else self._frontier.sequence
+        )
+        if current_sequence >= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "commit range auditor sequence would overflow the"
+                " unsigned 64-bit range"
+            )
+        if final.sequence <= current_sequence:
+            raise ValueError(
+                "commit range end sequence does not strictly advance"
+                " the checkpoint"
+            )
+        self._frontier = final
+        return start, final
+
     def audit(self, x: object) -> "CommitRangeAuditor":
         """Audit one :class:`CommitRange` and advance the checkpoint.
 
@@ -8083,33 +8321,98 @@ class CommitRangeAuditor:
         """
         with self._lock:
             record = _coerce_commit_range(x, "x")
-            # audit_range is a pure check: the NPBJ11 range MAC, every
-            # carried commit pair replayed per NPBJ10 from the body's S,
-            # and the replayed final frontier matched against E.
-            final = audit_range(record, self._key)
-            start, _, _ = _parse_commit_range_body(record.body)
-            current = (
-                b"" if self._frontier is None else self._frontier.to_bytes()
-            )
-            if start != current:
-                raise ValueError(
-                    "commit range start does not match the checkpoint"
-                )
-            current_sequence = (
-                0 if self._frontier is None else self._frontier.sequence
-            )
-            if current_sequence >= 0xFFFFFFFFFFFFFFFF:
-                raise ValueError(
-                    "commit range auditor sequence would overflow the"
-                    " unsigned 64-bit range"
-                )
-            if final.sequence <= current_sequence:
-                raise ValueError(
-                    "commit range end sequence does not strictly advance"
-                    " the checkpoint"
-                )
-            self._frontier = final
+            self._advance_locked(record)
             return self
+
+    def commit(self, x: object) -> "RangeReceipt":
+        """Audit one :class:`CommitRange`, advance the checkpoint and seal
+        the commitment as a :class:`RangeReceipt`.
+
+        ``x`` must be a :class:`CommitRange` or its canonical
+        :meth:`CommitRange.to_bytes` encoding — any other type raises
+        :class:`TypeError`; every contract violation :meth:`audit` rejects
+        raises :class:`ValueError` here too. The whole range is audited
+        under the auditor lock exactly as :meth:`audit` audits it and the
+        checkpoint atomically advanced in the same step; only once the
+        checkpoint replacement has succeeded is the receipt produced: its
+        ``start`` is the range's start (the empty byte string when the
+        range started from nothing), its ``digest`` the ``SHA256`` of the
+        range's canonical :meth:`CommitRange.to_bytes` encoding, its
+        ``end`` the canonical encoding of the new checkpoint frontier and
+        its ``mac`` the ``NPBJ12`` receipt MAC
+        ``HMAC-SHA256(key, b"NPBJ12" + C)``. A failed commit changes
+        nothing and produces no receipt, and concurrent commits and audits
+        linearize in lock-acquisition order. The returned receipt is
+        frozen and stores no key material; pass it with the range and the
+        shared key to :func:`audit_receipt` to re-verify the commitment.
+        """
+        with self._lock:
+            record = _coerce_commit_range(x, "x")
+            start, final = self._advance_locked(record)
+            receipt = RangeReceipt(
+                version=1,
+                start=start,
+                digest=hashlib.sha256(record.to_bytes()).digest(),
+                end=final.to_bytes(),
+                mac=b"\x00" * 32,
+            )
+            return replace(
+                receipt,
+                mac=_range_receipt_mac(self._key, receipt),
+            )
+
+
+def audit_receipt(
+    r: object, x: object, key: object
+) -> "JournalBatchReceiptFrontier":
+    """Re-verify a :class:`RangeReceipt` against its :class:`CommitRange`
+    and the shared ``key``.
+
+    ``r`` must be a :class:`RangeReceipt` or its canonical
+    :meth:`RangeReceipt.to_bytes` encoding, ``x`` the :class:`CommitRange`
+    it attests or its canonical :meth:`CommitRange.to_bytes` encoding and
+    ``key`` the non-empty shared ``bytes`` key — a wrong-typed argument
+    raises :class:`TypeError`, every other contract violation raises
+    :class:`ValueError`. The receipt MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPBJ12" + C)`` over the canonical encoding of the
+    receipt's first four fields, the range digest recomputed as
+    ``SHA256(x.to_bytes())`` and the receipt's ``start``/``end`` matched
+    against the range body's ``S``/``E`` — all four always recomputed and
+    each compared in constant time before any result is consulted. The
+    range itself is then re-verified exactly as :func:`audit_range`
+    verifies it — the ``NPBJ11`` range MAC, every carried ``[R, B]`` pair
+    replayed per ``NPBJ10`` and the replayed final frontier matched
+    against the body's ``E``. Auditing is a pure check: it touches no
+    auditor state and returns no partial result — on success the frozen
+    :class:`JournalBatchReceiptFrontier` at the range's end is returned.
+    """
+    receipt = _coerce_range_receipt(r, "r")
+    record = _coerce_commit_range(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    start, _, end = _parse_commit_range_body(record.body)
+    # The receipt MAC, the range digest and the two endpoints are all
+    # always recomputed/compared in constant time before any result is
+    # consulted.
+    mac_ok = hmac.compare_digest(
+        _range_receipt_mac(key, receipt), receipt.mac
+    )
+    digest_ok = hmac.compare_digest(
+        hashlib.sha256(record.to_bytes()).digest(), receipt.digest
+    )
+    start_ok = hmac.compare_digest(receipt.start, start)
+    end_ok = hmac.compare_digest(receipt.end, end)
+    if not mac_ok or not digest_ok or not start_ok or not end_ok:
+        raise ValueError(
+            "range receipt mac, range digest or endpoints do not match"
+        )
+    # Verifying the range re-verifies its NPBJ11 MAC, every MAC layer of
+    # both endpoint frontiers and the whole carried commit chain,
+    # returning the frozen frontier at the range end (it itself raises
+    # ValueError if the replayed frontier does not equal that end).
+    return audit_range(record, key)
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
