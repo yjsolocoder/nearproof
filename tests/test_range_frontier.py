@@ -647,5 +647,244 @@ class RangeAuditorAuditTest(unittest.TestCase):
         self.assertIsNone(RangeAuditor(KEY).state)
 
 
+class RangeAuditorAuditBatchTest(unittest.TestCase):
+    def test_batch_returns_self_and_commits_whole_chain(self):
+        auditor = RangeAuditor(KEY)
+        result = auditor.audit_batch(
+            [(RECEIPT_R1, RANGE_1), (RECEIPT_RCP, RANGE_FROM_CP)]
+        )
+        self.assertIs(result, auditor)
+        self.assertEqual(auditor.state, RFRONTIER_2)
+
+    def test_batch_matches_sequential_audits(self):
+        batched = RangeAuditor(KEY)
+        batched.audit_batch(
+            [(RECEIPT_R1, RANGE_1), (RECEIPT_RCP, RANGE_FROM_CP)]
+        )
+        sequential = RangeAuditor(KEY)
+        sequential.audit(RECEIPT_R1, RANGE_1)
+        sequential.audit(RECEIPT_RCP, RANGE_FROM_CP)
+        self.assertEqual(batched.state, sequential.state)
+
+    def test_single_item_batch_from_checkpoint(self):
+        auditor = RangeAuditor(KEY, checkpoint=RFRONTIER_1)
+        self.assertIs(
+            auditor.audit_batch([(RECEIPT_RCP, RANGE_FROM_CP)]), auditor
+        )
+        self.assertEqual(auditor.state, RFRONTIER_2)
+
+    def test_accepts_canonical_bytes_and_pairs_as_lists(self):
+        auditor = RangeAuditor(KEY)
+        auditor.audit_batch(
+            [
+                [RECEIPT_R1.to_bytes(), RANGE_1.to_bytes()],
+                (RECEIPT_RCP, RANGE_FROM_CP),
+            ]
+        )
+        self.assertEqual(auditor.state, RFRONTIER_2)
+
+    def test_accepts_single_pass_generators(self):
+        auditor = RangeAuditor(KEY)
+        auditor.audit_batch(
+            (RECEIPT_R1, RANGE_1) for _ in range(1)
+        )
+        self.assertEqual(auditor.state, RFRONTIER_1)
+
+    def test_empty_batch_rejected_and_changes_nothing(self):
+        auditor = RangeAuditor(KEY)
+        for empty in ([], (), iter([]), b""):
+            with self.subTest(empty=empty):
+                with self.assertRaises(ValueError):
+                    auditor.audit_batch(empty)
+        self.assertIsNone(auditor.state)
+
+    def test_non_iterable_items_is_type_error(self):
+        auditor = RangeAuditor(KEY)
+        for bad in (None, 42, 3.5, object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    auditor.audit_batch(bad)
+        self.assertIsNone(auditor.state)
+
+    def test_non_pair_items_are_type_error(self):
+        auditor = RangeAuditor(KEY)
+        for bad in (
+            [()],
+            [(RECEIPT_R1,)],
+            [(RECEIPT_R1, RANGE_1, RECEIPT_RCP)],
+            [42],
+            ["ab"],
+            [b"xy"],
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    auditor.audit_batch(bad)
+        self.assertIsNone(auditor.state)
+
+    def test_wrong_pair_member_kind_is_type_error(self):
+        auditor = RangeAuditor(KEY)
+        for bad in (
+            [(RECEIPT_R1, 7)],
+            [(7, RANGE_1)],
+            [(None, None)],
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    auditor.audit_batch(bad)
+        self.assertIsNone(auditor.state)
+
+    def test_malformed_member_bytes_is_value_error(self):
+        auditor = RangeAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_batch([(b"not-json", RANGE_1)])
+        with self.assertRaises(ValueError):
+            auditor.audit_batch([(RECEIPT_R1, b"not-json")])
+        self.assertIsNone(auditor.state)
+
+    def test_wrong_key_rejected(self):
+        with self.assertRaises(ValueError):
+            RangeAuditor(OTHER_KEY).audit_batch(
+                [(RECEIPT_R1, RANGE_1)]
+            )
+
+    def test_tampered_receipt_rejected(self):
+        import dataclasses
+
+        tampered = dataclasses.replace(RECEIPT_R1, mac=b"\xff" * 32)
+        auditor = RangeAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_batch([(tampered, RANGE_1)])
+        self.assertIsNone(auditor.state)
+
+    def test_first_receipt_must_start_empty(self):
+        auditor = RangeAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_batch([(RECEIPT_RCP, RANGE_FROM_CP)])
+        self.assertIsNone(auditor.state)
+
+    def test_first_receipt_must_match_checkpoint_end(self):
+        auditor = RangeAuditor(KEY, checkpoint=RFRONTIER_1)
+        with self.assertRaises(ValueError):
+            auditor.audit_batch([(RECEIPT_R1, RANGE_1)])
+        self.assertEqual(auditor.state, RFRONTIER_1)
+
+    def test_broken_internal_link_rolls_back(self):
+        # The second receipt carries an empty start instead of the first
+        # receipt's end, so the batch must fail between items and commit
+        # nothing.
+        broken = range_receipt_for(
+            RANGE_FROM_CP, b"", CFRONTIER_2.to_bytes()
+        )
+        auditor = RangeAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_batch(
+                [(RECEIPT_R1, RANGE_1), (broken, RANGE_FROM_CP)]
+            )
+        self.assertIsNone(auditor.state)
+
+    def test_mid_batch_replay_rolls_back_and_auditor_recovers(self):
+        auditor = RangeAuditor(KEY)
+        with self.assertRaises(ValueError):
+            auditor.audit_batch(
+                [(RECEIPT_R1, RANGE_1), (RECEIPT_R1, RANGE_1)]
+            )
+        self.assertIsNone(auditor.state)
+        # No partial advancement: the same first receipt audits fine
+        # afterwards.
+        auditor.audit_batch([(RECEIPT_R1, RANGE_1)])
+        self.assertEqual(auditor.state, RFRONTIER_1)
+
+    def test_replayed_batch_after_success_rejected(self):
+        auditor = RangeAuditor(KEY)
+        auditor.audit_batch(
+            [(RECEIPT_R1, RANGE_1), (RECEIPT_RCP, RANGE_FROM_CP)]
+        )
+        with self.assertRaises(ValueError):
+            auditor.audit_batch([(RECEIPT_R1, RANGE_1)])
+        self.assertEqual(auditor.state, RFRONTIER_2)
+
+    def test_sequence_overflow_rolls_back(self):
+        maxed = range_frontier_for(
+            U64_MAX, CFRONTIER_1.to_bytes(), RDIGEST_1
+        )
+        auditor = RangeAuditor(KEY, checkpoint=maxed)
+        with self.assertRaises(ValueError):
+            auditor.audit_batch([(RECEIPT_RCP, RANGE_FROM_CP)])
+        self.assertIs(auditor.state, maxed)
+        # An overflow reached only on the second item must discard the
+        # first item's temporary advancement too.
+        near = range_frontier_for(
+            U64_MAX - 1, CFRONTIER_1.to_bytes(), RDIGEST_1
+        )
+        partial = RangeAuditor(KEY, checkpoint=near)
+        with self.assertRaises(ValueError):
+            partial.audit_batch(
+                [(RECEIPT_RCP, RANGE_FROM_CP), (RECEIPT_RCP, RANGE_FROM_CP)]
+            )
+        self.assertIs(partial.state, near)
+
+    def test_audit_and_audit_batch_linearize_together(self):
+        auditor = RangeAuditor(KEY)
+        successes, failures = [], []
+        barrier = threading.Barrier(6)
+
+        def run(use_batch):
+            barrier.wait()
+            try:
+                if use_batch:
+                    auditor.audit_batch([(RECEIPT_R1, RANGE_1)])
+                else:
+                    auditor.audit(RECEIPT_R1, RANGE_1)
+                successes.append(1)
+            except ValueError:
+                failures.append(1)
+
+        threads = [
+            threading.Thread(target=run, args=(index % 2 == 0,))
+            for index in range(6)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 5)
+        self.assertEqual(auditor.state, RFRONTIER_1)
+
+    def test_competing_batches_linearize(self):
+        auditor = RangeAuditor(KEY)
+        successes, failures = [], []
+        barrier = threading.Barrier(4)
+
+        def run():
+            barrier.wait()
+            try:
+                auditor.audit_batch(
+                    [(RECEIPT_R1, RANGE_1), (RECEIPT_RCP, RANGE_FROM_CP)]
+                )
+                successes.append(1)
+            except ValueError:
+                failures.append(1)
+
+        threads = [threading.Thread(target=run) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 3)
+        self.assertEqual(auditor.state, RFRONTIER_2)
+
+    def test_state_exported_after_batch_restarts(self):
+        auditor = RangeAuditor(KEY)
+        auditor.audit_batch(
+            [(RECEIPT_R1, RANGE_1), (RECEIPT_RCP, RANGE_FROM_CP)]
+        )
+        restored = RangeAuditor(
+            KEY, checkpoint=auditor.state.to_bytes()
+        )
+        self.assertEqual(restored.state, RFRONTIER_2)
+
+
 if __name__ == "__main__":
     unittest.main()
