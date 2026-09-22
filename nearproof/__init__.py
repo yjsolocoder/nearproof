@@ -17,7 +17,7 @@ JournalBatchReceiptFrontier /
 Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
 RangeBatchReceipt /
 RangeDecision / RangeFrontier / RangeReceipt / RangeReceiptBatch /
-SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList
+ReceiptStream / SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList
 / Verifier /
 VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_b / audit_bound /
@@ -27,12 +27,12 @@ audit_map_history_evidence / audit_map_history_journal_bundle /
 audit_map_history_journal_receipt /
 audit_map_update /
 audit_proof / audit_range / audit_receipt /
-audit_batch_receipt / audit_range_receipt_batch /
+audit_batch_receipt / audit_range_receipt_batch / audit_stream /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
 revoke_context / revoke_observation / revoke_trust / seal_map_history /
-seal_map_history_journal_bundle / seal_range.
+seal_map_history_journal_bundle / seal_range / seal_stream.
 """
 
 from __future__ import annotations
@@ -99,6 +99,7 @@ __all__ = [
     "RangeFrontier",
     "RangeReceipt",
     "RangeReceiptBatch",
+    "ReceiptStream",
     "SPEED_OF_LIGHT_MPS",
     "TrustRevocation",
     "TrustRevocationList",
@@ -125,6 +126,7 @@ __all__ = [
     "audit_range",
     "audit_range_receipt_batch",
     "audit_receipt",
+    "audit_stream",
     "cert",
     "locate",
     "locate_attested",
@@ -142,6 +144,7 @@ __all__ = [
     "seal_map_history_journal_receipt_batch",
     "seal_range",
     "seal_range_receipt_batch",
+    "seal_stream",
 ]
 
 SPEED_OF_LIGHT_MPS = 299_792_458.0
@@ -222,6 +225,8 @@ _RANGE_BATCH_RECEIPT_PREFIX = b"NPBJ16"
 # frontier MAC and the batch digest-chain step respectively.
 _RANGE_BATCH_RECEIPT_FRONTIER_MAC_PREFIX = b"NPBJ17"
 _RANGE_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPBJ18"
+# Domain separation prefix for the receipt-stream MAC.
+_RECEIPT_STREAM_PREFIX = b"NPBJ19"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -10280,6 +10285,468 @@ class RangeBatchReceiptAuditor:
                 ),
             )
             return self
+
+
+def _receipt_stream_content(stream: "ReceiptStream") -> list:
+    """The JSON-ready first four receipt-stream fields (everything but
+    ``mac``)."""
+    return [
+        stream.version,
+        stream.start.hex(),
+        [
+            [receipt.hex(), batch.hex()]
+            for receipt, batch in stream.items
+        ],
+        stream.end.hex(),
+    ]
+
+
+def _receipt_stream_content_bytes(stream: "ReceiptStream") -> bytes:
+    """The canonical compact encoding ``C`` of the first four
+    receipt-stream fields."""
+    return _encode_payload(_receipt_stream_content(stream))
+
+
+def _receipt_stream_mac(key: bytes, stream: "ReceiptStream") -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ19" + C)`` where ``C`` is the canonical
+    encoding of the first four fields. The prefix and ``C`` are
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _RECEIPT_STREAM_PREFIX + _receipt_stream_content_bytes(stream),
+        hashlib.sha256,
+    ).digest()
+
+
+def _require_receipt_stream_frontier(
+    value: bytes, name: str, allow_empty: bool
+) -> None:
+    """Enforce the canonical-:class:`RangeBatchReceiptFrontier`-bytes
+    contract of a receipt-stream endpoint.
+
+    ``value`` is already known to be ``bytes``; when ``allow_empty``
+    holds, ``b""`` (the stream starts with no committed batch receipt at
+    all) is also accepted. :meth:`RangeBatchReceiptFrontier.from_bytes`
+    enforces the full contract including its canonical re-encoding
+    check, and every violation — including the field-shape
+    :class:`TypeError` a malformed inner document would otherwise
+    surface — raises :class:`ValueError`."""
+    if allow_empty and value == b"":
+        return
+    try:
+        RangeBatchReceiptFrontier.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        suffix = " or empty" if allow_empty else ""
+        raise ValueError(
+            f"receipt stream {name} must be the canonical"
+            f" RangeBatchReceiptFrontier encoding{suffix}"
+        ) from error
+
+
+def _require_receipt_stream_receipt(value: bytes) -> None:
+    """Enforce the canonical-:class:`RangeBatchReceipt`-bytes contract of
+    a stream ``items`` receipt.
+
+    ``value`` is already known to be ``bytes``; every violation —
+    including the field-shape :class:`TypeError` a malformed inner
+    document would otherwise surface — raises :class:`ValueError`."""
+    try:
+        RangeBatchReceipt.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "receipt stream items receipts must be the canonical"
+            " RangeBatchReceipt encoding"
+        ) from error
+
+
+def _require_receipt_stream_batch(value: bytes) -> None:
+    """Enforce the canonical-:class:`RangeReceiptBatch`-bytes contract of
+    a stream ``items`` batch.
+
+    ``value`` is already known to be ``bytes``; every violation —
+    including the field-shape :class:`TypeError` a malformed inner
+    document would otherwise surface — raises :class:`ValueError`."""
+    try:
+        RangeReceiptBatch.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "receipt stream items batches must be the canonical"
+            " RangeReceiptBatch encoding"
+        ) from error
+
+
+@dataclass(frozen=True)
+class ReceiptStream:
+    """A key-MAC'd stream sealing one contiguous audited
+    :class:`RangeBatchReceipt`/:class:`RangeReceiptBatch` commit chain
+    against the range-batch receipt frontier.
+
+    ``version`` is always ``1``. ``start`` is the canonical
+    :meth:`RangeBatchReceiptFrontier.to_bytes` encoding of the commit
+    frontier the chain starts from, or ``b""`` when the chain starts
+    with no committed batch receipt at all (sequence zero, the digest
+    chain rooted at ``d0``). ``items`` is a non-empty ordered tuple of
+    ``(receipt, batch)`` pairs — the canonical
+    :meth:`RangeBatchReceipt.to_bytes` bytes of each audited batch
+    receipt together with the canonical
+    :meth:`RangeReceiptBatch.to_bytes` bytes of the
+    :class:`RangeReceiptBatch` it attests, to replay in order. ``end``
+    is the canonical non-empty
+    :meth:`RangeBatchReceiptFrontier.to_bytes` encoding of the commit
+    frontier the chain ends at. ``mac`` is exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPBJ19" + C)`` where ``C`` is the canonical
+    compact encoding of the first four fields (the version, the
+    lowercase-hex start, the array of lowercase-hex receipt/batch pairs
+    and the lowercase-hex end, without ``mac``), the prefix and ``C``
+    concatenated directly with no separator or length prefix. Instances
+    are frozen, constructed positionally in field order and compare
+    equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    start: bytes
+    items: tuple
+    end: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "receipt stream version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError("receipt stream version must be 1")
+        if not isinstance(self.start, bytes):
+            raise TypeError("receipt stream start must be bytes")
+        _require_receipt_stream_frontier(
+            self.start, "start", allow_empty=True
+        )
+        if not isinstance(self.items, tuple):
+            raise TypeError("receipt stream items must be a tuple")
+        if not self.items:
+            raise ValueError("receipt stream items must be non-empty")
+        for item in self.items:
+            if not isinstance(item, tuple):
+                raise TypeError(
+                    "receipt stream items entries must be tuples"
+                )
+            if len(item) != 2:
+                raise ValueError(
+                    "receipt stream items entries must be"
+                    " (receipt, batch) pairs"
+                )
+            receipt, batch = item
+            if not isinstance(receipt, bytes):
+                raise TypeError(
+                    "receipt stream items receipts must be bytes"
+                )
+            _require_receipt_stream_receipt(receipt)
+            if not isinstance(batch, bytes):
+                raise TypeError(
+                    "receipt stream items batches must be bytes"
+                )
+            _require_receipt_stream_batch(batch)
+        if not isinstance(self.end, bytes):
+            raise TypeError("receipt stream end must be bytes")
+        _require_receipt_stream_frontier(
+            self.end, "end", allow_empty=False
+        )
+        if not isinstance(self.mac, bytes):
+            raise TypeError("receipt stream mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError(
+                "receipt stream mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, start, items, end, mac]`` where ``start``, ``end`` and
+        ``mac`` are lowercase hex and ``items`` is the array of the
+        lowercase-hex ``[receipt, batch]`` canonical encoding pairs, no
+        whitespace, no length prefix."""
+        return _encode_payload(
+            _receipt_stream_content(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ReceiptStream":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, start, items, end, mac]`` in that order,
+        ``version == 1``, ``start`` a lowercase hex string that is empty
+        or decodes to the canonical
+        :class:`RangeBatchReceiptFrontier` encoding, ``items`` a
+        non-empty array of ``[receipt, batch]`` pairs of lowercase hex
+        strings decoding to the canonical :class:`RangeBatchReceipt`
+        and :class:`RangeReceiptBatch` encodings, ``end`` a lowercase
+        hex string decoding to the canonical non-empty
+        :class:`RangeBatchReceiptFrontier` encoding and ``mac`` a
+        lowercase hex string decoding to exactly 32 bytes. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical
+        spelling are rejected too. No MAC is verified here — neither
+        the stream MAC nor any MAC of the carried receipts, batches or
+        frontiers; pass the record to :func:`audit_stream` with the
+        shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("receipt stream data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"receipt stream is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "receipt stream must be a JSON array of exactly"
+                " version, start, items, end and mac"
+            )
+        raw_version, raw_start, raw_items, raw_end, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "receipt stream version must be an integer"
+            )
+        if raw_version != 1:
+            raise ValueError("receipt stream version must be 1")
+        start = _parse_bit_map_hex(raw_start, "receipt stream start")
+        _require_receipt_stream_frontier(
+            start, "start", allow_empty=True
+        )
+        if not isinstance(raw_items, list):
+            raise TypeError(
+                "receipt stream items must be an array"
+            )
+        if not raw_items:
+            raise ValueError("receipt stream items must be non-empty")
+        items = []
+        for raw_item in raw_items:
+            if not isinstance(raw_item, list):
+                raise TypeError(
+                    "receipt stream items entries must be arrays"
+                )
+            if len(raw_item) != 2:
+                raise ValueError(
+                    "receipt stream items entries must be"
+                    " [receipt, batch] pairs"
+                )
+            raw_receipt, raw_batch = raw_item
+            receipt = _parse_bit_map_hex(
+                raw_receipt, "receipt stream items receipts"
+            )
+            _require_receipt_stream_receipt(receipt)
+            batch = _parse_bit_map_hex(
+                raw_batch, "receipt stream items batches"
+            )
+            _require_receipt_stream_batch(batch)
+            items.append((receipt, batch))
+        end = _parse_bit_map_hex(raw_end, "receipt stream end")
+        _require_receipt_stream_frontier(end, "end", allow_empty=False)
+        mac = _parse_bit_map_hex(raw_mac, "receipt stream mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "receipt stream mac must decode to exactly 32 bytes"
+            )
+        record_obj = cls(
+            version=1,
+            start=start,
+            items=tuple(items),
+            end=end,
+            mac=mac,
+        )
+        if record_obj.to_bytes() != data:
+            raise ValueError(
+                "receipt stream encoding is not canonical"
+            )
+        return record_obj
+
+
+def _coerce_receipt_stream(x: object, name: str) -> "ReceiptStream":
+    """Coerce a :class:`ReceiptStream` or its canonical bytes,
+    splitting the TypeError/ValueError contract exactly as the public
+    auditors do: the wrong kind of argument raises :class:`TypeError`,
+    a field-shape failure surfacing while parsing byte content of the
+    right kind is a value error."""
+    if isinstance(x, ReceiptStream):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return ReceiptStream.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the receipt stream field"
+                " contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a ReceiptStream instance or its canonical"
+        " bytes"
+    )
+
+
+def seal_stream(
+    items: object, key: object, *, checkpoint: object = None
+) -> "ReceiptStream":
+    """Audit a contiguous chain of committed :class:`RangeBatchReceipt`
+    pairs against the range-batch receipt frontier and seal it as a
+    stream.
+
+    ``items`` must be a non-empty iterable of ``(receipt, batch)``
+    pairs whose receipt is each a :class:`RangeBatchReceipt` or its
+    canonical :meth:`RangeBatchReceipt.to_bytes` encoding and whose
+    batch is the attested :class:`RangeReceiptBatch` or its canonical
+    :meth:`RangeReceiptBatch.to_bytes` encoding, and ``key`` the
+    non-empty shared ``bytes`` key. ``checkpoint`` is keyword-only:
+    ``None`` (the default) starts the chain with no committed batch
+    receipt at all — sequence zero, the digest chain rooted at ``d0``
+    — otherwise it must be the canonical
+    :meth:`RangeBatchReceiptFrontier.to_bytes` bytes (a
+    :class:`RangeBatchReceiptFrontier` instance is not accepted here).
+    A non-iterable ``items``, a non-``bytes`` ``key`` or
+    ``checkpoint``, a non-unpackable pair entry or a wrong-typed pair
+    member raises :class:`TypeError`; an empty sequence, an empty key,
+    a pair of the wrong arity, a malformed or non-canonical encoding,
+    a MAC mismatch, a failed receipt/batch audit, a sequence overflow
+    or a broken chain raises :class:`ValueError`. The whole chain is
+    verified first — exactly as :class:`RangeBatchReceiptAuditor`
+    audits it with
+    :meth:`RangeBatchReceiptAuditor.audit`, starting from the supplied
+    checkpoint — and only on success is the stream produced purely by
+    computation: ``start`` carries the starting point (``b""`` when
+    ``checkpoint`` is ``None``, else the checkpoint bytes), ``items``
+    the canonical encoding pair of every receipt and its batch in
+    order and ``end`` the canonical encoding of the final range-batch
+    receipt frontier, MAC'd as ``HMAC-SHA256(key, b"NPBJ19" + C)``.
+    Sealing touches no auditor state.
+    """
+    try:
+        pairs = list(items)  # type: ignore[arg-type]
+    except TypeError:
+        raise TypeError(
+            "items must be an iterable of (receipt, batch) pairs"
+        ) from None
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if checkpoint is not None and not isinstance(checkpoint, bytes):
+        raise TypeError(
+            "checkpoint must be the canonical"
+            " RangeBatchReceiptFrontier bytes or None"
+        )
+    # Constructing the auditor verifies a non-None canonical-bytes
+    # checkpoint at six MAC layers (a malformed or mismatched encoding
+    # raises ValueError); the kind and emptiness contracts above are
+    # already enforced.
+    auditor = RangeBatchReceiptAuditor(key, checkpoint=checkpoint)
+    coerced = []
+    for pair in pairs:
+        try:
+            raw_receipt, raw_batch = pair
+        except TypeError:
+            raise TypeError(
+                "items entries must be (receipt, batch) pairs"
+            ) from None
+        except ValueError:
+            raise ValueError(
+                "items entries must be (receipt, batch) pairs"
+            ) from None
+        coerced.append(
+            (
+                _coerce_range_batch_receipt(
+                    raw_receipt, "items receipts"
+                ),
+                _coerce_range_receipt_batch(
+                    raw_batch, "items batches"
+                ),
+            )
+        )
+    if not coerced:
+        raise ValueError("items must be a non-empty sequence")
+    # audit replays the whole chain on a temporary frontier seeded with
+    # the checkpoint and raises before any state is adopted, so a
+    # mid-chain failure surfaces here and nothing is sealed.
+    for receipt, batch in coerced:
+        auditor.audit(receipt, batch)
+    start = b"" if checkpoint is None else checkpoint
+    final = auditor.state
+    stream = ReceiptStream(
+        version=1,
+        start=start,
+        items=tuple(
+            (receipt.to_bytes(), batch.to_bytes())
+            for receipt, batch in coerced
+        ),
+        end=final.to_bytes(),  # type: ignore[union-attr]
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        stream, mac=_receipt_stream_mac(key, stream)
+    )
+
+
+def audit_stream(x: object, key: object) -> bytes:
+    """Re-verify a :class:`ReceiptStream` against ``key``.
+
+    ``x`` must be a :class:`ReceiptStream` or its canonical
+    :meth:`ReceiptStream.to_bytes` encoding and ``key`` the non-empty
+    shared ``bytes`` key — a wrong-typed argument raises
+    :class:`TypeError`, every other contract violation raises
+    :class:`ValueError`. The stream MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPBJ19" + C)`` and compared in constant
+    time; the declared ``end`` commit frontier is then checked at six
+    MAC layers — its own ``NPBJ17`` MAC and the five layers of its
+    ``end`` range frontier, all always recomputed and each compared in
+    constant time; then the carried receipt/batch pairs are replayed
+    one by one
+    exactly as :class:`RangeBatchReceiptAuditor` audits them: each
+    pair re-verified like :func:`audit_batch_receipt` (the ``NPBJ16``
+    receipt MAC, the batch digest, the endpoints and the whole carried
+    batch verification) and advanced per the ``NPBJ18`` digest-chain
+    rule, starting with no committed batch receipt at all when
+    ``start`` is empty and from the carried starting
+    :class:`RangeBatchReceiptFrontier` otherwise; the replayed final
+    frontier must equal the stream's ``end`` byte for byte. Auditing
+    is a pure check: it touches no auditor state and returns no
+    partial result — on success the canonical
+    :meth:`RangeBatchReceiptFrontier.to_bytes` bytes at the stream
+    ``end`` are returned.
+    """
+    stream = _coerce_receipt_stream(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _receipt_stream_mac(key, stream), stream.mac
+    ):
+        raise ValueError(
+            "receipt stream mac does not match the key"
+        )
+    # The declared end is checked at six MAC layers — the commit
+    # frontier's own NPBJ17 MAC and the five layers of its end range
+    # frontier — independently of the replay below.
+    _verify_range_batch_receipt_frontier_macs(
+        key, RangeBatchReceiptFrontier.from_bytes(stream.end)
+    )
+    auditor = RangeBatchReceiptAuditor(
+        key, checkpoint=stream.start if stream.start else None
+    )
+    for receipt, batch in stream.items:
+        auditor.audit(receipt, batch)
+    final = auditor.state
+    if final is None or final.to_bytes() != stream.end:
+        raise ValueError(
+            "receipt stream end does not match the replayed chain"
+        )
+    return final.to_bytes()
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
