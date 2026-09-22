@@ -6006,6 +6006,23 @@ class BitMapHistoryJournalReceiptAuditor:
     advance are one atomic step: a failed audit raises :class:`ValueError`
     and leaves the frontier untouched, and concurrent audits linearize in
     lock-acquisition order so a committed receipt is never lost.
+
+    :meth:`audit_batch` accepts one
+    :class:`BitMapHistoryJournalReceiptBatch` (or its canonical
+    :meth:`BitMapHistoryJournalReceiptBatch.to_bytes` encoding) sealing a
+    whole contiguous receipt chain and commits it as a single transaction
+    under the same lock: the batch ``NPBJ7`` MAC and every MAC layer of
+    both non-empty endpoint frontiers are re-verified in constant time
+    before any item is replayed, the batch ``start`` must equal the current
+    :attr:`checkpoint` byte for byte (``b""`` only when no receipt has
+    committed yet), the carried receipt/bundle pairs are replayed in order
+    on a temporary frontier, and only when every pair audits and the
+    temporary frontier's canonical bytes equal the batch ``end`` byte for
+    byte is the checkpoint replaced — a failed batch raises
+    :class:`ValueError` and changes nothing, and the same batch replayed is
+    rejected on its mismatching ``start``. :meth:`audit` and
+    :meth:`audit_batch` share the auditor lock, so single receipts and
+    batches linearize together.
     """
 
     def __init__(self, key: object, *, checkpoint: object = None) -> None:
@@ -6138,6 +6155,94 @@ class BitMapHistoryJournalReceiptAuditor:
                     self._key, candidate
                 ),
             )
+            return self
+
+    def audit_batch(self, x: object) -> "BitMapHistoryJournalReceiptAuditor":
+        """Audit one committed :class:`BitMapHistoryJournalReceiptBatch`
+        and commit the whole chain as a single transaction.
+
+        ``x`` must be a :class:`BitMapHistoryJournalReceiptBatch` or its
+        canonical :meth:`BitMapHistoryJournalReceiptBatch.to_bytes`
+        encoding — any other type raises :class:`TypeError`; a malformed or
+        non-canonical encoding, a batch MAC mismatch, an endpoint frontier
+        or state/table MAC mismatch, a ``start`` that does not equal the
+        current :attr:`checkpoint` byte for byte (``b""`` only before the
+        first committed receipt), a carried receipt or bundle that fails its
+        audit, a sequence that would overflow u64, or a replayed final
+        frontier that does not equal the batch ``end`` raises
+        :class:`ValueError`. Under the auditor lock the batch ``NPBJ7`` MAC
+        is recomputed and compared in constant time first; then every
+        non-empty endpoint frontier is checked at three MAC layers — the
+        frontier's own ``NPBJ5`` MAC and the two layers of its ``end``
+        state, the embedded checkpoint table's ``NPBL1`` MAC and the
+        state's own ``NPBJ1`` MAC, all always recomputed and each compared
+        in constant time — and only once all of that passes are the carried
+        receipt/bundle pairs replayed in order on a temporary frontier,
+        each exactly as :meth:`audit` audits it, with the digest chain
+        extending as ``SHA256(b"NPBJ6" + d + u64be(n) + R)``. The live
+        checkpoint is replaced once, and only when every pair audits and
+        the temporary frontier's canonical bytes equal the batch ``end``
+        byte for byte; a failed batch changes no state, so the same batch
+        replayed is afterwards rejected on its mismatching ``start``.
+        :meth:`audit` and :meth:`audit_batch` share the auditor lock and
+        linearize together in lock-acquisition order. Returns the auditor
+        itself.
+        """
+        with self._lock:
+            batch = _coerce_bit_map_history_journal_receipt_batch(x, "x")
+            # The batch NPBJ7 MAC is always recomputed and compared in
+            # constant time before anything else is consulted.
+            if not hmac.compare_digest(
+                _bit_map_history_journal_receipt_batch_mac(
+                    self._key, batch
+                ),
+                batch.mac,
+            ):
+                raise ValueError(
+                    "bit map history journal receipt batch mac does not"
+                    " match"
+                )
+            # Every non-empty endpoint is checked at three MAC layers — the
+            # frontier's own NPBJ5 MAC, the end state's NPBJ1 MAC and the
+            # embedded table's NPBL1 MAC — before any item is replayed.
+            if batch.start:
+                _verify_bit_map_history_journal_receipt_frontier_macs(
+                    self._key,
+                    BitMapHistoryJournalReceiptFrontier.from_bytes(
+                        batch.start
+                    ),
+                    "start",
+                )
+            _verify_bit_map_history_journal_receipt_frontier_macs(
+                self._key,
+                BitMapHistoryJournalReceiptFrontier.from_bytes(batch.end),
+                "end",
+            )
+            current = (
+                b""
+                if self._frontier is None
+                else self._frontier.to_bytes()
+            )
+            if batch.start != current:
+                raise ValueError(
+                    "bit map history journal receipt batch start does not"
+                    " match the frontier"
+                )
+            # Replay the whole chain on a temporary frontier; the live
+            # checkpoint is read but never mutated until the commit below.
+            candidate = BitMapHistoryJournalReceiptAuditor(
+                self._key,
+                checkpoint=batch.start if batch.start else None,
+            )
+            for receipt, bundle in batch.items:
+                candidate.audit(receipt, bundle)
+            final = candidate.checkpoint
+            if final is None or final.to_bytes() != batch.end:
+                raise ValueError(
+                    "bit map history journal receipt batch end does not"
+                    " match the replayed chain"
+                )
+            self._frontier = final
             return self
 
 
