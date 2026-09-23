@@ -17,8 +17,8 @@ JournalBatchReceiptFrontier /
 Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
 RangeBatchReceipt /
 RangeDecision / RangeFrontier / RangeReceipt / RangeReceiptBatch /
-ReceiptStream / SPEED_OF_LIGHT_MPS / TrustRevocation / TrustRevocationList
-/ Verifier /
+ReceiptStream / SPEED_OF_LIGHT_MPS / StreamReceipt / TrustRevocation /
+TrustRevocationList / Verifier /
 VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_b / audit_bound /
 audit_bound_policy /
@@ -28,6 +28,7 @@ audit_map_history_journal_receipt /
 audit_map_update /
 audit_proof / audit_range / audit_receipt /
 audit_batch_receipt / audit_range_receipt_batch / audit_stream /
+audit_stream_receipt /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
@@ -102,6 +103,7 @@ __all__ = [
     "RangeReceiptBatch",
     "ReceiptStream",
     "SPEED_OF_LIGHT_MPS",
+    "StreamReceipt",
     "TrustRevocation",
     "TrustRevocationList",
     "Verifier",
@@ -128,6 +130,7 @@ __all__ = [
     "audit_range_receipt_batch",
     "audit_receipt",
     "audit_stream",
+    "audit_stream_receipt",
     "cert",
     "locate",
     "locate_attested",
@@ -228,6 +231,8 @@ _RANGE_BATCH_RECEIPT_FRONTIER_MAC_PREFIX = b"NPBJ17"
 _RANGE_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPBJ18"
 # Domain separation prefix for the receipt-stream MAC.
 _RECEIPT_STREAM_PREFIX = b"NPBJ19"
+# Domain separation prefix for the stream-receipt MAC.
+_STREAM_RECEIPT_PREFIX = b"NPBJ20"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -10191,6 +10196,14 @@ class RangeBatchReceiptAuditor:
     final frontier equals the stream ``end`` byte for byte. A failed
     stream changes no state, so a stream replayed afterwards is
     rejected on its mismatching start.
+
+    :meth:`commit_stream` performs exactly :meth:`audit_stream` under
+    the same shared lock and, only once the commit has succeeded, mints
+    a :class:`StreamReceipt` over the committed stream: its digest is
+    ``SHA256(stream.to_bytes())`` and its MAC
+    ``HMAC-SHA256(key, b"NPBJ20" + C)`` over the canonical
+    ``[1, S, D, E]`` content. A failed stream raises before the state
+    is replaced and no receipt is produced.
     """
 
     def __init__(self, key: object, *, checkpoint: object = None) -> None:
@@ -10330,41 +10343,75 @@ class RangeBatchReceiptAuditor:
         lock and linearize together in lock-acquisition order. Returns
         the auditor itself.
         """
+        stream = _coerce_receipt_stream(x, "x")
         with self._lock:
-            stream = _coerce_receipt_stream(x, "x")
-            # The stream NPBJ19 MAC is always recomputed and compared
-            # in constant time before anything else is consulted.
-            if not hmac.compare_digest(
-                _receipt_stream_mac(self._key, stream), stream.mac
-            ):
-                raise ValueError(
-                    "receipt stream mac does not match the key"
-                )
-            current = (
-                b""
-                if self._frontier is None
-                else self._frontier.to_bytes()
+            return self._audit_stream_locked(stream)
+
+    def _audit_stream_locked(
+        self, stream: "ReceiptStream"
+    ) -> "RangeBatchReceiptAuditor":
+        """The locked body of :meth:`audit_stream`; ``stream`` is already
+        coerced and the caller already holds the auditor lock."""
+        # The stream NPBJ19 MAC is always recomputed and compared
+        # in constant time before anything else is consulted.
+        if not hmac.compare_digest(
+            _receipt_stream_mac(self._key, stream), stream.mac
+        ):
+            raise ValueError(
+                "receipt stream mac does not match the key"
             )
-            if stream.start != current:
-                raise ValueError(
-                    "receipt stream start does not match the frontier"
-                )
-            # Replay the whole chain on a temporary auditor seeded with
-            # the stream start; the live frontier is read but never
-            # mutated until the replayed final frontier is adopted.
-            candidate = RangeBatchReceiptAuditor(
-                self._key,
-                checkpoint=stream.start if stream.start else None,
+        current = (
+            b""
+            if self._frontier is None
+            else self._frontier.to_bytes()
+        )
+        if stream.start != current:
+            raise ValueError(
+                "receipt stream start does not match the frontier"
             )
-            for receipt, batch in stream.items:
-                candidate.audit(receipt, batch)
-            final = candidate.state
-            if final is None or final.to_bytes() != stream.end:
-                raise ValueError(
-                    "receipt stream end does not match the replayed chain"
-                )
-            self._frontier = final
-            return self
+        # Replay the whole chain on a temporary auditor seeded with
+        # the stream start; the live frontier is read but never
+        # mutated until the replayed final frontier is adopted.
+        candidate = RangeBatchReceiptAuditor(
+            self._key,
+            checkpoint=stream.start if stream.start else None,
+        )
+        for receipt, batch in stream.items:
+            candidate.audit(receipt, batch)
+        final = candidate.state
+        if final is None or final.to_bytes() != stream.end:
+            raise ValueError(
+                "receipt stream end does not match the replayed chain"
+            )
+        self._frontier = final
+        return self
+
+    def commit_stream(self, x: object) -> "StreamReceipt":
+        """Atomically commit one sealed :class:`ReceiptStream` and issue
+        a :class:`StreamReceipt` for the committed frontier.
+
+        ``x`` must be a :class:`ReceiptStream` or its canonical
+        :meth:`ReceiptStream.to_bytes` encoding — any other type raises
+        :class:`TypeError`; everything
+        :meth:`RangeBatchReceiptAuditor.audit_stream` rejects raises
+        :class:`ValueError`. The stream is committed exactly as
+        :meth:`audit_stream` commits it under the shared auditor lock —
+        stream ``NPBJ19`` MAC compared in constant time, start matched
+        against the current :attr:`state`, the whole carried chain
+        replayed on a temporary auditor and the live state replaced once
+        the replayed final frontier equals the stream ``end`` — and only
+        after the commit succeeds is the :class:`StreamReceipt` minted:
+        ``D = SHA256(stream.to_bytes())`` and
+        ``M = HMAC-SHA256(key, b"NPBJ20" + C)`` over the canonical
+        ``[1, S, D, E]`` encoding, both direct concatenations with no
+        length prefix. A failed stream raises before the state is
+        replaced and produces no receipt. Returns the minted
+        :class:`StreamReceipt`.
+        """
+        stream = _coerce_receipt_stream(x, "x")
+        with self._lock:
+            self._audit_stream_locked(stream)
+            return _mint_stream_receipt(self._key, stream)
 
 
 def _require_receipt_stream_frontier(
@@ -10786,6 +10833,269 @@ def audit_stream(x: object, key: object) -> bytes:
             "receipt stream end does not match the replayed chain"
         )
     return stream.end
+
+
+def _stream_receipt_content(receipt: "StreamReceipt") -> list:
+    """The JSON-ready first four stream-receipt fields (everything but
+    ``mac``)."""
+    return [
+        receipt.version,
+        receipt.start.hex(),
+        receipt.digest.hex(),
+        receipt.end.hex(),
+    ]
+
+
+def _stream_receipt_content_bytes(receipt: "StreamReceipt") -> bytes:
+    """The canonical compact encoding ``C`` of the first four
+    stream-receipt fields, ``[1, S, D, E]``."""
+    return _encode_payload(_stream_receipt_content(receipt))
+
+
+def _stream_receipt_digest(stream: "ReceiptStream") -> bytes:
+    """``D = SHA256(stream.to_bytes())`` over the stream's canonical
+    compact encoding."""
+    return hashlib.sha256(stream.to_bytes()).digest()
+
+
+def _stream_receipt_mac(key: bytes, receipt: "StreamReceipt") -> bytes:
+    """``M = HMAC-SHA256(key, b"NPBJ20" + C)`` where ``C`` is the
+    canonical ``[1, S, D, E]`` encoding. The prefix and ``C`` are
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _STREAM_RECEIPT_PREFIX + _stream_receipt_content_bytes(receipt),
+        hashlib.sha256,
+    ).digest()
+
+
+def _mint_stream_receipt(
+    key: bytes, stream: "ReceiptStream"
+) -> "StreamReceipt":
+    """Mint the :class:`StreamReceipt` of an already-committed stream:
+    ``D = SHA256(stream.to_bytes())`` and
+    ``M = HMAC-SHA256(key, b"NPBJ20" + C)`` over ``[1, S, D, E]``."""
+    digest = _stream_receipt_digest(stream)
+    receipt = StreamReceipt(
+        version=1,
+        start=stream.start,
+        digest=digest,
+        end=stream.end,
+        mac=b"\x00" * 32,
+    )
+    return replace(receipt, mac=_stream_receipt_mac(key, receipt))
+
+
+@dataclass(frozen=True)
+class StreamReceipt:
+    """A key-MAC'd receipt attesting one committed
+    :class:`ReceiptStream` at the range-batch receipt frontier.
+
+    ``version`` is always ``1``. ``start`` is the stream's starting
+    endpoint — either ``b""`` (the committed chain started with no
+    batch commit at all) or the canonical
+    :meth:`RangeBatchReceiptFrontier.to_bytes` encoding the chain
+    started from. ``digest`` is exactly 32 bytes:
+    ``D = SHA256(stream.to_bytes())`` over the committed stream's
+    canonical compact encoding. ``end`` is the canonical non-empty
+    :meth:`RangeBatchReceiptFrontier.to_bytes` encoding of the commit
+    frontier the committed chain ends at. ``mac`` is exactly 32 bytes —
+    ``M = HMAC-SHA256(key, b"NPBJ20" + C)`` where ``C`` is the canonical
+    compact encoding of the first four fields ``[1, S, D, E]`` (the
+    version, the lowercase-hex start, the lowercase-hex digest and the
+    lowercase-hex end, without ``mac``), the prefix and ``C``
+    concatenated directly with no separator or length prefix. Instances
+    are frozen, constructed positionally in field order and compare
+    equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    start: bytes
+    digest: bytes
+    end: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("stream receipt version must be an integer")
+        if self.version != 1:
+            raise ValueError("stream receipt version must be 1")
+        if not isinstance(self.start, bytes):
+            raise TypeError("stream receipt start must be bytes")
+        _require_receipt_stream_frontier(
+            self.start, "start", allow_empty=True
+        )
+        if not isinstance(self.digest, bytes):
+            raise TypeError("stream receipt digest must be bytes")
+        if len(self.digest) != 32:
+            raise ValueError(
+                "stream receipt digest must be exactly 32 bytes"
+            )
+        if not isinstance(self.end, bytes):
+            raise TypeError("stream receipt end must be bytes")
+        _require_receipt_stream_frontier(
+            self.end, "end", allow_empty=False
+        )
+        if not isinstance(self.mac, bytes):
+            raise TypeError("stream receipt mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError(
+                "stream receipt mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, start, digest, end, mac]`` where ``start``, ``digest``,
+        ``end`` and ``mac`` are lowercase hex, no whitespace, no length
+        prefix."""
+        return _encode_payload(
+            _stream_receipt_content(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "StreamReceipt":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, start, digest, end, mac]`` in that order,
+        ``version == 1``, ``start`` a lowercase hex string that is empty
+        or decodes to the canonical
+        :class:`RangeBatchReceiptFrontier` encoding, ``digest`` and
+        ``mac`` lowercase hex strings each decoding to exactly 32 bytes
+        and ``end`` a lowercase hex string decoding to the canonical
+        non-empty :class:`RangeBatchReceiptFrontier` encoding. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical
+        spelling are rejected too. No MAC, digest or carried stream is
+        verified here — pass the record together with the committed
+        stream to :func:`audit_stream_receipt` with the shared key for
+        that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("stream receipt data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"stream receipt is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "stream receipt must be a JSON array of exactly"
+                " version, start, digest, end and mac"
+            )
+        raw_version, raw_start, raw_digest, raw_end, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "stream receipt version must be an integer"
+            )
+        if raw_version != 1:
+            raise ValueError("stream receipt version must be 1")
+        start = _parse_bit_map_hex(raw_start, "stream receipt start")
+        _require_receipt_stream_frontier(
+            start, "start", allow_empty=True
+        )
+        digest = _parse_bit_map_hex(raw_digest, "stream receipt digest")
+        if len(digest) != 32:
+            raise ValueError(
+                "stream receipt digest must decode to exactly 32 bytes"
+            )
+        end = _parse_bit_map_hex(raw_end, "stream receipt end")
+        _require_receipt_stream_frontier(end, "end", allow_empty=False)
+        mac = _parse_bit_map_hex(raw_mac, "stream receipt mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "stream receipt mac must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            start=start,
+            digest=digest,
+            end=end,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError("stream receipt encoding is not canonical")
+        return record
+
+
+def audit_stream_receipt(
+    r: object, x: object, key: object
+) -> bytes:
+    """Re-verify a :class:`StreamReceipt` against the committed
+    :class:`ReceiptStream` and the shared ``key``.
+
+    ``r`` must be a :class:`StreamReceipt` or its canonical
+    :meth:`StreamReceipt.to_bytes` encoding, ``x`` the committed
+    :class:`ReceiptStream` or its canonical
+    :meth:`ReceiptStream.to_bytes` encoding and ``key`` the non-empty
+    shared ``bytes`` key — a wrong-typed argument raises
+    :class:`TypeError`, every other contract violation raises
+    :class:`ValueError`. Verification, all in constant time at the
+    comparison layers: the stream-receipt MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPBJ20" + C)`` and compared in constant time,
+    the digest is recomputed as ``SHA256(x.to_bytes())`` and compared in
+    constant time, and the receipt and stream ``start`` and ``end``
+    endpoints are each compared in constant time; then the stream
+    itself is replayed from scratch by :func:`audit_stream` — its
+    ``NPBJ19`` MAC, every carried receipt/batch audit and the replayed
+    final frontier. Only when all checks pass is the canonical
+    :meth:`RangeBatchReceiptFrontier.to_bytes` encoding of the committed
+    ``end`` returned (``end`` itself, byte for byte).
+    """
+    if isinstance(r, StreamReceipt):
+        receipt = r
+    elif isinstance(r, bytes):
+        try:
+            receipt = StreamReceipt.from_bytes(r)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                "r does not satisfy the stream receipt field contract"
+            ) from error
+    else:
+        raise TypeError(
+            "r must be a StreamReceipt instance or its canonical bytes"
+        )
+    stream = _coerce_receipt_stream(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    # The NPBJ20 MAC, the digest and both endpoints are all recomputed
+    # and each compared in constant time before any result is consulted.
+    mac_ok = hmac.compare_digest(
+        _stream_receipt_mac(key, receipt), receipt.mac
+    )
+    digest_ok = hmac.compare_digest(
+        _stream_receipt_digest(stream), receipt.digest
+    )
+    start_ok = hmac.compare_digest(stream.start, receipt.start)
+    end_ok = hmac.compare_digest(stream.end, receipt.end)
+    if not mac_ok:
+        raise ValueError("stream receipt mac does not match the key")
+    if not digest_ok:
+        raise ValueError(
+            "stream receipt digest does not match the stream"
+        )
+    if not start_ok:
+        raise ValueError(
+            "stream receipt start does not match the stream"
+        )
+    if not end_ok:
+        raise ValueError(
+            "stream receipt end does not match the stream"
+        )
+    # Replay the whole committed stream from scratch: its NPBJ19 MAC,
+    # every carried receipt/batch audit and the replayed final frontier.
+    # audit_stream returns the canonical end bytes on success.
+    return audit_stream(stream, key)
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
