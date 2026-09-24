@@ -18,7 +18,8 @@ Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
 RangeBatchReceipt /
 RangeDecision / RangeFrontier / RangeReceipt / RangeReceiptBatch /
 ReceiptStream / SPEED_OF_LIGHT_MPS / StreamReceipt /
-StreamReceiptAuditor / StreamReceiptBatch / StreamReceiptFrontier /
+StreamReceiptAuditor / StreamReceiptBatch /
+StreamReceiptBatchCommitReceipt / StreamReceiptFrontier /
 TrustRevocation /
 TrustRevocationList / Verifier /
 VerifierTrust / assess / attest_observation /
@@ -29,8 +30,9 @@ audit_map_history_evidence / audit_map_history_journal_bundle /
 audit_map_history_journal_receipt /
 audit_map_update /
 audit_proof / audit_range / audit_receipt /
-audit_batch_receipt / audit_range_receipt_batch / audit_stream /
-audit_stream_receipt /
+audit_batch_commit_receipt / audit_batch_receipt /
+audit_range_receipt_batch / audit_stream /
+audit_stream_batch_commit_receipt / audit_stream_receipt /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
@@ -108,6 +110,7 @@ __all__ = [
     "StreamReceipt",
     "StreamReceiptAuditor",
     "StreamReceiptBatch",
+    "StreamReceiptBatchCommitReceipt",
     "StreamReceiptFrontier",
     "TrustRevocation",
     "TrustRevocationList",
@@ -118,6 +121,7 @@ __all__ = [
     "attest_observation_for_point",
     "audit",
     "audit_b",
+    "audit_batch_commit_receipt",
     "audit_batch_receipt",
     "audit_bound",
     "audit_bound_policy",
@@ -135,6 +139,7 @@ __all__ = [
     "audit_range_receipt_batch",
     "audit_receipt",
     "audit_stream",
+    "audit_stream_batch_commit_receipt",
     "audit_stream_receipt",
     "cert",
     "locate",
@@ -245,6 +250,8 @@ _STREAM_RECEIPT_FRONTIER_MAC_PREFIX = b"NPBJ21"
 _STREAM_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPBJ22"
 # Domain separation prefix for the stream-receipt batch MAC.
 _STREAM_RECEIPT_BATCH_PREFIX = b"NPBJ23"
+# Domain separation prefix for the stream-receipt batch commit receipt MAC.
+_STREAM_RECEIPT_BATCH_COMMIT_RECEIPT_PREFIX = b"NPBJ24"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -11463,6 +11470,19 @@ class StreamReceiptAuditor:
     changes no state, and concurrent calls linearize with :meth:`audit`
     in lock-acquisition order.
 
+    :meth:`commit_batch` commits one transferable
+    :class:`StreamReceiptBatch` exactly like :meth:`audit_batch` and,
+    only after the frontier has advanced, mints a transferable
+    :class:`StreamReceiptBatchCommitReceipt` attesting the committed
+    batch — ``start`` the batch's ``start``, ``batch_digest``
+    ``SHA256(batch.to_bytes())`` over the canonical batch encoding,
+    ``end`` the batch's declared ``end`` and ``mac``
+    ``HMAC-SHA256(key, b"NPBJ24" + C)`` over the canonical compact
+    encoding of those four fields. A failure raises before anything is
+    minted and leaves the frontier exactly where it stood, and
+    concurrent commits linearize with :meth:`audit` and
+    :meth:`audit_batch` in lock-acquisition order.
+
     The read-only :attr:`checkpoint` property is a synonym of
     :attr:`state`: ``None`` before the first successfully audited
     commit, the current :class:`StreamReceiptFrontier` afterwards.
@@ -11700,6 +11720,59 @@ class StreamReceiptAuditor:
             # and leaves the frontier exactly where it stood.
             self._frontier = self._replay_batch_locked(batch)
             return self
+
+    def commit_batch(
+        self, x: object
+    ) -> "StreamReceiptBatchCommitReceipt":
+        """Atomically commit one transferable
+        :class:`StreamReceiptBatch` exactly like :meth:`audit_batch`,
+        advance the frontier, and return a
+        :class:`StreamReceiptBatchCommitReceipt` attesting the committed
+        batch.
+
+        ``x`` must be a :class:`StreamReceiptBatch` or its canonical
+        :meth:`StreamReceiptBatch.to_bytes` encoding — any other type
+        raises :class:`TypeError`; every other contract violation (a
+        malformed or non-canonical encoding, a wrong key, a ``NPBJ23``
+        batch MAC mismatch, a MAC mismatch on either non-empty endpoint
+        :class:`StreamReceiptFrontier`, a broken carried link, an old
+        fork, a batch replayed twice, a final state that does not match
+        the replayed chain, or a u64 overflow) raises
+        :class:`ValueError`. The verification is exactly
+        :meth:`audit_batch`'s and runs under the same lock shared with
+        :meth:`audit`; the frontier is replaced once, and only when the
+        whole batch verifies, and the receipt is then minted over it —
+        ``start`` the batch's ``start`` (``b""`` before the first
+        committed batch), ``batch_digest`` ``SHA256(batch.to_bytes())``
+        over the canonical batch encoding, ``end`` the batch's declared
+        ``end`` and ``mac`` ``HMAC-SHA256(key, b"NPBJ24" + C)`` over the
+        canonical compact encoding of those four fields. A failure
+        raises before anything is minted and leaves the frontier
+        exactly where it stood, and concurrent commits linearize in
+        lock-acquisition order. Returns the frozen
+        :class:`StreamReceiptBatchCommitReceipt`; the auditor itself is
+        not returned.
+        """
+        with self._lock:
+            batch = _coerce_stream_receipt_batch(x, "x")
+            # Adopt the replayed frontier only once the whole batch has
+            # verified; a failure inside raises before this assignment
+            # and leaves the frontier exactly where it stood, and the
+            # receipt is minted only after the state has advanced.
+            self._frontier = self._replay_batch_locked(batch)
+            placeholder = StreamReceiptBatchCommitReceipt(
+                version=1,
+                start=batch.start,
+                batch_digest=hashlib.sha256(batch.to_bytes()).digest(),
+                end=batch.end,
+                mac=b"\x00" * 32,
+            )
+            return replace(
+                placeholder,
+                mac=_stream_receipt_batch_commit_receipt_mac(
+                    self._key, placeholder
+                ),
+            )
 
 
 def _require_stream_receipt_batch_frontier(
@@ -12092,6 +12165,306 @@ def seal_stream_receipt_batch(
         mac=b"\x00" * 32,
     )
     return replace(batch, mac=_stream_receipt_batch_mac(key, batch))
+
+
+def _stream_receipt_batch_commit_receipt_content(
+    receipt: "StreamReceiptBatchCommitReceipt",
+) -> list:
+    """The JSON-ready first four stream-receipt-batch-commit-receipt
+    fields (everything but ``mac``)."""
+    return [
+        receipt.version,
+        receipt.start.hex(),
+        receipt.batch_digest.hex(),
+        receipt.end.hex(),
+    ]
+
+
+def _stream_receipt_batch_commit_receipt_content_bytes(
+    receipt: "StreamReceiptBatchCommitReceipt",
+) -> bytes:
+    """The canonical compact encoding ``C`` of the first four
+    stream-receipt-batch-commit-receipt fields."""
+    return _encode_payload(
+        _stream_receipt_batch_commit_receipt_content(receipt)
+    )
+
+
+def _stream_receipt_batch_commit_receipt_mac(
+    key: bytes, receipt: "StreamReceiptBatchCommitReceipt"
+) -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ24" + C)`` where ``C`` is the canonical
+    encoding of the first four fields. The prefix and ``C`` are
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _STREAM_RECEIPT_BATCH_COMMIT_RECEIPT_PREFIX
+        + _stream_receipt_batch_commit_receipt_content_bytes(receipt),
+        hashlib.sha256,
+    ).digest()
+
+
+@dataclass(frozen=True)
+class StreamReceiptBatchCommitReceipt:
+    """A key-MAC'd, transferable receipt attesting one committed
+    :class:`StreamReceiptBatch`.
+
+    ``version`` is always ``1``. ``start`` is the canonical
+    :meth:`StreamReceiptFrontier.to_bytes` encoding of the stream-receipt
+    frontier the committed batch started from, or ``b""`` when it started
+    with no stream commit at all. ``batch_digest`` is exactly 32 bytes —
+    ``SHA256(batch.to_bytes())`` over the canonical encoding of the
+    committed :class:`StreamReceiptBatch`. ``end`` is the canonical
+    non-empty :meth:`StreamReceiptFrontier.to_bytes` encoding of the
+    stream-receipt frontier the batch ended at. ``mac`` is exactly 32
+    bytes — ``HMAC-SHA256(key, b"NPBJ24" + C)`` where ``C`` is the
+    canonical compact encoding of the first four fields (the version, the
+    lowercase-hex start, the lowercase-hex batch digest and the
+    lowercase-hex end, without ``mac``), the prefix and ``C``
+    concatenated directly with no separator or length prefix. Instances
+    are frozen, constructed positionally in field order and compare
+    equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    start: bytes
+    batch_digest: bytes
+    end: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "stream receipt batch commit receipt version must be an"
+                " integer"
+            )
+        if self.version != 1:
+            raise ValueError(
+                "stream receipt batch commit receipt version must be 1"
+            )
+        if not isinstance(self.start, bytes):
+            raise TypeError(
+                "stream receipt batch commit receipt start must be bytes"
+            )
+        _require_stream_receipt_batch_frontier(
+            self.start, "start", allow_empty=True
+        )
+        if not isinstance(self.batch_digest, bytes):
+            raise TypeError(
+                "stream receipt batch commit receipt batch_digest must be"
+                " bytes"
+            )
+        if len(self.batch_digest) != 32:
+            raise ValueError(
+                "stream receipt batch commit receipt batch_digest must be"
+                " exactly 32 bytes"
+            )
+        if not isinstance(self.end, bytes):
+            raise TypeError(
+                "stream receipt batch commit receipt end must be bytes"
+            )
+        _require_stream_receipt_batch_frontier(
+            self.end, "end", allow_empty=False
+        )
+        if not isinstance(self.mac, bytes):
+            raise TypeError(
+                "stream receipt batch commit receipt mac must be bytes"
+            )
+        if len(self.mac) != 32:
+            raise ValueError(
+                "stream receipt batch commit receipt mac must be exactly"
+                " 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, start, batch_digest, end, mac]`` where ``start``,
+        ``batch_digest``, ``end`` and ``mac`` are lowercase hex, no
+        whitespace, no length prefix."""
+        return _encode_payload(
+            _stream_receipt_batch_commit_receipt_content(self)
+            + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "StreamReceiptBatchCommitReceipt":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, start, batch_digest, end, mac]`` in that
+        order, ``version == 1``, ``start`` a lowercase hex string that is
+        empty or decodes to the canonical :class:`StreamReceiptFrontier`
+        encoding, ``batch_digest`` a lowercase hex string decoding to
+        exactly 32 bytes, ``end`` a lowercase hex string decoding to the
+        canonical non-empty :class:`StreamReceiptFrontier` encoding and
+        ``mac`` a lowercase hex string decoding to exactly 32 bytes.
+        After parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical
+        spelling are rejected too. No MAC is verified here — pass the
+        record to :func:`audit_batch_commit_receipt` with the shared key
+        for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "stream receipt batch commit receipt data must be bytes"
+            )
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"stream receipt batch commit receipt is not valid JSON:"
+                f" {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "stream receipt batch commit receipt must be a JSON array"
+                " of exactly version, start, batch_digest, end and mac"
+            )
+        raw_version, raw_start, raw_digest, raw_end, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "stream receipt batch commit receipt version must be an"
+                " integer"
+            )
+        if raw_version != 1:
+            raise ValueError(
+                "stream receipt batch commit receipt version must be 1"
+            )
+        start = _parse_bit_map_hex(
+            raw_start, "stream receipt batch commit receipt start"
+        )
+        _require_stream_receipt_batch_frontier(
+            start, "start", allow_empty=True
+        )
+        batch_digest = _parse_bit_map_hex(
+            raw_digest, "stream receipt batch commit receipt batch_digest"
+        )
+        if len(batch_digest) != 32:
+            raise ValueError(
+                "stream receipt batch commit receipt batch_digest must"
+                " decode to exactly 32 bytes"
+            )
+        end = _parse_bit_map_hex(
+            raw_end, "stream receipt batch commit receipt end"
+        )
+        _require_stream_receipt_batch_frontier(
+            end, "end", allow_empty=False
+        )
+        mac = _parse_bit_map_hex(
+            raw_mac, "stream receipt batch commit receipt mac"
+        )
+        if len(mac) != 32:
+            raise ValueError(
+                "stream receipt batch commit receipt mac must decode to"
+                " exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            start=start,
+            batch_digest=batch_digest,
+            end=end,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "stream receipt batch commit receipt encoding is not"
+                " canonical"
+            )
+        return record
+
+
+def _coerce_stream_receipt_batch_commit_receipt(
+    x: object, name: str
+) -> "StreamReceiptBatchCommitReceipt":
+    """Coerce a :class:`StreamReceiptBatchCommitReceipt` or its canonical
+    bytes, splitting the TypeError/ValueError contract exactly as the
+    public auditors do: the wrong kind of argument raises
+    :class:`TypeError`, a field-shape failure surfacing while parsing
+    byte content of the right kind is a value error."""
+    if isinstance(x, StreamReceiptBatchCommitReceipt):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return StreamReceiptBatchCommitReceipt.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the stream receipt batch commit"
+                " receipt field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a StreamReceiptBatchCommitReceipt instance or"
+        " its canonical bytes"
+    )
+
+
+def audit_batch_commit_receipt(
+    r: object, b: object, key: object
+) -> "StreamReceiptFrontier":
+    """Re-verify a :class:`StreamReceiptBatchCommitReceipt` against the
+    :class:`StreamReceiptBatch` it attests and the shared ``key``.
+
+    ``r`` must be a :class:`StreamReceiptBatchCommitReceipt` or its
+    canonical :meth:`StreamReceiptBatchCommitReceipt.to_bytes` encoding,
+    ``b`` the attested :class:`StreamReceiptBatch` or its canonical
+    :meth:`StreamReceiptBatch.to_bytes` encoding and ``key`` the
+    non-empty shared ``bytes`` key — a wrong-typed argument raises
+    :class:`TypeError`, every other contract violation raises
+    :class:`ValueError`. The receipt MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPBJ24" + C)`` and compared in constant time,
+    the receipt ``batch_digest`` is compared in constant time against
+    ``SHA256(b.to_bytes())`` and the receipt ``start``/``end`` must equal
+    the batch's ``start``/``end`` byte for byte; then the batch itself is
+    verified exactly as :meth:`StreamReceiptAuditor.audit_batch` verifies
+    it — the ``NPBJ23`` batch MAC, every MAC layer of both non-empty
+    endpoint :class:`StreamReceiptFrontier` values and the whole carried
+    receipt/stream chain replayed from the batch ``start`` to its
+    ``end``. Auditing is a pure check: it touches no auditor state and
+    returns no partial result — on success the frozen
+    :class:`StreamReceiptFrontier` at the batch ``end`` is returned.
+    """
+    receipt = _coerce_stream_receipt_batch_commit_receipt(r, "r")
+    batch = _coerce_stream_receipt_batch(b, "b")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    # The receipt MAC, the batch digest and the two endpoints are all
+    # always recomputed/compared in constant time before any result is
+    # consulted.
+    mac_ok = hmac.compare_digest(
+        _stream_receipt_batch_commit_receipt_mac(key, receipt), receipt.mac
+    )
+    digest_ok = hmac.compare_digest(
+        hashlib.sha256(batch.to_bytes()).digest(), receipt.batch_digest
+    )
+    start_ok = hmac.compare_digest(receipt.start, batch.start)
+    end_ok = hmac.compare_digest(receipt.end, batch.end)
+    if not mac_ok or not digest_ok or not start_ok or not end_ok:
+        raise ValueError(
+            "stream receipt batch commit receipt mac, batch digest or"
+            " endpoints do not match"
+        )
+    # Verifying the batch re-verifies its NPBJ23 MAC, every MAC layer of
+    # both endpoint frontiers and the whole carried receipt/stream chain,
+    # returning the frozen stream-receipt frontier at the batch end (the
+    # commit itself raises ValueError if the replayed frontier does not
+    # equal that end).
+    auditor = StreamReceiptAuditor(
+        key, checkpoint=(None if batch.start == b"" else batch.start)
+    )
+    auditor.audit_batch(batch)
+    return auditor.state  # type: ignore[return-value]
+
+
+# Descriptive alias of audit_batch_commit_receipt.
+audit_stream_batch_commit_receipt = audit_batch_commit_receipt
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
