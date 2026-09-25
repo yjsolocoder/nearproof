@@ -18,7 +18,8 @@ Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
 RangeBatchReceipt /
 RangeDecision / RangeFrontier / RangeReceipt / RangeReceiptBatch /
 ReceiptStream / SPEED_OF_LIGHT_MPS / SpanBundleReceipt /
-SpanBundleReceiptAuditor / SpanBundleReceiptFrontier /
+SpanBundleReceiptAuditor / SpanBundleReceiptBatch /
+SpanBundleReceiptFrontier /
 SpanReceiptBundle / StreamReceipt /
 StreamReceiptAuditor / StreamReceiptBatch /
 StreamCommitReceiptAuditor / StreamCommitReceiptBundle /
@@ -40,7 +41,8 @@ audit_map_history_journal_receipt /
 audit_map_update /
 audit_proof / audit_range / audit_receipt /
 audit_batch_receipt / audit_bundle_receipt / audit_range_receipt_batch /
-audit_span_receipt_bundle / audit_stream /
+audit_span_bundle_receipt_batch / audit_span_receipt_bundle /
+audit_stream /
 audit_stream_commit_receipt_bundle /
 audit_stream_commit_receipt_span /
 audit_stream_commit_receipt_span_receipt /
@@ -50,7 +52,7 @@ locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
 revoke_context / revoke_observation / revoke_trust / seal_map_history /
 seal_map_history_journal_bundle / seal_range / seal_range_receipt_batch /
-seal_span_receipt_bundle /
+seal_span_bundle_receipt_batch / seal_span_receipt_bundle /
 seal_stream / seal_stream_commit_receipt_bundle /
 seal_stream_commit_receipt_span /
 seal_stream_receipt_batch.
@@ -124,6 +126,7 @@ __all__ = [
     "SPEED_OF_LIGHT_MPS",
     "SpanBundleReceipt",
     "SpanBundleReceiptAuditor",
+    "SpanBundleReceiptBatch",
     "SpanBundleReceiptFrontier",
     "SpanReceiptBundle",
     "StreamCommitReceiptAuditor",
@@ -167,6 +170,7 @@ __all__ = [
     "audit_range",
     "audit_range_receipt_batch",
     "audit_receipt",
+    "audit_span_bundle_receipt_batch",
     "audit_span_receipt_bundle",
     "audit_stream",
     "audit_stream_commit_receipt_bundle",
@@ -192,6 +196,7 @@ __all__ = [
     "seal_map_history_journal_receipt_batch",
     "seal_range",
     "seal_range_receipt_batch",
+    "seal_span_bundle_receipt_batch",
     "seal_span_receipt_bundle",
     "seal_stream",
     "seal_stream_commit_receipt_bundle",
@@ -315,6 +320,8 @@ _SPAN_BUNDLE_RECEIPT_PREFIX = b"NPBJ36"
 # Domain separation prefix for the span-bundle-receipt frontier signature
 # (the digest chain concatenates its parts directly, with no prefix).
 _SPAN_BUNDLE_RECEIPT_FRONTIER_SIGNATURE_PREFIX = b"NPBJ37"
+# Domain separation prefix for the span bundle receipt batch signature.
+_SPAN_BUNDLE_RECEIPT_BATCH_PREFIX = b"NPBJ38"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -11159,6 +11166,607 @@ class SpanBundleReceiptAuditor:
                 ),
             )
             return self
+
+    def audit_batch(self, x: object) -> "SpanBundleReceiptAuditor":
+        """Atomically commit one transferable
+        :class:`SpanBundleReceiptBatch` against the current frontier.
+
+        ``x`` must be a :class:`SpanBundleReceiptBatch` or its canonical
+        :meth:`SpanBundleReceiptBatch.to_bytes` encoding — any other type
+        raises :class:`TypeError`; a malformed or non-canonical encoding
+        raises :class:`ValueError`. Under the auditor lock the batch is
+        first verified independently of the live state: its ``NPBJ38``
+        signature is recomputed and compared in constant time, and each
+        non-empty endpoint :class:`SpanBundleReceiptFrontier` (``start``
+        and ``end``) is checked at every signature layer exactly as the
+        checkpoint check does, all always recomputed and each compared in
+        constant time. Only after every check passes is anything
+        replayed: the batch ``start`` must equal the current
+        :attr:`checkpoint` :meth:`SpanBundleReceiptFrontier.to_bytes`
+        encoding byte for byte (``b""`` only before the first accepted
+        receipt, so an empty ledger accepts only an empty start), and the
+        carried receipts are then replayed in order on a temporary
+        frontier seeded with the matching starting point, each receipt
+        re-verified and linked exactly as the ledger rules advance a
+        receipt — the ``NPBJ36`` signature, the byte-for-byte start
+        linkage, the u64 sequence increment, the digest-chain step and
+        the recomputed ``NPBJ37`` frontier signature. The live checkpoint
+        is replaced once, and only when the replayed frontier's
+        :meth:`SpanBundleReceiptFrontier.to_bytes` equals the batch's
+        declared ``end`` byte for byte; the same batch replayed, an old
+        fork, a broken chain, a mid-replay failure, a final-frontier
+        mismatch or a u64 overflow therefore all raise
+        :class:`ValueError` and change no state. :meth:`audit` and this
+        method share the auditor lock and linearize together in
+        lock-acquisition order. Returns the auditor itself.
+        """
+        with self._lock:
+            # Decode per the batch contract: a non-batch argument is a
+            # TypeError; malformed or non-canonical byte content is a
+            # ValueError. Nothing has been replayed yet, so decoding
+            # failures cannot affect the frontier.
+            batch = _coerce_span_bundle_receipt_batch(x, "x")
+            # Adopt the replayed frontier only once the whole batch has
+            # verified; a failure inside raises before this assignment
+            # and leaves the frontier exactly where it stood.
+            self._frontier = self._replay_batch_locked(batch)
+            return self
+
+    def _replay_batch_locked(
+        self, batch: "SpanBundleReceiptBatch"
+    ) -> "SpanBundleReceiptFrontier":
+        """Verify one batch against the current frontier and return the
+        frontier it ends at without mutating any auditor state.
+
+        The caller must hold :attr:`_lock`. Before anything is replayed
+        the batch's ``NPBJ38`` signature and every signature layer of
+        each non-empty endpoint :class:`SpanBundleReceiptFrontier` are
+        recomputed, every comparison in constant time; then the batch
+        ``start`` must equal the current :attr:`checkpoint` encoding byte
+        for byte (``b""`` only with no receipt accepted yet) and the
+        carried receipts are replayed in order on a temporary frontier,
+        each exactly as the ledger rules advance it; the replayed
+        frontier's :meth:`SpanBundleReceiptFrontier.to_bytes` must equal
+        the batch's declared ``end`` byte for byte. Any failure raises
+        :class:`ValueError` before a result is returned, so the caller's
+        checkpoint is untouched until it adopts the returned frontier
+        itself.
+        """
+        # Independently recompute the NPBJ38 batch signature and every
+        # signature layer of each non-empty endpoint frontier before any
+        # replay touches the temporary chain; every comparison is
+        # constant time and a mismatch raises ValueError.
+        if not hmac.compare_digest(
+            _span_bundle_receipt_batch_signature(self._key, batch),
+            batch.signature,
+        ):
+            raise ValueError(
+                "span bundle receipt batch signature does not match the"
+                " key"
+            )
+        start_frontier: "Optional[SpanBundleReceiptFrontier]" = None
+        if batch.start:
+            start_frontier = SpanBundleReceiptFrontier.from_bytes(
+                batch.start
+            )
+            _verify_span_bundle_receipt_frontier_signatures(
+                self._key, start_frontier
+            )
+        _verify_span_bundle_receipt_frontier_signatures(
+            self._key, SpanBundleReceiptFrontier.from_bytes(batch.end)
+        )
+        # The batch must extend exactly the current checkpoint: the empty
+        # start only for a ledger with no receipt accepted yet, otherwise
+        # the current checkpoint encoding byte for byte. This is what
+        # rejects an old fork and the same batch replayed.
+        current = (
+            b""
+            if self._frontier is None
+            else self._frontier.to_bytes()
+        )
+        if batch.start != current:
+            raise ValueError(
+                "span bundle receipt batch start does not match the"
+                " current span bundle receipt frontier"
+            )
+        # Replay the whole carried chain on a temporary frontier seeded
+        # with the matching starting point; each receipt is re-verified
+        # and linked/advanced exactly like the ledger rules. The live
+        # checkpoint is read but never mutated until it adopts the
+        # replayed frontier.
+        final = _replay_span_bundle_receipt_batch(
+            self._key, start_frontier, batch.receipts
+        )
+        if final.to_bytes() != batch.end:
+            raise ValueError(
+                "span bundle receipt batch end does not match the"
+                " replayed chain"
+            )
+        return final
+
+
+def _require_span_bundle_receipt_batch_frontier(
+    value: bytes, name: str, allow_empty: bool
+) -> None:
+    """Enforce the canonical-:class:`SpanBundleReceiptFrontier`-bytes
+    contract of a span-bundle-receipt batch endpoint.
+
+    ``value`` is already known to be ``bytes``; when ``allow_empty``
+    holds, ``b""`` (the batch starts with no audited receipt at all) is
+    also accepted. :meth:`SpanBundleReceiptFrontier.from_bytes` enforces
+    the full contract including its canonical re-encoding check, and
+    every violation — including the field-shape :class:`TypeError` a
+    malformed inner document would otherwise surface — raises
+    :class:`ValueError`."""
+    if allow_empty and value == b"":
+        return
+    try:
+        SpanBundleReceiptFrontier.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        suffix = " or empty" if allow_empty else ""
+        raise ValueError(
+            f"span bundle receipt batch {name} must be the canonical"
+            f" SpanBundleReceiptFrontier encoding{suffix}"
+        ) from error
+
+
+def _require_span_bundle_receipt_batch_receipt(value: bytes) -> None:
+    """Enforce the canonical-:class:`SpanBundleReceipt`-bytes contract of
+    a batch ``receipts`` entry.
+
+    ``value`` is already known to be ``bytes``; every violation —
+    including the field-shape :class:`TypeError` a malformed inner
+    document would otherwise surface — raises :class:`ValueError`."""
+    try:
+        SpanBundleReceipt.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "span bundle receipt batch receipts entries must be the"
+            " canonical SpanBundleReceipt encoding"
+        ) from error
+
+
+def _span_bundle_receipt_batch_content(
+    batch: "SpanBundleReceiptBatch",
+) -> list:
+    """The JSON-ready first four batch fields (everything but
+    ``signature``)."""
+    return [
+        batch.version,
+        batch.start.hex(),
+        [receipt.hex() for receipt in batch.receipts],
+        batch.end.hex(),
+    ]
+
+
+def _span_bundle_receipt_batch_content_bytes(
+    batch: "SpanBundleReceiptBatch",
+) -> bytes:
+    """The canonical compact encoding ``C`` of the first four batch
+    fields."""
+    return _encode_payload(_span_bundle_receipt_batch_content(batch))
+
+
+def _span_bundle_receipt_batch_signature(
+    key: bytes, batch: "SpanBundleReceiptBatch"
+) -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ38" + C)`` where ``C`` is the canonical
+    encoding of the first four fields. The prefix and ``C`` are
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _SPAN_BUNDLE_RECEIPT_BATCH_PREFIX
+        + _span_bundle_receipt_batch_content_bytes(batch),
+        hashlib.sha256,
+    ).digest()
+
+
+@dataclass(frozen=True)
+class SpanBundleReceiptBatch:
+    """A key-signed, transferable batch sealing one contiguous audited
+    :class:`SpanBundleReceipt` chain against the span-bundle-receipt
+    ledger.
+
+    ``version`` is always ``1``. ``start`` is the canonical
+    :meth:`SpanBundleReceiptFrontier.to_bytes` encoding of the receipt
+    ledger frontier the chain starts from, or ``b""`` when the chain
+    starts with no receipt at all (sequence zero, the digest chain rooted
+    at ``d0``). ``receipts`` is a non-empty ordered tuple of the
+    canonical :meth:`SpanBundleReceipt.to_bytes` bytes of each receipt to
+    replay in order — the batch carries the receipt bodies only; the
+    committed bundles they attest are not carried and not replayed with
+    the batch. ``end`` is the canonical non-empty
+    :meth:`SpanBundleReceiptFrontier.to_bytes` encoding of the receipt
+    ledger frontier the chain ends at. ``signature`` is exactly 32 bytes
+    — ``HMAC-SHA256(key, b"NPBJ38" + C)`` where ``C`` is the canonical
+    compact encoding of the first four fields (the version, the
+    lowercase-hex start, the array of lowercase-hex receipt encodings and
+    the lowercase-hex end, without ``signature``), the prefix and ``C``
+    concatenated directly with no separator or length prefix. Instances
+    are frozen, constructed positionally in field order and compare equal
+    by their fields. A field of the wrong type raises :class:`TypeError`;
+    every other contract violation raises :class:`ValueError`. No key
+    material is stored.
+    """
+
+    version: int
+    start: bytes
+    receipts: tuple
+    end: bytes
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "span bundle receipt batch version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError("span bundle receipt batch version must be 1")
+        if not isinstance(self.start, bytes):
+            raise TypeError("span bundle receipt batch start must be bytes")
+        _require_span_bundle_receipt_batch_frontier(
+            self.start, "start", allow_empty=True
+        )
+        if not isinstance(self.receipts, tuple):
+            raise TypeError(
+                "span bundle receipt batch receipts must be a tuple"
+            )
+        if not self.receipts:
+            raise ValueError(
+                "span bundle receipt batch receipts must be non-empty"
+            )
+        for receipt in self.receipts:
+            if not isinstance(receipt, bytes):
+                raise TypeError(
+                    "span bundle receipt batch receipts entries must be"
+                    " bytes"
+                )
+            _require_span_bundle_receipt_batch_receipt(receipt)
+        if not isinstance(self.end, bytes):
+            raise TypeError("span bundle receipt batch end must be bytes")
+        _require_span_bundle_receipt_batch_frontier(
+            self.end, "end", allow_empty=False
+        )
+        if not isinstance(self.signature, bytes):
+            raise TypeError(
+                "span bundle receipt batch signature must be bytes"
+            )
+        if len(self.signature) != 32:
+            raise ValueError(
+                "span bundle receipt batch signature must be exactly 32"
+                " bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, start, receipts, end, signature]`` where ``start``, ``end``
+        and ``signature`` are lowercase hex and ``receipts`` is the array
+        of the lowercase-hex canonical receipt encodings, no whitespace,
+        no length prefix."""
+        return _encode_payload(
+            _span_bundle_receipt_batch_content(self)
+            + [self.signature.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SpanBundleReceiptBatch":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, start, receipts, end, signature]`` in that
+        order, ``version == 1``, ``start`` a lowercase hex string that is
+        empty or decodes to the canonical
+        :class:`SpanBundleReceiptFrontier` encoding, ``receipts`` a
+        non-empty array of lowercase hex strings each decoding to the
+        canonical :class:`SpanBundleReceipt` encoding, ``end`` a
+        lowercase hex string decoding to the canonical non-empty
+        :class:`SpanBundleReceiptFrontier` encoding and ``signature`` a
+        lowercase hex string decoding to exactly 32 bytes. After parsing
+        and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical
+        spelling are rejected too. No signature is verified here —
+        neither the batch signature nor any signature of the carried
+        receipts or frontiers; pass the record to
+        :func:`audit_span_bundle_receipt_batch` with the shared key for
+        that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("span bundle receipt batch data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"span bundle receipt batch is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "span bundle receipt batch must be a JSON array of"
+                " exactly version, start, receipts, end and signature"
+            )
+        raw_version, raw_start, raw_receipts, raw_end, raw_signature = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "span bundle receipt batch version must be an integer"
+            )
+        if raw_version != 1:
+            raise ValueError("span bundle receipt batch version must be 1")
+        start = _parse_bit_map_hex(raw_start, "span bundle receipt batch start")
+        _require_span_bundle_receipt_batch_frontier(
+            start, "start", allow_empty=True
+        )
+        if not isinstance(raw_receipts, list):
+            raise TypeError(
+                "span bundle receipt batch receipts must be an array"
+            )
+        if not raw_receipts:
+            raise ValueError(
+                "span bundle receipt batch receipts must be non-empty"
+            )
+        receipts = []
+        for raw_receipt in raw_receipts:
+            receipt = _parse_bit_map_hex(
+                raw_receipt, "span bundle receipt batch receipts entries"
+            )
+            _require_span_bundle_receipt_batch_receipt(receipt)
+            receipts.append(receipt)
+        end = _parse_bit_map_hex(raw_end, "span bundle receipt batch end")
+        _require_span_bundle_receipt_batch_frontier(
+            end, "end", allow_empty=False
+        )
+        signature = _parse_bit_map_hex(
+            raw_signature, "span bundle receipt batch signature"
+        )
+        if len(signature) != 32:
+            raise ValueError(
+                "span bundle receipt batch signature must decode to"
+                " exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            start=start,
+            receipts=tuple(receipts),
+            end=end,
+            signature=signature,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "span bundle receipt batch encoding is not canonical"
+            )
+        return record
+
+
+def _coerce_span_bundle_receipt_batch(
+    x: object, name: str
+) -> "SpanBundleReceiptBatch":
+    """Coerce a :class:`SpanBundleReceiptBatch` or its canonical bytes,
+    splitting the TypeError/ValueError contract exactly as the public
+    auditors do: the wrong kind of argument raises :class:`TypeError`, a
+    field-shape failure surfacing while parsing byte content of the right
+    kind is a value error."""
+    if isinstance(x, SpanBundleReceiptBatch):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return SpanBundleReceiptBatch.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the span bundle receipt batch"
+                " field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a SpanBundleReceiptBatch instance or its"
+        " canonical bytes"
+    )
+
+
+def _replay_span_bundle_receipt_batch(
+    key: bytes,
+    frontier: "Optional[SpanBundleReceiptFrontier]",
+    receipts: "tuple[bytes, ...]",
+) -> "SpanBundleReceiptFrontier":
+    """Replay a batch's receipt chain onto a tentative
+    span-bundle-receipt frontier.
+
+    ``frontier`` is the parsed and signature-verified starting frontier
+    or ``None`` for the empty ledger (sequence zero, the digest chain
+    rooted at ``d0``). Each carried receipt is re-parsed and its
+    ``NPBJ36`` signature recomputed and compared in constant time, and
+    the receipt ``start`` must then continue byte for byte from the
+    tentative frontier ``end`` before the u64 sequence, the digest-chain
+    head, the end frontier and the frontier signature advance per
+    ``NPBJ37``. The replay touches no shared state: the caller adopts
+    the returned tentative frontier only after its own endpoint
+    comparison, and every failure raises :class:`ValueError`.
+    """
+    for receipt_encoding in receipts:
+        receipt = SpanBundleReceipt.from_bytes(receipt_encoding)
+        if not hmac.compare_digest(
+            _span_bundle_receipt_signature(key, receipt),
+            receipt.signature,
+        ):
+            raise ValueError(
+                "span bundle receipt batch carried receipt signature"
+                " does not match the key"
+            )
+        current = b"" if frontier is None else frontier.end
+        if receipt.start != current:
+            raise ValueError(
+                "span bundle receipt batch carried receipt start does"
+                " not match the frontier end"
+            )
+        previous_sequence = 0 if frontier is None else frontier.sequence
+        if previous_sequence >= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "span bundle receipt frontier sequence would overflow"
+                " the unsigned 64-bit range"
+            )
+        sequence = previous_sequence + 1
+        previous_digest = (
+            b"\x00" * 32 if frontier is None else frontier.digest
+        )
+        digest = _span_bundle_receipt_frontier_next_digest(
+            previous_digest, sequence, receipt.to_bytes()
+        )
+        candidate = SpanBundleReceiptFrontier(
+            version=1,
+            sequence=sequence,
+            end=receipt.end,
+            digest=digest,
+            signature=b"\x00" * 32,
+        )
+        frontier = replace(
+            candidate,
+            signature=_span_bundle_receipt_frontier_signature(
+                key, candidate
+            ),
+        )
+    # The batch contract guarantees a non-empty chain, so the result is
+    # always a concrete frontier.
+    return frontier  # type: ignore[return-value]
+
+
+def seal_span_bundle_receipt_batch(
+    receipts: object, key: object, *, start: object = None
+) -> "SpanBundleReceiptBatch":
+    """Verify a contiguous chain of :class:`SpanBundleReceipt` receipts
+    against the receipt ledger's semantics and seal the whole segment as
+    a transferable batch.
+
+    ``receipts`` must be a non-empty ordered iterable whose entries are
+    each a :class:`SpanBundleReceipt` or its canonical
+    :meth:`SpanBundleReceipt.to_bytes` encoding, and ``key`` the
+    non-empty shared ``bytes`` key. ``start`` is keyword-only: ``None``
+    (the default) starts the chain from the empty ledger — sequence zero,
+    no receipt at all, the digest chain rooted at ``d0`` — otherwise it
+    must be a :class:`SpanBundleReceiptFrontier` or its canonical
+    :meth:`SpanBundleReceiptFrontier.to_bytes` encoding. A non-iterable
+    ``receipts``, a non-``bytes`` ``key``, a wrong-typed receipt or a
+    wrong-kind ``start`` raises :class:`TypeError`; an empty sequence, an
+    empty key, a malformed or non-canonical encoding, a receipt whose
+    ``NPBJ36`` signature does not verify, a broken link, a u64 sequence
+    overflow or a start frontier that fails its signature check raises
+    :class:`ValueError`. The whole chain is verified first — each
+    receipt's signature re-verified and each receipt linked byte for
+    byte, the sequence and digest-chain head advanced exactly as
+    :class:`SpanBundleReceiptAuditor` advances them, starting from the
+    supplied frontier — and only on success is the batch produced purely
+    by computation: ``start`` carries the starting point (``b""`` when
+    ``start`` is ``None``, else the frontier's canonical encoding),
+    ``receipts`` the canonical encoding of every receipt in order and
+    ``end`` the canonical encoding of the final receipt ledger frontier,
+    signed as ``HMAC-SHA256(key, b"NPBJ38" + C)``. Sealing touches no
+    auditor state.
+    """
+    try:
+        raw_receipts = list(receipts)  # type: ignore[arg-type]
+    except TypeError:
+        raise TypeError(
+            "receipts must be an iterable of SpanBundleReceipt receipts"
+        ) from None
+    # The constructor validates the key (non-empty bytes) and the
+    # keyword-only start frontier (a SpanBundleReceiptFrontier, its
+    # canonical bytes or None), parsing and signature-checking a supplied
+    # frontier at every layer.
+    auditor = SpanBundleReceiptAuditor(key, checkpoint=start)
+    coerced = [
+        _coerce_span_bundle_receipt(receipt, "receipts")
+        for receipt in raw_receipts
+    ]
+    if not coerced:
+        raise ValueError("receipts must be a non-empty sequence")
+    if start is None:
+        start_bytes = b""
+    elif isinstance(start, SpanBundleReceiptFrontier):
+        start_bytes = start.to_bytes()
+    else:
+        # Canonical SpanBundleReceiptFrontier bytes, already validated by
+        # the auditor constructor.
+        start_bytes = start  # type: ignore[assignment]
+    # Replay the whole chain on the temporary frontier seeded with the
+    # start; each receipt is re-verified and linked/advanced exactly like
+    # the ledger rules. A failure here raises before anything is sealed.
+    final = _replay_span_bundle_receipt_batch(
+        key,
+        auditor.checkpoint,
+        tuple(receipt.to_bytes() for receipt in coerced),
+    )
+    batch = SpanBundleReceiptBatch(
+        version=1,
+        start=start_bytes,
+        receipts=tuple(receipt.to_bytes() for receipt in coerced),
+        end=final.to_bytes(),
+        signature=b"\x00" * 32,
+    )
+    return replace(
+        batch,
+        signature=_span_bundle_receipt_batch_signature(key, batch),
+    )
+
+
+def audit_span_bundle_receipt_batch(
+    x: object, key: object
+) -> "SpanBundleReceiptFrontier":
+    """Re-verify a :class:`SpanBundleReceiptBatch` against ``key``.
+
+    ``x`` must be a :class:`SpanBundleReceiptBatch` or its canonical
+    :meth:`SpanBundleReceiptBatch.to_bytes` encoding and ``key`` the
+    non-empty shared ``bytes`` key — a wrong-typed argument raises
+    :class:`TypeError`, every other contract violation raises
+    :class:`ValueError`. The batch signature is recomputed as
+    ``HMAC-SHA256(key, b"NPBJ38" + C)`` and compared in constant time;
+    then each non-empty endpoint :class:`SpanBundleReceiptFrontier` is
+    checked at every signature layer exactly as
+    :func:`_verify_span_bundle_receipt_frontier_signatures` recomputes
+    them — the frontier's own ``NPBJ37`` signature and every MAC layer
+    of its ``end`` range frontier — all always recomputed and each
+    compared in constant time, and finally the carried receipts are
+    replayed one by one on a tentative frontier: each receipt's
+    ``NPBJ36`` signature re-verified, each receipt ``start`` continuing
+    byte for byte from the tentative frontier ``end`` with the first
+    linking to the batch ``start``, and the non-bool u64 sequence, the
+    digest-chain head and the frontier signature advancing per
+    ``NPBJ37`` exactly as :class:`SpanBundleReceiptAuditor` advances
+    them, starting with no receipt at all when ``start`` is empty and
+    from the carried starting frontier otherwise; the replayed final
+    frontier must equal the batch's ``end`` byte for byte. Auditing is a
+    pure check: it touches no auditor state and returns no partial
+    result — on success the frozen :class:`SpanBundleReceiptFrontier`
+    the chain ends at is returned.
+    """
+    batch = _coerce_span_bundle_receipt_batch(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _span_bundle_receipt_batch_signature(key, batch), batch.signature
+    ):
+        raise ValueError(
+            "span bundle receipt batch signature does not match the key"
+        )
+    start_frontier: "Optional[SpanBundleReceiptFrontier]" = None
+    if batch.start:
+        start_frontier = SpanBundleReceiptFrontier.from_bytes(batch.start)
+        _verify_span_bundle_receipt_frontier_signatures(
+            key, start_frontier
+        )
+    _verify_span_bundle_receipt_frontier_signatures(
+        key, SpanBundleReceiptFrontier.from_bytes(batch.end)
+    )
+    final = _replay_span_bundle_receipt_batch(
+        key, start_frontier, batch.receipts
+    )
+    if final.to_bytes() != batch.end:
+        raise ValueError(
+            "span bundle receipt batch end does not match the replayed"
+            " chain"
+        )
+    return final
 
 
 def _range_batch_receipt_content(
