@@ -24,7 +24,7 @@ StreamCommitReceiptBundleReceipt /
 StreamCommitReceiptBundleReceiptAuditor /
 StreamCommitReceiptBundleReceiptFrontier /
 StreamCommitReceiptFrontier /
-StreamCommitReceiptSpan /
+StreamCommitReceiptSpan / StreamCommitReceiptSpanReceipt /
 StreamReceiptBatchCommitReceipt / StreamReceiptFrontier /
 TrustRevocation /
 TrustRevocationList / Verifier /
@@ -39,6 +39,7 @@ audit_proof / audit_range / audit_receipt /
 audit_batch_receipt / audit_range_receipt_batch / audit_stream /
 audit_stream_commit_receipt_bundle /
 audit_stream_commit_receipt_span /
+audit_stream_commit_receipt_span_receipt /
 audit_stream_receipt / audit_stream_receipt_batch_commit_receipt /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
@@ -123,6 +124,7 @@ __all__ = [
     "StreamCommitReceiptBundleReceiptFrontier",
     "StreamCommitReceiptFrontier",
     "StreamCommitReceiptSpan",
+    "StreamCommitReceiptSpanReceipt",
     "StreamReceipt",
     "StreamReceiptAuditor",
     "StreamReceiptBatch",
@@ -157,6 +159,7 @@ __all__ = [
     "audit_stream_commit_receipt_bundle",
     "audit_stream_commit_receipt_bundle_receipt",
     "audit_stream_commit_receipt_span",
+    "audit_stream_commit_receipt_span_receipt",
     "audit_stream_receipt",
     "audit_stream_receipt_batch_commit_receipt",
     "cert",
@@ -286,6 +289,9 @@ _STREAM_COMMIT_RECEIPT_BUNDLE_RECEIPT_FRONTIER_MAC_PREFIX = b"NPBJ29"
 _STREAM_COMMIT_RECEIPT_BUNDLE_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPBJ30"
 # Domain separation prefix for the stream commit-receipt span MAC.
 _STREAM_COMMIT_RECEIPT_SPAN_PREFIX = b"NPBJ31"
+
+# Domain tag of the stream-commit-receipt span-receipt signature.
+_STREAM_COMMIT_RECEIPT_SPAN_RECEIPT_PREFIX = b"NPBJ32"
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -14424,24 +14430,70 @@ class StreamCommitReceiptBundleReceiptAuditor:
         partially applied. Returns the auditor itself.
         """
         with self._lock:
-            span = _coerce_stream_commit_receipt_span(x, "x")
-            # audit_stream_commit_receipt_span is a pure check: it
-            # recomputes the NPBJ31 span MAC, verifies both endpoint
-            # frontiers at every layer and fully re-verifies and replays
-            # every carried receipt/bundle pair onto a tentative
-            # frontier, returning the frozen frontier at the span end —
-            # touching no auditor state.
-            final = audit_stream_commit_receipt_span(span, self._key)
-            current = (
-                b"" if self._frontier is None else self._frontier.to_bytes()
-            )
-            if span.start != current:
-                raise ValueError(
-                    "stream commit receipt span start does not match the"
-                    " frontier"
-                )
-            self._frontier = final
+            self._audit_span_locked(x)
             return self
+
+    def _audit_span_locked(
+        self, x: object
+    ) -> "StreamCommitReceiptSpan":
+        """The lock-held body of :meth:`audit_span`: verify and book one
+        whole span, returning the coerced span. The caller must hold the
+        auditor lock; every failure raises before any state change."""
+        span = _coerce_stream_commit_receipt_span(x, "x")
+        # audit_stream_commit_receipt_span is a pure check: it
+        # recomputes the NPBJ31 span MAC, verifies both endpoint
+        # frontiers at every layer and fully re-verifies and replays
+        # every carried receipt/bundle pair onto a tentative
+        # frontier, returning the frozen frontier at the span end —
+        # touching no auditor state.
+        final = audit_stream_commit_receipt_span(span, self._key)
+        current = (
+            b"" if self._frontier is None else self._frontier.to_bytes()
+        )
+        if span.start != current:
+            raise ValueError(
+                "stream commit receipt span start does not match the"
+                " frontier"
+            )
+        self._frontier = final
+        return span
+
+    def commit_span(self, x: object) -> "StreamCommitReceiptSpanReceipt":
+        """Atomically book one whole :class:`StreamCommitReceiptSpan`
+        exactly like :meth:`audit_span` and return a
+        :class:`StreamCommitReceiptSpanReceipt` attesting the commit.
+
+        ``x`` follows the same contract as :meth:`audit_span` — a
+        :class:`StreamCommitReceiptSpan` or its canonical bytes; any
+        other type raises :class:`TypeError`, every other contract
+        violation raises :class:`ValueError`. Verification and the
+        frontier advance run under the same auditor lock as
+        :meth:`audit`/:meth:`audit_span`, so concurrent calls linearize
+        in lock-acquisition order; the receipt is signed out only after
+        the checkpoint has been successfully replaced, and any failure
+        leaves the checkpoint untouched and produces no receipt. The
+        returned receipt carries the span's ``start`` and ``end``, the
+        span digest ``SHA256(span.to_bytes())`` binding the receipt to
+        that one determined span, and the signature
+        ``HMAC-SHA256(key, b"NPBJ32" + C)`` over the canonical encoding
+        of the first four fields. The legacy :meth:`audit_span`
+        interface is unchanged.
+        """
+        with self._lock:
+            span = self._audit_span_locked(x)
+            receipt = StreamCommitReceiptSpanReceipt(
+                version=1,
+                start=span.start,
+                span_digest=hashlib.sha256(span.to_bytes()).digest(),
+                end=span.end,
+                mac=b"\x00" * 32,
+            )
+            return replace(
+                receipt,
+                mac=_stream_commit_receipt_span_receipt_mac(
+                    self._key, receipt
+                ),
+            )
 
 
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
@@ -18716,3 +18768,312 @@ def audit_stream_commit_receipt_span(
             " chain"
         )
     return final
+
+
+def _stream_commit_receipt_span_receipt_content(
+    receipt: "StreamCommitReceiptSpanReceipt",
+) -> list:
+    """The JSON-ready first four stream-commit-receipt span-receipt
+    fields (everything but ``mac``)."""
+    return [
+        receipt.version,
+        receipt.start.hex(),
+        receipt.span_digest.hex(),
+        receipt.end.hex(),
+    ]
+
+
+def _stream_commit_receipt_span_receipt_content_bytes(
+    receipt: "StreamCommitReceiptSpanReceipt",
+) -> bytes:
+    """The canonical compact encoding ``C`` of the first four
+    stream-commit-receipt span-receipt fields, ``[1, S, D, E]``."""
+    return _encode_payload(
+        _stream_commit_receipt_span_receipt_content(receipt)
+    )
+
+
+def _stream_commit_receipt_span_receipt_mac(
+    key: bytes, receipt: "StreamCommitReceiptSpanReceipt"
+) -> bytes:
+    """``M = HMAC-SHA256(key, b"NPBJ32" + C)`` where ``C`` is the
+    canonical encoding of the first four fields. The prefix and ``C``
+    are concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _STREAM_COMMIT_RECEIPT_SPAN_RECEIPT_PREFIX
+        + _stream_commit_receipt_span_receipt_content_bytes(receipt),
+        hashlib.sha256,
+    ).digest()
+
+
+@dataclass(frozen=True)
+class StreamCommitReceiptSpanReceipt:
+    """A key-signed, transferable receipt attesting that one whole
+    :class:`StreamCommitReceiptSpan` was committed to the batch-commit
+    receipt ledger as a single atomic step.
+
+    ``version`` is always ``1``. ``start`` is the canonical
+    :meth:`StreamCommitReceiptBundleReceiptFrontier.to_bytes` encoding
+    of the ledger frontier the committed span started from, or ``b""``
+    when it started from the empty ledger. ``span_digest`` is exactly
+    32 bytes — ``SHA256(span.to_bytes())`` over the canonical encoding
+    of the committed :class:`StreamCommitReceiptSpan`, binding the
+    receipt to that one determined span and no other span over the same
+    endpoints. ``end`` is the canonical non-empty
+    :meth:`StreamCommitReceiptBundleReceiptFrontier.to_bytes` encoding
+    of the ledger frontier the span ended at. ``mac`` is exactly 32
+    bytes — ``M = HMAC-SHA256(key, b"NPBJ32" + C)`` where ``C`` is the
+    canonical compact encoding of the first four fields (the version,
+    the lowercase-hex start, the lowercase-hex span digest and the
+    lowercase-hex end, without ``mac``), the prefix and ``C``
+    concatenated directly with no separator or length prefix. Instances
+    are frozen, constructed positionally in field order and compare
+    equal by their fields. A field of the wrong type raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    start: bytes
+    span_digest: bytes
+    end: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "stream commit receipt span receipt version must be an"
+                " integer"
+            )
+        if self.version != 1:
+            raise ValueError(
+                "stream commit receipt span receipt version must be 1"
+            )
+        if not isinstance(self.start, bytes):
+            raise TypeError(
+                "stream commit receipt span receipt start must be bytes"
+            )
+        _require_stream_commit_receipt_span_frontier(
+            self.start, "start", allow_empty=True
+        )
+        if not isinstance(self.span_digest, bytes):
+            raise TypeError(
+                "stream commit receipt span receipt span digest must"
+                " be bytes"
+            )
+        if len(self.span_digest) != 32:
+            raise ValueError(
+                "stream commit receipt span receipt span digest must"
+                " be exactly 32 bytes"
+            )
+        if not isinstance(self.end, bytes):
+            raise TypeError(
+                "stream commit receipt span receipt end must be bytes"
+            )
+        _require_stream_commit_receipt_span_frontier(
+            self.end, "end", allow_empty=False
+        )
+        if not isinstance(self.mac, bytes):
+            raise TypeError(
+                "stream commit receipt span receipt mac must be bytes"
+            )
+        if len(self.mac) != 32:
+            raise ValueError(
+                "stream commit receipt span receipt mac must be exactly"
+                " 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, start, span_digest, end, mac]`` where ``start``,
+        ``span_digest``, ``end`` and ``mac`` are lowercase hex, no
+        whitespace, no length prefix."""
+        return _encode_payload(
+            _stream_commit_receipt_span_receipt_content(self)
+            + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "StreamCommitReceiptSpanReceipt":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, start, span_digest, end, mac]`` in that
+        order, ``version == 1``, ``start`` a lowercase hex string that
+        is empty or decodes to the canonical
+        :class:`StreamCommitReceiptBundleReceiptFrontier` encoding,
+        ``span_digest`` and ``mac`` lowercase hex strings each decoding
+        to exactly 32 bytes and ``end`` a lowercase hex string decoding
+        to the canonical non-empty
+        :class:`StreamCommitReceiptBundleReceiptFrontier` encoding.
+        After parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical
+        spelling are rejected too. No signature is verified here —
+        neither the receipt signature nor any signature of the endpoint
+        frontiers; pass the record together with the committed span to
+        :func:`audit_stream_commit_receipt_span_receipt` with the shared
+        key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "stream commit receipt span receipt data must be bytes"
+            )
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                "stream commit receipt span receipt is not valid JSON:"
+                f" {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "stream commit receipt span receipt must be a JSON array"
+                " of exactly version, start, span digest, end and mac"
+            )
+        raw_version, raw_start, raw_span_digest, raw_end, raw_mac = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "stream commit receipt span receipt version must be an"
+                " integer"
+            )
+        if raw_version != 1:
+            raise ValueError(
+                "stream commit receipt span receipt version must be 1"
+            )
+        start = _parse_bit_map_hex(
+            raw_start, "stream commit receipt span receipt start"
+        )
+        _require_stream_commit_receipt_span_frontier(
+            start, "start", allow_empty=True
+        )
+        span_digest = _parse_bit_map_hex(
+            raw_span_digest,
+            "stream commit receipt span receipt span digest",
+        )
+        if len(span_digest) != 32:
+            raise ValueError(
+                "stream commit receipt span receipt span digest must"
+                " decode to exactly 32 bytes"
+            )
+        end = _parse_bit_map_hex(
+            raw_end, "stream commit receipt span receipt end"
+        )
+        _require_stream_commit_receipt_span_frontier(
+            end, "end", allow_empty=False
+        )
+        mac = _parse_bit_map_hex(
+            raw_mac, "stream commit receipt span receipt mac"
+        )
+        if len(mac) != 32:
+            raise ValueError(
+                "stream commit receipt span receipt mac must decode to"
+                " exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            start=start,
+            span_digest=span_digest,
+            end=end,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "stream commit receipt span receipt encoding is not"
+                " canonical"
+            )
+        return record
+
+
+def _coerce_stream_commit_receipt_span_receipt(
+    x: object, name: str
+) -> "StreamCommitReceiptSpanReceipt":
+    """Coerce a :class:`StreamCommitReceiptSpanReceipt` or its canonical
+    bytes, splitting the TypeError/ValueError contract exactly as the
+    public auditors do: the wrong kind of argument raises
+    :class:`TypeError`, a field-shape failure surfacing while parsing
+    byte content of the right kind is a value error."""
+    if isinstance(x, StreamCommitReceiptSpanReceipt):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return StreamCommitReceiptSpanReceipt.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the stream commit receipt span"
+                " receipt field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a StreamCommitReceiptSpanReceipt instance or"
+        " its canonical bytes"
+    )
+
+
+def audit_stream_commit_receipt_span_receipt(
+    receipt: object, span: object, key: object
+) -> "StreamCommitReceiptBundleReceiptFrontier":
+    """Re-verify a :class:`StreamCommitReceiptSpanReceipt` against the
+    :class:`StreamCommitReceiptSpan` it attests and ``key``.
+
+    ``receipt`` must be a :class:`StreamCommitReceiptSpanReceipt` or its
+    canonical :meth:`StreamCommitReceiptSpanReceipt.to_bytes` encoding,
+    ``span`` the committed :class:`StreamCommitReceiptSpan` or its
+    canonical :meth:`StreamCommitReceiptSpan.to_bytes` encoding and
+    ``key`` the non-empty shared ``bytes`` key — a wrong-typed argument
+    raises :class:`TypeError`, every other contract violation raises
+    :class:`ValueError`. The receipt signature is recomputed as
+    ``HMAC-SHA256(key, b"NPBJ32" + C)`` and compared in constant time,
+    and the span digest ``SHA256(span.to_bytes())`` is recomputed and
+    compared against the carried ``span_digest`` in constant time, so
+    the receipt is bound to that one determined span; then the receipt
+    ``start`` and ``end`` must equal the span's ``start`` and ``end``
+    byte for byte. Finally the span itself is re-verified in full
+    exactly as :func:`audit_stream_commit_receipt_span` verifies it —
+    its ``NPBJ31`` MAC, both endpoint frontiers at every MAC layer and
+    the whole carried receipt/bundle chain replayed onto a tentative
+    frontier that must reach the span ``end`` byte for byte. Auditing is
+    a pure check: it touches no auditor state and returns no partial
+    result — on success the frozen
+    :class:`StreamCommitReceiptBundleReceiptFrontier` the committed
+    chain ends at is returned.
+    """
+    record = _coerce_stream_commit_receipt_span_receipt(receipt, "receipt")
+    span_record = _coerce_stream_commit_receipt_span(span, "span")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _stream_commit_receipt_span_receipt_mac(key, record), record.mac
+    ):
+        raise ValueError(
+            "stream commit receipt span receipt mac does not match"
+        )
+    if not hmac.compare_digest(
+        hashlib.sha256(span_record.to_bytes()).digest(),
+        record.span_digest,
+    ):
+        raise ValueError(
+            "stream commit receipt span receipt span digest does not"
+            " match the span"
+        )
+    if record.start != span_record.start:
+        raise ValueError(
+            "stream commit receipt span receipt start does not match"
+            " the span start"
+        )
+    if record.end != span_record.end:
+        raise ValueError(
+            "stream commit receipt span receipt end does not match"
+            " the span end"
+        )
+    # audit_stream_commit_receipt_span is a pure check: the NPBJ31 span
+    # MAC, both endpoint frontiers at every MAC layer and the whole
+    # carried receipt/bundle chain replayed onto a tentative frontier,
+    # returning the frozen frontier at the span end.
+    return audit_stream_commit_receipt_span(span_record, key)
