@@ -12241,10 +12241,23 @@ def audit_span_bundle_receipt_batch_receipt(
     )
     start_ok = hmac.compare_digest(record.start, sealed.start)
     end_ok = hmac.compare_digest(record.end, sealed.end)
-    if not signature_ok or not digest_ok or not start_ok or not end_ok:
+    # The three failure classes carry distinguishable wording: a bad
+    # receipt signature, a bad batch digest and mismatched endpoints each
+    # name themselves.
+    if not signature_ok:
         raise ValueError(
-            "span bundle receipt batch receipt signature, batch digest"
-            " or endpoints do not match"
+            "span bundle receipt batch receipt signature does not match"
+            " the key"
+        )
+    if not digest_ok:
+        raise ValueError(
+            "span bundle receipt batch receipt batch digest does not"
+            " match the batch"
+        )
+    if not start_ok or not end_ok:
+        raise ValueError(
+            "span bundle receipt batch receipt endpoints do not match the"
+            " batch"
         )
     # Verifying the batch re-verifies its NPBJ38 signature, every
     # signature layer of both endpoint frontiers and the whole carried
