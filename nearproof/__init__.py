@@ -140,6 +140,8 @@ __all__ = [
     "SpanBundleReceiptBatchReceiptAuditor",
     "SpanBundleReceiptBatchReceiptBundle",
     "SpanBundleReceiptBatchReceiptBundleReceipt",
+    "SpanBundleReceiptBatchReceiptBundleReceiptAuditor",
+    "SpanBundleReceiptBatchReceiptBundleReceiptFrontier",
     "SpanBundleReceiptBatchReceiptFrontier",
     "SpanBundleReceiptFrontier",
     "SpanReceiptBundle",
@@ -353,6 +355,14 @@ _SPAN_BUNDLE_RECEIPT_BATCH_RECEIPT_BUNDLE_PREFIX = b"NPBJ41"
 # Domain separation prefix for the span-bundle-receipt batch-receipt
 # bundle receipt signature.
 _SPAN_BUNDLE_RECEIPT_BATCH_RECEIPT_BUNDLE_RECEIPT_PREFIX = b"NPBJ42"
+# Domain separation prefixes for the bundle-receipt ledger frontier: the
+# frontier signature and the per-receipt digest-chain step respectively.
+_SPAN_BUNDLE_RECEIPT_BATCH_RECEIPT_BUNDLE_RECEIPT_FRONTIER_SIGNATURE_PREFIX = (
+    b"NPBJ43"
+)
+_SPAN_BUNDLE_RECEIPT_BATCH_RECEIPT_BUNDLE_RECEIPT_FRONTIER_DIGEST_PREFIX = (
+    b"NPBJ44"
+)
 # A bit transcript (t) is 16 random bytes; per-bit responses are 32 bytes.
 BIT_T_BYTES = 16
 BIT_R_BYTES = 32
@@ -13930,7 +13940,7 @@ def audit_span_bundle_receipt_batch_receipt_bundle_receipt(
         raise ValueError("key must be non-empty")
     # The receipt signature, the bundle digest and the two endpoints are
     # all always recomputed/compared in constant time before any result
-    # is consulted.
+    # is consulted; each failure class raises its own ValueError message.
     signature_ok = hmac.compare_digest(
         _span_bundle_receipt_batch_receipt_bundle_receipt_signature(
             key, record
@@ -13943,10 +13953,20 @@ def audit_span_bundle_receipt_batch_receipt_bundle_receipt(
     )
     start_ok = hmac.compare_digest(record.start, sealed.start)
     end_ok = hmac.compare_digest(record.end, sealed.end)
-    if not signature_ok or not digest_ok or not start_ok or not end_ok:
+    if not signature_ok:
         raise ValueError(
-            "span bundle receipt batch receipt bundle receipt"
-            " signature, bundle digest or endpoints do not match"
+            "span bundle receipt batch receipt bundle receipt signature"
+            " does not match the key"
+        )
+    if not digest_ok:
+        raise ValueError(
+            "span bundle receipt batch receipt bundle receipt bundle"
+            " digest does not match the bundle"
+        )
+    if not start_ok or not end_ok:
+        raise ValueError(
+            "span bundle receipt batch receipt bundle receipt endpoints"
+            " do not match the bundle"
         )
     # Verifying the bundle re-verifies its NPBJ41 signature, every
     # signature layer of both endpoint frontiers and the whole carried
@@ -23896,6 +23916,534 @@ class StreamCommitReceiptSpanReceiptAuditor:
                     _stream_commit_receipt_span_receipt_frontier_signature(
                         self._key, candidate
                     )
+                ),
+            )
+            return self
+
+
+def _span_bundle_receipt_batch_receipt_bundle_receipt_frontier_content(
+    frontier: "SpanBundleReceiptBatchReceiptBundleReceiptFrontier",
+) -> list:
+    """The JSON-ready first four bundle-receipt-frontier fields
+    (everything but ``signature``)."""
+    return [
+        frontier.version,
+        frontier.sequence,
+        frontier.end.hex(),
+        frontier.digest.hex(),
+    ]
+
+
+def _span_bundle_receipt_batch_receipt_bundle_receipt_frontier_content_bytes(
+    frontier: "SpanBundleReceiptBatchReceiptBundleReceiptFrontier",
+) -> bytes:
+    """The canonical compact encoding ``C`` of the first four
+    bundle-receipt-frontier fields,
+    ``[1, sequence, end, digest]``."""
+    return _encode_payload(
+        _span_bundle_receipt_batch_receipt_bundle_receipt_frontier_content(
+            frontier
+        )
+    )
+
+
+def _span_bundle_receipt_batch_receipt_bundle_receipt_frontier_signature(
+    key: bytes,
+    frontier: "SpanBundleReceiptBatchReceiptBundleReceiptFrontier",
+) -> bytes:
+    """``HMAC-SHA256(key, b"NPBJ43" + C)`` where ``C`` is the canonical
+    encoding of the first four fields. The prefix and ``C`` are
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key,
+        _SPAN_BUNDLE_RECEIPT_BATCH_RECEIPT_BUNDLE_RECEIPT_FRONTIER_SIGNATURE_PREFIX
+        + _span_bundle_receipt_batch_receipt_bundle_receipt_frontier_content_bytes(
+            frontier
+        ),
+        hashlib.sha256,
+    ).digest()
+
+
+def _span_bundle_receipt_batch_receipt_bundle_receipt_frontier_next_digest(
+    previous: bytes, sequence: int, receipt: bytes
+) -> bytes:
+    """One bundle-receipt digest-chain step:
+    ``SHA256(b"NPBJ44" + d + u64be(n) + R)``.
+
+    The prefix, the previous 32-byte digest, the fixed 8-byte big-endian
+    sequence and the canonical
+    :class:`SpanBundleReceiptBatchReceiptBundleReceipt` bytes are
+    concatenated directly with no separator or length prefix."""
+    return hashlib.sha256(
+        _SPAN_BUNDLE_RECEIPT_BATCH_RECEIPT_BUNDLE_RECEIPT_FRONTIER_DIGEST_PREFIX
+        + previous
+        + _bit_map_history_journal_u64be(sequence)
+        + receipt
+    ).digest()
+
+
+def _require_span_bundle_receipt_batch_receipt_bundle_receipt_frontier_end(
+    value: bytes,
+) -> None:
+    """Enforce that a bundle-receipt frontier ``end`` is the canonical
+    non-empty :class:`SpanBundleReceiptBatchReceiptFrontier` encoding.
+    ``value`` is already known to be ``bytes``;
+    :meth:`SpanBundleReceiptBatchReceiptFrontier.from_bytes` enforces the
+    full contract including its canonical re-encoding check, and every
+    violation — including the field-shape :class:`TypeError` a malformed
+    inner document would otherwise surface — raises
+    :class:`ValueError`."""
+    try:
+        SpanBundleReceiptBatchReceiptFrontier.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "span bundle receipt batch receipt bundle receipt frontier"
+            " end must be the canonical non-empty"
+            " SpanBundleReceiptBatchReceiptFrontier encoding"
+        ) from error
+
+
+@dataclass(frozen=True)
+class SpanBundleReceiptBatchReceiptBundleReceiptFrontier:
+    """A key-signed, digest-chained frontier over the audited
+    :class:`SpanBundleReceiptBatchReceiptBundleReceipt` receipt stream.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer (the number of audited
+    :class:`SpanBundleReceiptBatchReceiptBundleReceipt` receipts);
+    ``end`` the canonical non-empty
+    :meth:`SpanBundleReceiptBatchReceiptFrontier.to_bytes` encoding of
+    the batch-receipt ledger frontier the audited bundle-receipt chain
+    currently ends at; ``digest`` exactly 32 bytes — the head of a hash
+    chain with ``d0`` fixed at 32 zero bytes and each accepted bundle
+    receipt extending it as
+    ``d' = SHA256(b"NPBJ44" + d + u64be(n) + R)`` where ``n`` is the
+    new sequence, ``u64be(n)`` its fixed 8-byte big-endian encoding and
+    ``R`` the canonical
+    :meth:`SpanBundleReceiptBatchReceiptBundleReceipt.to_bytes` bytes,
+    every part concatenated directly with no separator or length prefix;
+    ``signature`` exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPBJ43" + C)`` where ``C`` is the canonical
+    compact encoding of the first four fields (the version, sequence,
+    lowercase-hex end and lowercase-hex digest, without ``signature``),
+    the prefix and ``C`` concatenated directly with no separator or
+    length prefix. Instances are frozen, constructed positionally in
+    field order and compare equal by their fields. A field of the wrong
+    type raises :class:`TypeError`; every other contract violation
+    raises :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    sequence: int
+    end: bytes
+    digest: bytes
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier version must be 1"
+            )
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier sequence must be a non-bool integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier sequence must fit in an unsigned 64-bit"
+                " integer"
+            )
+        if not isinstance(self.end, bytes):
+            raise TypeError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier end must be bytes"
+            )
+        _require_span_bundle_receipt_batch_receipt_bundle_receipt_frontier_end(
+            self.end
+        )
+        for name in ("digest", "signature"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(
+                    "span bundle receipt batch receipt bundle receipt"
+                    f" frontier {name} must be bytes"
+                )
+            if len(value) != 32:
+                raise ValueError(
+                    "span bundle receipt batch receipt bundle receipt"
+                    f" frontier {name} must be exactly 32 bytes"
+                )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, sequence, end, digest, signature]`` where ``end``,
+        ``digest`` and ``signature`` are lowercase hex, no whitespace,
+        no length prefix."""
+        return _encode_payload(
+            _span_bundle_receipt_batch_receipt_bundle_receipt_frontier_content(
+                self
+            )
+            + [self.signature.hex()]
+        )
+
+    @classmethod
+    def from_bytes(
+        cls, data: bytes
+    ) -> "SpanBundleReceiptBatchReceiptBundleReceiptFrontier":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and
+        for fields of the wrong type; raises :class:`ValueError` for
+        anything that does not satisfy the value contract: an array of
+        exactly ``[version, sequence, end, digest, signature]`` in that
+        order, ``version == 1``, ``sequence`` a non-bool u64, ``end`` a
+        lowercase hex string decoding to the canonical non-empty
+        :class:`SpanBundleReceiptBatchReceiptFrontier` encoding, and
+        ``digest``/``signature`` lowercase hex strings decoding to
+        exactly 32 bytes each. After parsing and field validation the
+        record is re-encoded with :meth:`to_bytes` and the result must
+        equal the input byte for byte, so formatted JSON, whitespace and
+        any non-canonical spelling are rejected too. No signature is
+        verified here — neither the bundle-receipt frontier signature
+        nor any signature of the nested ``end`` batch-receipt ledger
+        frontier; pass the record to
+        :class:`SpanBundleReceiptBatchReceiptBundleReceiptAuditor` for
+        that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier data must be bytes"
+            )
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                "span bundle receipt batch receipt bundle receipt"
+                f" frontier is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 5:
+            raise ValueError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier must be a JSON array of exactly version,"
+                " sequence, end, digest and signature"
+            )
+        raw_version, raw_sequence, raw_end, raw_digest, raw_signature = outer
+        if type(raw_version) is not int:
+            raise TypeError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier version must be an integer"
+            )
+        if raw_version != 1:
+            raise ValueError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier version must be 1"
+            )
+        if type(raw_sequence) is not int:
+            raise TypeError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier sequence must be a non-bool integer"
+            )
+        if not 0 <= raw_sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier sequence must fit in an unsigned 64-bit"
+                " integer"
+            )
+        end = _parse_bit_map_hex(
+            raw_end,
+            "span bundle receipt batch receipt bundle receipt frontier"
+            " end",
+        )
+        _require_span_bundle_receipt_batch_receipt_bundle_receipt_frontier_end(
+            end
+        )
+        digest = _parse_bit_map_hex(
+            raw_digest,
+            "span bundle receipt batch receipt bundle receipt frontier"
+            " digest",
+        )
+        if len(digest) != 32:
+            raise ValueError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier digest must decode to exactly 32 bytes"
+            )
+        signature = _parse_bit_map_hex(
+            raw_signature,
+            "span bundle receipt batch receipt bundle receipt frontier"
+            " signature",
+        )
+        if len(signature) != 32:
+            raise ValueError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier signature must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            sequence=raw_sequence,
+            end=end,
+            digest=digest,
+            signature=signature,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "span bundle receipt batch receipt bundle receipt"
+                " frontier encoding is not canonical"
+            )
+        return record
+
+
+def _verify_span_bundle_receipt_batch_receipt_bundle_receipt_frontier_signatures(
+    key: bytes,
+    frontier: "SpanBundleReceiptBatchReceiptBundleReceiptFrontier",
+) -> None:
+    """Recompute the signature layers of a parsed bundle-receipt
+    frontier — the frontier's own ``NPBJ43`` signature over the
+    canonical encoding of its first four fields, and every signature
+    layer of its ``end`` batch-receipt ledger frontier exactly as
+    :func:`_verify_span_bundle_receipt_batch_receipt_frontier_signatures`
+    recomputes them (that endpoint's own ``NPBJ40`` signature, the
+    ``NPBJ37`` signature of the receipt ledger frontier nested in its
+    ``end`` and every layer below it, down through the checkpoint
+    table's ``NPBL1`` MAC). Every layer is always recomputed and each
+    compared in constant time before any result is consulted."""
+    frontier_signature_ok = hmac.compare_digest(
+        _span_bundle_receipt_batch_receipt_bundle_receipt_frontier_signature(
+            key, frontier
+        ),
+        frontier.signature,
+    )
+    endpoint_ok = True
+    try:
+        # _verify_span_bundle_receipt_batch_receipt_frontier_signatures
+        # recomputes the endpoint's own NPBJ40 signature and every
+        # nested layer of its end receipt ledger frontier, down through
+        # the NPBJ37 ledger-frontier signature and below.
+        _verify_span_bundle_receipt_batch_receipt_frontier_signatures(
+            key,
+            SpanBundleReceiptBatchReceiptFrontier.from_bytes(frontier.end),
+        )
+    except (TypeError, ValueError):
+        endpoint_ok = False
+    if not frontier_signature_ok or not endpoint_ok:
+        raise ValueError(
+            "span bundle receipt batch receipt bundle receipt frontier"
+            " signature does not match the key"
+        )
+
+
+class SpanBundleReceiptBatchReceiptBundleReceiptAuditor:
+    """Stateful anti-rollback ledger chaining audited
+    :class:`SpanBundleReceiptBatchReceiptBundleReceipt` receipts into
+    one monotone, restartable, sequence-numbered
+    :class:`SpanBundleReceiptBatchReceiptBundleReceiptFrontier`.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the
+    same shared key the bundle receipts, bundles, batch receipts,
+    batches and every nested frontier are signed or MAC'd with.
+    ``checkpoint`` is keyword-only: ``None`` (the default) starts from
+    sequence zero with no bundle receipt at all and the digest chain
+    rooted at ``d0`` (32 zero bytes); otherwise it must be a
+    :class:`SpanBundleReceiptBatchReceiptBundleReceiptFrontier` or its
+    canonical
+    :meth:`SpanBundleReceiptBatchReceiptBundleReceiptFrontier.to_bytes`
+    encoding (any other type raises :class:`TypeError`). A supplied
+    frontier is checked with every signature layer always recomputed
+    and each compared in constant time before any result is consulted:
+    the frontier's own ``NPBJ43`` signature over the canonical encoding
+    of its first four fields, and every signature layer of its ``end``
+    batch-receipt ledger frontier — that endpoint's own ``NPBJ40``
+    signature, the ``NPBJ37`` signature of the receipt ledger frontier
+    nested in its ``end`` and every layer below it. A malformed encoding
+    or any signature mismatch raises :class:`ValueError`. Across a
+    restart the caller must pass the value previously exported at
+    :attr:`checkpoint`; nothing is persisted by the auditor itself and
+    no alias of the checkpoint is retained beyond the frozen frontier
+    object.
+
+    Each :meth:`audit` accepts one
+    :class:`SpanBundleReceiptBatchReceiptBundleReceipt` and the
+    :class:`SpanBundleReceiptBatchReceiptBundle` it attests (either as
+    objects or as their canonical bytes) and, under the auditor lock,
+    first re-verifies the pair exactly like
+    :func:`audit_span_bundle_receipt_batch_receipt_bundle_receipt` —
+    the ``NPBJ42`` receipt signature, the bundle digest, the endpoint
+    equality and the whole attested bundle with its carried
+    receipt/batch chain — and then demands the receipt starts exactly
+    where the ledger currently stands: with no frontier the receipt's
+    ``start`` must be empty, and otherwise it must equal the frontier
+    ``end`` byte for byte. Only then does the frontier advance
+    atomically: ``n`` is the old sequence plus one, the new ``end`` is
+    the receipt's ``end``, the new digest is
+    ``SHA256(b"NPBJ44" + d + u64be(n) + R)`` over the previous digest,
+    the fixed 8-byte big-endian ``n`` and the canonical bundle-receipt
+    bytes, and the new frontier is signed as
+    ``HMAC-SHA256(key, b"NPBJ43" + C)``. Verification and the frontier
+    advance are one atomic step: a failed audit raises
+    :class:`ValueError` (and a wrong-typed argument :class:`TypeError`)
+    and leaves the frontier untouched — replaying the last accepted
+    receipt (same sequence, same digest), presenting an older or
+    lower-sequence receipt, presenting a same-sequence fork or any
+    other old fork all fail the start linkage exactly like a broken
+    chain, a receipt/bundle mismatch or a u64 overflow — and concurrent
+    audits linearize in lock-acquisition order so an accepted receipt
+    is never lost or rolled back.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._frontier: (
+            "Optional[SpanBundleReceiptBatchReceiptBundleReceiptFrontier]"
+        ) = None
+        if checkpoint is None:
+            return
+        if isinstance(
+            checkpoint,
+            SpanBundleReceiptBatchReceiptBundleReceiptFrontier,
+        ):
+            frontier = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                frontier = SpanBundleReceiptBatchReceiptBundleReceiptFrontier.from_bytes(
+                    checkpoint
+                )
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value
+                # error.
+                raise ValueError(
+                    "checkpoint does not satisfy the span bundle receipt"
+                    " batch receipt bundle receipt frontier field"
+                    " contract"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be a"
+                " SpanBundleReceiptBatchReceiptBundleReceiptFrontier"
+                " instance, its canonical bytes, or None"
+            )
+        _verify_span_bundle_receipt_batch_receipt_bundle_receipt_frontier_signatures(
+            self._key, frontier
+        )
+        self._frontier = frontier
+
+    @property
+    def checkpoint(
+        self,
+    ) -> "Optional[SpanBundleReceiptBatchReceiptBundleReceiptFrontier]":
+        """The current
+        :class:`SpanBundleReceiptBatchReceiptBundleReceiptFrontier`
+        checkpoint, or ``None`` before the first successfully audited
+        receipt. The returned object is frozen and the property
+        read-only; persist its
+        :meth:`SpanBundleReceiptBatchReceiptBundleReceiptFrontier.to_bytes`
+        output and pass it back to a new auditor to survive a restart.
+        There is no ``state`` alias."""
+        return self._frontier
+
+    def audit(
+        self, receipt: object, bundle: object
+    ) -> "SpanBundleReceiptBatchReceiptBundleReceiptAuditor":
+        """Audit one
+        :class:`SpanBundleReceiptBatchReceiptBundleReceipt` against the
+        :class:`SpanBundleReceiptBatchReceiptBundle` it attests and
+        advance the ledger.
+
+        ``receipt`` must be a
+        :class:`SpanBundleReceiptBatchReceiptBundleReceipt` or its
+        canonical
+        :meth:`SpanBundleReceiptBatchReceiptBundleReceipt.to_bytes`
+        encoding and ``bundle`` the
+        :class:`SpanBundleReceiptBatchReceiptBundle` it attests or its
+        canonical
+        :meth:`SpanBundleReceiptBatchReceiptBundle.to_bytes` encoding —
+        any other type raises :class:`TypeError`; a malformed or
+        non-canonical encoding, a signature or digest mismatch, a wrong
+        key, endpoints that do not match the bundle, a bundle that fails
+        verification, a receipt ``start`` that does not equal the
+        current frontier ``end`` (empty when no receipt has been
+        accepted yet), or a sequence that would overflow u64 raises
+        :class:`ValueError`. Replaying the last accepted receipt, an
+        older receipt or an old fork all fail that same start-linkage
+        check. The pair is re-verified exactly as
+        :func:`audit_span_bundle_receipt_batch_receipt_bundle_receipt`
+        verifies it and the start matched against the frontier under
+        the auditor lock, and the sequence, digest-chain head, end
+        frontier and frontier signature are all advanced in the same
+        atomic step, so a failed audit changes nothing and concurrent
+        audits are serialized in lock-acquisition order. Returns the
+        auditor itself.
+        """
+        with self._lock:
+            record = (
+                _coerce_span_bundle_receipt_batch_receipt_bundle_receipt(
+                    receipt, "receipt"
+                )
+            )
+            bound = _coerce_span_bundle_receipt_batch_receipt_bundle(
+                bundle, "bundle"
+            )
+            # audit_span_bundle_receipt_batch_receipt_bundle_receipt is
+            # a pure check: the NPBJ42 receipt signature, the bundle
+            # digest, the endpoints and the whole attested bundle
+            # chain, returning the frozen
+            # SpanBundleReceiptBatchReceiptFrontier at the bundle end.
+            audit_span_bundle_receipt_batch_receipt_bundle_receipt(
+                record, bound, self._key
+            )
+            current = (
+                b"" if self._frontier is None else self._frontier.end
+            )
+            if record.start != current:
+                raise ValueError(
+                    "span bundle receipt batch receipt bundle receipt"
+                    " start does not match the frontier end"
+                )
+            previous_sequence = (
+                0 if self._frontier is None else self._frontier.sequence
+            )
+            if previous_sequence >= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    "span bundle receipt batch receipt bundle receipt"
+                    " frontier sequence would overflow the unsigned"
+                    " 64-bit range"
+                )
+            sequence = previous_sequence + 1
+            previous_digest = (
+                b"\x00" * 32
+                if self._frontier is None
+                else self._frontier.digest
+            )
+            digest = _span_bundle_receipt_batch_receipt_bundle_receipt_frontier_next_digest(
+                previous_digest, sequence, record.to_bytes()
+            )
+            candidate = (
+                SpanBundleReceiptBatchReceiptBundleReceiptFrontier(
+                    version=1,
+                    sequence=sequence,
+                    end=record.end,
+                    digest=digest,
+                    signature=b"\x00" * 32,
+                )
+            )
+            self._frontier = replace(
+                candidate,
+                signature=_span_bundle_receipt_batch_receipt_bundle_receipt_frontier_signature(
+                    self._key, candidate
                 ),
             )
             return self

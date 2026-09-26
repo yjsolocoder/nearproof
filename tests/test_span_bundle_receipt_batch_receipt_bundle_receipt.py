@@ -843,6 +843,86 @@ class AuditBundleReceiptStatelessViolationTest(unittest.TestCase):
             )
 
 
+class AuditBundleReceiptStatelessMessageTest(unittest.TestCase):
+    """The three mismatch classes of the stateless entry raise
+    distinguishable ValueError messages."""
+
+    def _message(self, receipt, bundle):
+        with self.assertRaises(ValueError) as caught:
+            audit_span_bundle_receipt_batch_receipt_bundle_receipt(
+                receipt, bundle, KEY
+            )
+        return str(caught.exception)
+
+    def test_signature_mismatch_message(self):
+        message = self._message(
+            dataclasses.replace(BRECEIPT_1, signature=ZERO), BUNDLE_1
+        )
+        self.assertIn("signature", message)
+        self.assertNotIn("digest", message)
+        self.assertNotIn("endpoints", message)
+
+    def test_bundle_digest_mismatch_message(self):
+        message = self._message(self._forged_digest_receipt(), BUNDLE_1)
+        self.assertIn("digest", message)
+        self.assertNotIn("signature", message)
+        self.assertNotIn("endpoints", message)
+
+    @staticmethod
+    def _forged_digest_receipt():
+        # Honestly re-signed over a wrong bundle digest, so only the
+        # digest comparison fails.
+        forged = dataclasses.replace(BRECEIPT_1, bundle_digest=ZERO)
+        return dataclasses.replace(
+            forged,
+            signature=(
+                _span_bundle_receipt_batch_receipt_bundle_receipt_signature(
+                    KEY, forged
+                )
+            ),
+        )
+
+    def test_endpoints_mismatch_message(self):
+        forged_end = dataclasses.replace(
+            BRECEIPT_1, end=FRONTIER_2.to_bytes()
+        )
+        forged_end = dataclasses.replace(
+            forged_end,
+            signature=(
+                _span_bundle_receipt_batch_receipt_bundle_receipt_signature(
+                    KEY, forged_end
+                )
+            ),
+        )
+        message = self._message(forged_end, BUNDLE_1)
+        self.assertIn("endpoints", message)
+        self.assertNotIn("signature", message)
+        self.assertNotIn("digest", message)
+
+    def test_messages_are_pairwise_distinct(self):
+        signature_message = self._message(
+            dataclasses.replace(BRECEIPT_1, signature=ZERO), BUNDLE_1
+        )
+        digest_message = self._message(
+            self._forged_digest_receipt(), BUNDLE_1
+        )
+        forged_end = dataclasses.replace(
+            BRECEIPT_1, end=FRONTIER_2.to_bytes()
+        )
+        forged_end = dataclasses.replace(
+            forged_end,
+            signature=(
+                _span_bundle_receipt_batch_receipt_bundle_receipt_signature(
+                    KEY, forged_end
+                )
+            ),
+        )
+        endpoints_message = self._message(forged_end, BUNDLE_1)
+        self.assertEqual(
+            len({signature_message, digest_message, endpoints_message}), 3
+        )
+
+
 class ParameterNamingTest(unittest.TestCase):
     def test_audit_bundle_receipt_param_named_x(self):
         signature = inspect.signature(
