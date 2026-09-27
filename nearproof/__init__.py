@@ -1,6 +1,6 @@
 """nearproof - verifiable distance measurement and location proofs.
 
-Public API: AttestedObservation / BitEvidence / BitFrontier / BitGate /
+Public API: AssessEvidence / AttestedObservation / BitEvidence / BitFrontier / BitGate /
 BitGuard / BitMap / BitMapHistoryAuditor / BitMapHistoryEvidence /
 BitMapHistoryEvidenceAuditor / BitMapHistoryJournalAuditor /
 BitMapHistoryJournalBundle / BitMapHistoryJournalReceipt /
@@ -42,7 +42,7 @@ StreamReceiptBatchCommitReceipt / StreamReceiptFrontier /
 TrustRevocation /
 TrustRevocationList / Verifier /
 VerifierTrust / assess / attest_observation /
-attest_observation_for_point / audit / audit_b / audit_bound /
+attest_observation_for_point / audit / audit_assess_evidence / audit_b / audit_bound /
 audit_bound_policy /
 audit_cert_evidence / audit_crl / audit_map_history /
 audit_map_history_evidence / audit_map_history_journal_bundle /
@@ -63,7 +63,8 @@ audit_stream_receipt / audit_stream_receipt_batch_commit_receipt /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
-revoke_context / revoke_observation / revoke_trust / seal_map_history /
+revoke_context / revoke_observation / revoke_trust / seal_assess_evidence /
+seal_map_history /
 seal_map_history_journal_bundle / seal_range / seal_range_receipt_batch /
 seal_span_bundle_receipt_batch /
 seal_span_bundle_receipt_batch_receipt_bundle /
@@ -89,6 +90,7 @@ from statistics import median
 from typing import Callable, Optional
 
 __all__ = [
+    "AssessEvidence",
     "AttestedObservation",
     "BitEvidence",
     "BitFrontier",
@@ -179,6 +181,7 @@ __all__ = [
     "attest_observation",
     "attest_observation_for_point",
     "audit",
+    "audit_assess_evidence",
     "audit_b",
     "audit_batch_receipt",
     "audit_bound",
@@ -223,6 +226,7 @@ __all__ = [
     "revoke_context",
     "revoke_observation",
     "revoke_trust",
+    "seal_assess_evidence",
     "seal_map_history",
     "seal_map_history_journal_bundle",
     "seal_map_history_journal_receipt_batch",
@@ -259,6 +263,8 @@ _TRUST_PREFIX = b"NPVT1"
 _TRUST_REVOCATION_PREFIX = b"NPVR1"
 # Domain separation prefix for the trust-revocation-list MAC.
 _TRUST_REVOCATION_LIST_PREFIX = b"NPVRL1"
+# Domain separation prefix for the assess-evidence MAC.
+_ASSESS_EVIDENCE_PREFIX = b"NPAE1"
 # Domain separation prefix for the certified-consensus-evidence MAC.
 _CERT_EVIDENCE_PREFIX = b"NPCCE1"
 # Domain separation prefix for the CRL-snapshot proof MAC.
@@ -19140,6 +19146,18 @@ def assess(
     """
     bound, minimum = _check_assess_params(limit, min_samples)
 
+    measurements = _coerce_assess_samples(samples, key)
+    return _assess_measurements(measurements, bound, minimum)
+
+
+def _coerce_assess_samples(samples: object, key: object) -> list:
+    """Turn an ``assess`` sample iterable into a list of :class:`Measurement`.
+
+    Mirrors :func:`assess`: samples must be all :class:`Measurement` or all
+    :class:`Evidence`/canonical bytes; evidence samples are audited with
+    :func:`audit` under ``key``. Every contract violation raises
+    :class:`ValueError`.
+    """
     try:
         raw_samples = list(samples)  # type: ignore[arg-type]
     except TypeError as error:
@@ -19165,10 +19183,14 @@ def assess(
     if "evidence" in kinds:
         # audit() accepts Evidence and bytes alike, rejects an empty key and
         # verifies each record under the same semantics as a standalone call.
-        measurements = [audit(sample, key) for sample in raw_samples]
-    else:
-        measurements = list(raw_samples)  # type: ignore[arg-type]
+        return [audit(sample, key) for sample in raw_samples]
+    return list(raw_samples)  # type: ignore[arg-type]
 
+
+def _assess_measurements(
+    measurements: list, bound: float, minimum: int
+) -> "RangeDecision":
+    """The robust inlier decision over already-validated measurements."""
     if len(measurements) < minimum:
         raise ValueError(f"need at least {minimum} samples, got {len(measurements)}")
 
@@ -19215,6 +19237,480 @@ def assess(
         upper_bound=upper_bound,
         accepted=upper_bound <= bound,
     )
+
+
+def _assess_evidence_content(record: "AssessEvidence") -> list:
+    """The JSON-ready assess-evidence array without its ``mac``.
+
+    The samples are the lowercase hex strings of their canonical
+    :meth:`Evidence.to_bytes` encodings, in the record's own (canonical,
+    order-independent) order.
+    """
+    return [
+        record.version,
+        [sample.hex() for sample in record.samples],
+        record.limit,
+        record.min_samples,
+        record.sample_count,
+        record.upper_bound,
+        record.accepted,
+    ]
+
+
+def _assess_evidence_content_bytes(record: "AssessEvidence") -> bytes:
+    """The canonical compact encoding ``C`` of every field but ``mac``."""
+    return _encode_payload(_assess_evidence_content(record))
+
+
+def _assess_evidence_mac(key: bytes, content: bytes) -> bytes:
+    """``HMAC-SHA256(key, b"NPAE1" + C)`` where ``C`` is the canonical
+    compact encoding of every field but ``mac``. The prefix and ``C`` are
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key, _ASSESS_EVIDENCE_PREFIX + content, hashlib.sha256
+    ).digest()
+
+
+def _require_assess_evidence_sample(value: bytes) -> None:
+    """Enforce the canonical-:class:`Evidence`-bytes contract of a carried
+    assess-evidence sample.
+
+    ``value`` is already known to be ``bytes``; the record must satisfy the
+    full :class:`Evidence` field contract and its canonical re-encoding must
+    match the input byte for byte. Every violation raises
+    :class:`ValueError`.
+    """
+    try:
+        record = Evidence.from_bytes(value)
+    except ValueError as error:
+        raise ValueError(
+            "assess evidence samples items must be the canonical Evidence"
+            " encoding"
+        ) from error
+    if record.to_bytes() != value:
+        raise ValueError(
+            "assess evidence samples items must be the canonical Evidence"
+            " encoding"
+        )
+
+
+def _coerce_assess_evidence_sample(item: object) -> bytes:
+    """Canonicalize one :func:`seal_assess_evidence` sample.
+
+    Accepts an :class:`Evidence` instance or its canonical
+    :meth:`Evidence.to_bytes` encoding and returns the canonical bytes. A
+    value of any other type raises :class:`TypeError`; malformed or
+    non-canonical bytes (or an invalid record) raise :class:`ValueError`.
+    """
+    if isinstance(item, Evidence):
+        _validate_evidence(item)
+        return item.to_bytes()
+    if isinstance(item, bytes):
+        try:
+            record = Evidence.from_bytes(item)
+        except ValueError as error:
+            raise ValueError(
+                "samples items must be Evidence instances or their canonical"
+                " bytes"
+            ) from error
+        if record.to_bytes() != item:
+            raise ValueError(
+                "samples items must be Evidence instances or their canonical"
+                " bytes"
+            )
+        return item
+    raise TypeError(
+        "samples items must be Evidence instances or their canonical bytes"
+    )
+
+
+@dataclass(frozen=True)
+class AssessEvidence:
+    """A key-MAC'd, auditable snapshot of one :func:`assess` decision.
+
+    Freezes the exact sample set one robust distance decision was made from
+    together with its threshold and conclusion, so a third party holding the
+    shared key can re-run the whole determination independently with
+    :func:`audit_assess_evidence`.
+
+    The canonical encoding is a compact UTF-8 JSON array in field order::
+
+        [1, S, L, M, C, U, A, MAC]
+
+    ``version`` is always ``1``; ``S`` is a tuple of canonical
+    :meth:`Evidence.to_bytes` bytes — only single-round evidence records are
+    carried, never :class:`Measurement` objects, which a third party could
+    not re-verify; ``L`` is the finite non-negative non-bool limit; ``M`` the
+    non-bool positive minimum sample count; ``C``/``U``/``A`` are the
+    conclusion's :class:`RangeDecision` fields — total sample count, largest
+    inlier distance and accept flag; ``MAC`` is exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPAE1" + C)`` over the canonical compact encoding
+    of the first seven fields, the prefix and the body concatenated directly
+    with no separator or length prefix. Instances are frozen, constructed
+    positionally in field order and compare equal by their fields. A
+    structural field of the wrong type raises :class:`TypeError`; every
+    other contract violation raises :class:`ValueError`. No key material is
+    stored.
+    """
+
+    version: int
+    samples: tuple
+    limit: float
+    min_samples: int
+    sample_count: int
+    upper_bound: float
+    accepted: bool
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("assess evidence version must be an integer")
+        if self.version != 1:
+            raise ValueError("assess evidence version must be 1")
+        if not isinstance(self.samples, tuple):
+            raise TypeError("assess evidence samples must be a tuple")
+        if not self.samples:
+            raise ValueError("assess evidence samples must be non-empty")
+        for sample in self.samples:
+            if not isinstance(sample, bytes):
+                raise TypeError(
+                    "assess evidence samples items must be bytes"
+                )
+            _require_assess_evidence_sample(sample)
+        if isinstance(self.limit, bool) or not isinstance(
+            self.limit, (int, float)
+        ):
+            raise ValueError("assess evidence limit must be a finite number")
+        if not math.isfinite(float(self.limit)) or float(self.limit) < 0:
+            raise ValueError(
+                "assess evidence limit must be a finite non-negative number"
+            )
+        for name, value in (
+            ("min_samples", self.min_samples),
+            ("sample_count", self.sample_count),
+        ):
+            # The decision-content integer fields follow the assess split:
+            # bool and any non-integer are value violations, never a
+            # structural TypeError.
+            if type(value) is not int:
+                raise ValueError(f"assess evidence {name} must be an integer")
+            if value < 1:
+                raise ValueError(f"assess evidence {name} must be positive")
+        if isinstance(self.upper_bound, bool) or not isinstance(
+            self.upper_bound, (int, float)
+        ):
+            raise ValueError(
+                "assess evidence upper_bound must be a finite number"
+            )
+        if not math.isfinite(float(self.upper_bound)) or float(
+            self.upper_bound
+        ) < 0:
+            raise ValueError(
+                "assess evidence upper_bound must be a finite non-negative"
+                " number"
+            )
+        if not isinstance(self.accepted, bool):
+            raise ValueError("assess evidence accepted must be a bool")
+        if not isinstance(self.mac, bytes):
+            raise TypeError("assess evidence mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("assess evidence mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, S, L, M, C, U, A, MAC]`` where ``S`` is the array of the
+        lowercase-hex canonical sample encodings and ``MAC`` the lowercase
+        hex of the MAC, no whitespace, no NaN/Infinity."""
+        return _encode_payload(
+            _assess_evidence_content(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "AssessEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes`` and for
+        the structural fields of the wrong type (``version`` a non-integer,
+        ``samples`` a non-array, a non-string sample or mac hex); raises
+        :class:`ValueError` for anything that does not satisfy the value
+        contract: an array of exactly ``[version, samples, limit,
+        min_samples, sample_count, upper_bound, accepted, mac]`` in that
+        order, ``version == 1``, a non-empty ``samples`` array of lowercase
+        hex strings each decoding to the canonical :class:`Evidence`
+        encoding, a finite non-bool non-negative ``limit``, positive
+        non-bool integers for ``min_samples``/``sample_count``, a finite
+        non-bool non-negative ``upper_bound``, a bool ``accepted`` and a
+        lowercase-hex ``mac`` decoding to exactly 32 bytes. After parsing
+        and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for byte,
+        so formatted JSON, whitespace and any non-canonical spelling are
+        rejected too. The MAC is not verified here — pass the record to
+        :func:`audit_assess_evidence` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("assess evidence data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"assess evidence is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 8:
+            raise ValueError(
+                "assess evidence must be a JSON array of exactly version,"
+                " samples, limit, min_samples, sample_count, upper_bound,"
+                " accepted and mac"
+            )
+        (
+            raw_version,
+            raw_samples,
+            raw_limit,
+            raw_min_samples,
+            raw_sample_count,
+            raw_upper_bound,
+            raw_accepted,
+            raw_mac,
+        ) = outer
+        if type(raw_version) is not int:
+            raise TypeError("assess evidence version must be an integer")
+        if raw_version != 1:
+            raise ValueError("assess evidence version must be 1")
+        if not isinstance(raw_samples, list):
+            raise TypeError("assess evidence samples must be an array")
+        if not raw_samples:
+            raise ValueError("assess evidence samples must be non-empty")
+        samples = tuple(
+            _parse_assess_evidence_hex(raw_sample, "samples item")
+            for raw_sample in raw_samples
+        )
+        for sample in samples:
+            _require_assess_evidence_sample(sample)
+        limit = _parse_assess_evidence_number(raw_limit, "limit")
+        if limit < 0:
+            raise ValueError(
+                "assess evidence limit must be a finite non-negative number"
+            )
+        min_samples = _parse_int_field(raw_min_samples, "min_samples")
+        if min_samples < 1:
+            raise ValueError("assess evidence min_samples must be positive")
+        sample_count = _parse_int_field(raw_sample_count, "sample_count")
+        if sample_count < 1:
+            raise ValueError("assess evidence sample_count must be positive")
+        upper_bound = _parse_assess_evidence_number(
+            raw_upper_bound, "upper_bound"
+        )
+        if upper_bound < 0:
+            raise ValueError(
+                "assess evidence upper_bound must be a finite non-negative"
+                " number"
+            )
+        if not isinstance(raw_accepted, bool):
+            raise ValueError("assess evidence accepted must be a bool")
+        mac = _parse_assess_evidence_hex(raw_mac, "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "assess evidence mac must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            samples=samples,
+            limit=limit,
+            min_samples=min_samples,
+            sample_count=sample_count,
+            upper_bound=upper_bound,
+            accepted=raw_accepted,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError("assess evidence encoding is not canonical")
+        return record
+
+
+def _parse_assess_evidence_hex(value: object, name: str) -> bytes:
+    """Lowercase round-tripping hex for assess-evidence byte fields.
+
+    Mirrors the split of the other bundle records: the wrong value type
+    raises :class:`TypeError`, an invalid or non-lowercase hex string raises
+    :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"assess evidence {name} must be a lowercase hex string")
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"assess evidence {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        raise ValueError(
+            f"assess evidence {name} must be a lowercase hex string"
+        )
+    return raw
+
+
+def _parse_assess_evidence_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"assess evidence {name} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"assess evidence {name} must be a finite number")
+    return number
+
+
+def _coerce_assess_evidence(
+    x: object, name: str
+) -> "AssessEvidence":
+    """Coerce an :class:`AssessEvidence` or its canonical bytes, splitting
+    the TypeError/ValueError contract exactly as the public auditors do: the
+    wrong kind of argument raises :class:`TypeError`, a field-shape failure
+    surfacing while parsing byte content of the right kind is a value
+    error."""
+    if isinstance(x, AssessEvidence):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return AssessEvidence.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the assess evidence field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be an AssessEvidence instance or its canonical bytes"
+    )
+
+
+def seal_assess_evidence(
+    samples: object,
+    limit: object,
+    key: object,
+    *,
+    min_samples: object = 5,
+) -> "AssessEvidence":
+    """Run :func:`assess` over evidence samples and freeze the decision.
+
+    ``samples`` must be an iterable whose items are each an
+    :class:`Evidence` instance or its canonical :meth:`Evidence.to_bytes`
+    encoding — :class:`Measurement` objects are not accepted, since they
+    carry nothing a third party could re-verify; a non-iterable ``samples``
+    or an element of any other type raises :class:`TypeError`. ``key`` must
+    be non-empty ``bytes`` — a non-``bytes`` value raises
+    :class:`TypeError`, an empty value :class:`ValueError`. ``limit`` and
+    the keyword-only ``min_samples`` (default ``5``, exactly as
+    :func:`assess`) follow the :func:`assess` contract: bools, non-numbers,
+    non-finite or negative limits and non-positive or non-integer minimum
+    sample counts raise :class:`ValueError`.
+
+    Every sample is audited with :func:`audit` first and the robust decision
+    is then computed with exactly the :func:`assess` semantics, so a bad
+    MAC, a malformed or non-canonical sample encoding, a duplicate
+    ``(round_index, nonce)`` pair, too few samples or too few inliers raises
+    :class:`ValueError` and no evidence is produced. Only on success is the
+    :class:`AssessEvidence` sealed: the carried sample encodings are sorted
+    into one canonical order (the input order never affects the artifact
+    bytes) and MAC'd as ``HMAC-SHA256(key, b"NPAE1" + C)`` over the compact
+    encoding of every field but ``mac``. Sealing is pure computation: it
+    touches no challenge registry or consumption state.
+    """
+    try:
+        items = list(samples)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "samples must be an iterable of Evidence instances or their"
+            " canonical bytes"
+        ) from error
+    for item in items:
+        if not isinstance(item, (Evidence, bytes)):
+            raise TypeError(
+                "samples items must be Evidence instances or their canonical"
+                " bytes"
+            )
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    bound, minimum = _check_assess_params(limit, min_samples)
+    sample_blobs = [_coerce_assess_evidence_sample(item) for item in items]
+    # Every evidence is verified exactly as a standalone audit() call would:
+    # MAC, response HMAC, elapsed and halved distance recomputation.
+    measurements = [audit(blob, key) for blob in sample_blobs]
+    decision = _assess_measurements(measurements, bound, minimum)
+    # One canonical sample order makes the artifact independent of the input
+    # order; the decision itself is order-independent already.
+    ordered = tuple(sorted(sample_blobs))
+    record = AssessEvidence(
+        version=1,
+        samples=ordered,
+        limit=bound,
+        min_samples=minimum,
+        sample_count=decision.sample_count,
+        upper_bound=decision.upper_bound,
+        accepted=decision.accepted,
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record,
+        mac=_assess_evidence_mac(
+            key, _assess_evidence_content_bytes(record)
+        ),
+    )
+
+
+def audit_assess_evidence(x: object, key: object) -> "RangeDecision":
+    """Independently re-verify an :class:`AssessEvidence` against ``key``.
+
+    ``x`` must be an :class:`AssessEvidence` or its canonical
+    :meth:`AssessEvidence.to_bytes` encoding — anything else raises
+    :class:`TypeError`; ``key`` must be non-empty ``bytes`` — a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`.
+
+    The outer MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPAE1" + C)`` and compared in constant time; then
+    every carried sample is re-verified with :func:`audit` — its MAC and
+    response HMAC checked and its elapsed time and halved distance
+    recomputed — and the whole robust determination is rerun with exactly
+    the :func:`assess` semantics against the carried ``limit`` and
+    ``min_samples``. The recomputed total sample count, largest inlier
+    distance and accept flag must each equal the recorded fields, or
+    :class:`ValueError` is raised. A bad outer or sample signature,
+    non-canonical encoding, tampered sample, threshold or conclusion, a
+    duplicate sample, too few samples or too few inliers all raise
+    :class:`ValueError`; no partial result is returned. Auditing is pure
+    computation: it touches no challenge registry or consumption state and
+    is no substitute for verification-time replay protection or challenge
+    expiry.
+    """
+    record = _coerce_assess_evidence(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _assess_evidence_mac(
+            key, _assess_evidence_content_bytes(record)
+        ),
+        record.mac,
+    ):
+        raise ValueError("assess evidence mac does not match the key")
+    measurements = [audit(sample, key) for sample in record.samples]
+    bound, minimum = _check_assess_params(record.limit, record.min_samples)
+    decision = _assess_measurements(measurements, bound, minimum)
+    if decision.sample_count != record.sample_count:
+        raise ValueError(
+            "assess evidence sample_count does not match the recomputed"
+            " decision"
+        )
+    if decision.upper_bound != record.upper_bound:
+        raise ValueError(
+            "assess evidence upper_bound does not match the recomputed"
+            " decision"
+        )
+    if decision.accepted is not record.accepted:
+        raise ValueError(
+            "assess evidence accepted does not match the recomputed decision"
+        )
+    return decision
 
 
 def _finite_non_bool(value: object) -> float:

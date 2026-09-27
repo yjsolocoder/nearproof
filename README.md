@@ -51,6 +51,11 @@ python3 -m nearproof
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
   - `clock` — 只读属性，暴露计时函数
 - `assess(samples, limit, *, key=None, min_samples=5) -> RangeDecision` — 基于一批轮次的稳健距离判定（见下）
+- `AssessEvidence(version, samples, limit, min_samples, sample_count, upper_bound, accepted, mac)` — 把一次 `assess` 判定连同其样本集、阈值、最少样本数与结论冻结的共享密钥签名记录（`version=1`，不含密钥；见下）
+  - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, S, L, M, C, U, A, MAC]`，`S` 为各样本规范 `Evidence` 字节的小写 hex 数组，`MAC` 小写 hex
+  - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或结构字段错型抛 `TypeError`，其余不合契约（含非规范编码）抛 `ValueError`（不校验 MAC）
+- `seal_assess_evidence(samples, limit, key, *, min_samples=5) -> AssessEvidence` — 逐份验样本并按 `assess` 口径重算判定，成功才封存（见下）
+- `audit_assess_evidence(x, key)` — 用共享密钥复核 `AssessEvidence`（对象或规范字节），重算判定并逐字段比对，返回对应的 `RangeDecision`（见下）
 - `audit(evidence, key)` — 用共享密钥复核 `Evidence`（或其字节编码），返回对应的 `Measurement`
 - `BitEvidence(version, t, context, digest, opening, queries, speed, timeout, limit, mac)` — 一场已接受**位挑战**会话的防篡改记录（`version=1`；`t` 恰 16 字节，`context`/`opening`/`digest`/`mac` 各恰 32 字节，`queries` 非空、每项为 `(b, r, s, e)`；不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, t, C, D, O, Q, V, T, L, M]`，bytes 字段小写 hex
@@ -548,6 +553,25 @@ measurements = [verifier.measure(prover) for _ in range(10)]
 decision = assess(measurements, limit=300.0)
 if decision.accepted:
     print(decision.sample_count, decision.upper_bound)
+```
+
+### 判定证据封存与复核 `AssessEvidence`、`seal_assess_evidence` 与 `audit_assess_evidence`
+
+`assess` 只是即时的统计判定入口，不承载样本集；`AssessEvidence` 把一次稳健距离判定**冻结成可审计的判定证据**，让持有共享密钥的第三方凭证据独立复核结论。
+
+`AssessEvidence(version, samples, limit, min_samples, sample_count, upper_bound, accepted, mac)` 是冻结的共享密钥 MAC **判定证据记录**：按字段序位置构造、冻结且按字段相等，不含密钥。`version` 固定为 `1`；`samples` 是**规范 `Evidence.to_bytes()` 字节的元组**——样本只收单轮证据（证据对象或其规范字节），`Measurement` 对象不进证据（第三方无法复核它）；`limit` 为非布尔、有限、非负数；`min_samples` 为非布尔正整数（缺省 `5`，沿用 `assess`）；`sample_count`/`upper_bound`/`accepted` 是那次判定 `RangeDecision` 的三字段；`mac` 恰 32 字节。结构字段错型（`version` 非整数、`samples` 非元组、样本非 bytes、`mac` 非 bytes）抛 `TypeError`，其余契约违约抛 `ValueError`。
+
+证据为紧凑 UTF-8 JSON **数组**（沿用本库证据编码规范：无空白、bytes 为小写 hex、不允许 NaN/Infinity），字段序 `[1, S, L, M, C, U, A, MAC]`：`S` 是各样本规范编码的小写 hex 数组。`MAC = HMAC-SHA256(key, b"NPAE1" + C)`，其中 `C` 是前七字段（不含 `MAC`）的紧凑编码，前缀与 `C` 直接拼接、无分隔符或长度前缀。`to_bytes()` 产出现范字节；`from_bytes(data)` 仅收 bytes，要求恰为八个元素的数组、字段契约全部满足（每个样本解码为**规范** `Evidence` 编码、`MAC` 解码恰 32 字节等），并把解析结果重编码与输入**逐字节**比对——格式化 JSON、空白等非规范写法一律拒绝；结构字段错型抛 `TypeError`，其余违约抛 `ValueError`；它不校验 MAC。
+
+- `seal_assess_evidence(samples, limit, key, *, min_samples=5)` 收样本集、阈值、密钥与最少样本数。`samples` 必须是可迭代对象，每项为 `Evidence` 或其规范字节（可混用）；`Measurement` 一律不收。不可迭代的 `samples`、元素错型或非 bytes 的 `key` 抛 `TypeError`；空密钥、阈值 / 最少样本数违约、样本签名不符、编码非规范、样本被篡改、样本重复、样本过少或内点不足一律抛 `ValueError`（判定口径与缺省值与 `assess` 一致）。封存先逐份按 `audit` 验样本、再按 `assess` 口径重算中位数 / MAD / 内点 / 结论，**全部通过才产出证据**——封存失败不产出证据。样本按规范字节排序为唯一顺序，故**样本顺序不改产物字节**。封存是纯计算，不触碰挑战登记与消费状态。
+- `audit_assess_evidence(x, key)` 收 `AssessEvidence` 对象或其规范字节与共享密钥；参数既非记录对象也非 bytes、或 `key` 非 bytes 抛 `TypeError`，空密钥抛 `ValueError`。先恒时复核外层 `NPAE1` MAC，再**逐份验样本签名**（MAC、应答 HMAC）并重算应答、耗时与距离，然后按携带的 `limit`/`min_samples` 重算中位数与偏差结论；重算的样本总数 `sample_count`、距离上界 `upper_bound` 与是否接受 `accepted` 须与记录**逐字段相等**，否则抛 `ValueError`。签名不符、编码非规范、样本被篡改、样本重复或样本过少一律抛 `ValueError`。复核是纯计算，不触碰挑战登记与消费状态，成功时返回对应的 `RangeDecision`。
+
+复核**不替代**验证时的重放防护与挑战有效期：时效与撤销不叠加到这层证据。
+
+```python
+evidence = seal_assess_evidence(records, limit=300.0, key=key)
+blob = evidence.to_bytes()
+decision = audit_assess_evidence(blob, key)   # 第三方独立复核
 ```
 
 ### 二维多验证者共识 `locate`
