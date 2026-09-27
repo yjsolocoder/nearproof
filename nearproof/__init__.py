@@ -42,7 +42,8 @@ StreamReceiptBatchCommitReceipt / StreamReceiptFrontier /
 TrustRevocation /
 TrustRevocationList / Verifier /
 VerifierTrust / assess / attest_observation /
-attest_observation_for_point / audit / audit_assess_evidence / audit_b / audit_bound /
+attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
+audit_b / audit_bound /
 audit_bound_policy /
 audit_cert_evidence / audit_crl / audit_map_history /
 audit_map_history_evidence / audit_map_history_journal_bundle /
@@ -63,7 +64,7 @@ audit_stream_receipt / audit_stream_receipt_batch_commit_receipt /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / prove_crl / revoke_bound /
-revoke_context / revoke_observation / revoke_trust / seal_assess_evidence /
+revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
 seal_map_history /
 seal_map_history_journal_bundle / seal_range / seal_range_receipt_batch /
 seal_span_bundle_receipt_batch /
@@ -182,6 +183,7 @@ __all__ = [
     "attest_observation_for_point",
     "audit",
     "audit_assess_evidence",
+    "audit_assess_evidence_policy",
     "audit_b",
     "audit_batch_receipt",
     "audit_bound",
@@ -224,6 +226,7 @@ __all__ = [
     "prove_crl",
     "revoke_bound",
     "revoke_context",
+    "revoke_evidence",
     "revoke_observation",
     "revoke_trust",
     "seal_assess_evidence",
@@ -19710,6 +19713,189 @@ def audit_assess_evidence(x: object, key: object) -> "RangeDecision":
         raise ValueError(
             "assess evidence accepted does not match the recomputed decision"
         )
+    return decision
+
+
+def revoke_evidence(
+    sample: object,
+    revoked_at: object,
+    key: object,
+) -> "BoundEvidenceRevocation":
+    """Sign a per-round revocation of one assess-evidence sample.
+
+    ``sample`` must be a single-round :class:`Evidence` instance or its
+    canonical :meth:`Evidence.to_bytes` encoding — exactly the kind of value
+    carried as an :class:`AssessEvidence` sample; an :class:`AssessEvidence`
+    itself, a :class:`Measurement` or any other kind is rejected, as is a
+    malformed or non-canonical encoding or an invalid record. ``key`` must be
+    non-empty ``bytes`` and ``revoked_at`` a finite non-bool non-negative
+    number (``version`` is set to ``1``).
+
+    The signed record is a :class:`BoundEvidenceRevocation` — the same
+    per-round revocation record :func:`revoke_bound` mints, with the same
+    ``NPBR1`` MAC over ``(round_index, nonce, revoked_at)`` taken from the
+    sample — so it feeds both :func:`audit_assess_evidence_policy` and the
+    existing :func:`audit_bound_policy` revocation sets interchangeably.
+    Every violation, regardless of whether it is a shape or a value
+    violation, raises :class:`ValueError`. Signing is pure computation: it
+    reads and mutates no verifier state.
+    """
+    if not isinstance(key, bytes):
+        raise ValueError("key must be non-empty bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    try:
+        blob = _coerce_assess_evidence_sample(sample)
+    except TypeError as error:
+        raise ValueError(
+            "sample must be an Evidence instance or its canonical bytes"
+        ) from error
+    evidence = Evidence.from_bytes(blob)
+    record = BoundEvidenceRevocation(
+        version=1,
+        round_index=evidence.round_index,
+        nonce=evidence.nonce,
+        revoked_at=revoked_at,  # type: ignore[arg-type]
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record, mac=_bound_revocation_mac(key, _bound_revocation_payload(record))
+    )
+
+
+def audit_assess_evidence_policy(
+    x: object,
+    key: object,
+    *,
+    now: object = None,
+    max_age: object = None,
+    revocations: object = None,
+) -> "RangeDecision":
+    """Re-verify an :class:`AssessEvidence` and enforce an optional freshness
+    and revocation policy.
+
+    ``x`` may be the record itself or its canonical
+    :meth:`AssessEvidence.to_bytes` encoding. The cryptographic,
+    canonical-encoding and robust-decision checks are exactly those of
+    :func:`audit_assess_evidence`, which runs first; every check it performs
+    (and its :class:`TypeError`/:class:`ValueError` split) applies unchanged.
+
+    With ``max_age=None`` and ``revocations=None`` (both the default) no
+    policy is enforced: the call is item-for-item the existing
+    :func:`audit_assess_evidence` review, returns the same
+    :class:`RangeDecision` and never reads a clock — ``now`` is ignored.
+    Once either option is enabled the existing review still runs first, so a
+    bad MAC or encoding failure raises before any policy check.
+
+    With ``max_age`` set it must be a non-bool finite non-negative number and
+    ``now`` is required — a finite non-bool number; omitting it or violating
+    either contract raises :class:`ValueError`. The freshness baseline is the
+    completion time of the latest-completed carried round — the maximum
+    sample ``end`` — which must satisfy the closed interval
+    ``0 <= now - latest_end <= max_age``: a future-dated baseline or an
+    over-age decision raises :class:`ValueError`, equality at either boundary
+    staying valid.
+
+    With ``revocations`` set it must be an iterable of
+    :class:`BoundEvidenceRevocation` instances and/or their canonical
+    :meth:`BoundEvidenceRevocation.to_bytes` encodings (mixing is allowed;
+    these are the same per-round records :func:`revoke_bound` and
+    :func:`revoke_evidence` sign). Every entry is parsed and its MAC
+    recomputed under the same ``key`` and compared in constant time; an item
+    that is neither kind, bytes that do not parse, a wrong key or any
+    tampering raises :class:`ValueError`. Two entries carrying the same
+    ``(round_index, nonce)`` pair are likewise rejected. ``now`` is required
+    exactly as under ``max_age`` (a finite non-bool number): an entry whose
+    ``revoked_at > now`` — a revocation dated in the future — raises
+    :class:`ValueError`. An entry matching none of the carried samples is
+    ignored beyond the MAC and timestamp checks, so unrelated revocations do
+    not reject the decision. An entry matches a carried sample on equal
+    ``round_index`` and ``nonce``; when that sample's completion time is not
+    later than ``revoked_at`` (``end <= revoked_at``) the decision is
+    rejected, while a sample completed strictly after the revocation
+    survives. Samples completed strictly after a matching revocation are
+    unaffected.
+
+    Like :func:`audit_assess_evidence` this is a pure check: it touches no
+    challenge registry or consumption state and is no substitute for
+    verification-time replay protection.
+    """
+    decision = audit_assess_evidence(x, key)
+    if max_age is None and revocations is None:
+        # No policy at all: `now` is ignored entirely and no clock read.
+        return decision
+    check_age = max_age is not None
+    age_limit = 0.0
+    if check_age:
+        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+            raise ValueError("max_age must be a finite non-negative number")
+        age_limit = float(max_age)
+        if not math.isfinite(age_limit) or age_limit < 0:
+            raise ValueError("max_age must be a finite non-negative number")
+    if now is None:
+        raise ValueError("now is required when max_age or revocations are set")
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValueError("now must be a finite number")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be a finite number")
+    record = _coerce_assess_evidence(x, "x")
+    # The baseline review above already proved each sample is the canonical
+    # Evidence encoding, so every parse here succeeds.
+    samples = [Evidence.from_bytes(sample) for sample in record.samples]
+    latest_end = max(sample.end for sample in samples)
+    if revocations is not None:
+        try:
+            raw_revocations = list(revocations)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise ValueError(
+                "revocations must be an iterable of BoundEvidenceRevocation"
+                " instances or their canonical bytes"
+            ) from error
+        targets = {
+            (sample.round_index, sample.nonce): sample for sample in samples
+        }
+        seen: set[tuple] = set()
+        for entry in raw_revocations:
+            if isinstance(entry, bytes):
+                try:
+                    entry = BoundEvidenceRevocation.from_bytes(entry)
+                except ValueError as error:
+                    raise ValueError(
+                        "revocations bytes must be the canonical"
+                        " BoundEvidenceRevocation encoding"
+                    ) from error
+            if not isinstance(entry, BoundEvidenceRevocation):
+                raise ValueError(
+                    "revocations must contain only BoundEvidenceRevocation"
+                    " instances or their canonical bytes"
+                )
+            identity = (entry.round_index, entry.nonce)
+            if identity in seen:
+                raise ValueError(
+                    "revocations contain a duplicate (round_index, nonce) pair"
+                )
+            seen.add(identity)
+            expected = _bound_revocation_mac(
+                key, _bound_revocation_payload(entry)  # type: ignore[arg-type]
+            )
+            if not hmac.compare_digest(expected, entry.mac):
+                raise ValueError("bound evidence revocation mac does not match")
+            revoked_at = float(entry.revoked_at)
+            if revoked_at > current:
+                raise ValueError("bound evidence revocation is dated in the future")
+            target = targets.get(identity)
+            # An entry for a round this decision does not carry is irrelevant:
+            # it still had to pass the MAC and future-date checks above.
+            if target is not None and target.end <= revoked_at:
+                raise ValueError(
+                    "assess evidence carries a sample completed no later than"
+                    " its revocation"
+                )
+    if check_age:
+        age = current - latest_end
+        if not 0.0 <= age <= age_limit:
+            raise ValueError("assess evidence is outside the allowed age")
     return decision
 
 
