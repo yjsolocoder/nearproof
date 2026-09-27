@@ -61,6 +61,12 @@ python3 -m nearproof
   - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON **对象**（键序 `version, sequence, issued_at, entries, mac`，各一次；`entries` 为对象数组，每条带 `BoundEvidenceRevocation` 键序，bytes 小写 hex；`issued_at` 恒为 float 拼写，无空白、无长度前缀）；`from_bytes` 仅收 bytes（非 bytes 抛 `TypeError`），缺/多/重复/乱序键、entries 非数组、某条 entry 不合契约、u64/时刻违约及任何非规范拼写均抛 `ValueError`，重编码须逐字节相等，不验任何 MAC
 - `make_evidence_revocation_list(entries, sequence, issued_at, key) -> EvidenceRevocationList` — 用非空 key 对一批 `BoundEvidenceRevocation`（可为空；不接受字节）签快照：先按 `(round_index, nonce)` 排序、重复对抛 `ValueError`，各条目自带 `NPBR1` MAC 原样携带，列表层 `mac = HMAC-SHA256(key, b"NPERL1" + 去mac规范JSON)`，直拼无长度前缀；`sequence`/`issued_at`/条目形状错抛 `TypeError`，值违约与空 key 抛 `ValueError`（见下）
 - `audit_evidence_revocation_list(x, key, now, min=0) -> None` — 收快照对象或规范字节；恒时复核双层 MAC（列表层 `NPERL1`、每条 entry 的 `NPBR1`，同一 key），并检查 `issued_at <= now`、`sequence >= min`；`x`/`key` 形状错抛 `TypeError`，其余（含空 key、MAC 不符、未来时间、序号过低、字节无法解析）一律抛 `ValueError`（见下）
+- `EvidenceRevocationListState(version, sequence, digest, signature)` — 防回滚的冻结证据撤销前沿检查点（`version=1`、`sequence` 为非布尔 u64、`digest`/`signature` 各恰 32 字节；`digest=SHA256(快照规范字节)` 把前沿绑定到那一份确定的快照、`signature=HMAC-SHA256(key, b"NPES1"+去signature规范编码)`，直拼无长度前缀；字段类型错抛 `TypeError`，值违约抛 `ValueError`）
+  - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON（键序 `version, sequence, digest, signature`，bytes 字段小写 hex）；`from_bytes` 仅收 bytes（非 bytes 抛 `TypeError`）、重编码须逐字节相等，不验 signature
+- `EvidenceRevocationListAuditor(key, *, checkpoint=None)` — 带状态、防回滚的撤销快照审计器；`key` 为非空 `bytes`（类型错抛 `TypeError`，空值抛 `ValueError`）；`checkpoint` 收前沿对象、规范字节或 `None`，加载时恒时验 `NPES1` signature（`None` 为空状态），重启时须由调用方传回保存的最新检查点
+  - `audit(x, now, min=0) -> auditor` — 依次收快照（对象或规范字节）、当前时刻、最低序号下限；锁内先按既有快照复核语义验双层签名、签发时刻与序号下限，再做前沿门控：低序拒绝、同序仅同摘要重放（不改状态）、高序推进；验签、门控与推进同一把锁内原子，失败不改状态，并发按取锁顺序线性化
+  - 只读 `checkpoint` 属性导出当前 `EvidenceRevocationListState | None`
+
 - `revoke_evidence(sample, revoked_at, key) -> BoundEvidenceRevocation` — 用非空 key 为单轮证据样本（`Evidence` 或其规范字节）签出一条逐轮撤销记录，记录形状与 `revoke_bound` 的产物相同、可互通（见下）
 - `audit(evidence, key)` — 用共享密钥复核 `Evidence`（或其字节编码），返回对应的 `Measurement`
 - `BitEvidence(version, t, context, digest, opening, queries, speed, timeout, limit, mac)` — 一场已接受**位挑战**会话的防篡改记录（`version=1`；`t` 恰 16 字节，`context`/`opening`/`digest`/`mac` 各恰 32 字节，`queries` 非空、每项为 `(b, r, s, e)`；不含密钥；见下）
@@ -595,6 +601,41 @@ if decision.accepted:
 `make_evidence_revocation_list(entries, sequence, issued_at, key)` 用共享 key 签一份快照：`entries` 为 `BoundEvidenceRevocation` 实例的可迭代对象（可为空；**不接受字节**），先复制并按 `(round_index, nonce)` 排序，**重复对抛 `ValueError`**，各条目自带 MAC 原样携带；`sequence` 为非布尔 u64、`issued_at` 为非布尔有限非负数；`key` 为非空 bytes。形状错（条目非记录实例、不可迭代、`sequence`/`issued_at`/`key` 类型不对）抛 `TypeError`，值违约（重复对、序号/时刻越界、空 key）抛 `ValueError`。返回的记录 `version=1`，`mac = HMAC-SHA256(key, b"NPERL1" + 去mac规范JSON)`。签发是纯计算，不触碰挑战登记与消费状态，也不替代验证时的重放防护。
 
 `audit_evidence_revocation_list(x, key, now, min=0)` 收 `EvidenceRevocationList` 对象或其规范字节，用同一 `key` **恒时**复核两层 MAC：列表层 `NPERL1` 与每条条目的 `NPBR1`，任一不符抛 `ValueError`；并要求 `issued_at <= now`（未来快照拒绝，两端相等有效）、`sequence >= min`（`min` 为非布尔整数、缺省 `0`，相等有效）。`x` 既非对象也非 bytes、或 `key` 非 bytes 抛 `TypeError`；空 key、字节无法解析、MAC 不符、未来时间、序号过低及其余违约一律抛 `ValueError`。成功返回 `None`。复核是纯计算，不触碰挑战登记与消费状态，也不替代验证时的重放防护。
+
+### 防回滚前沿 `EvidenceRevocationListState` 与 `EvidenceRevocationListAuditor`
+
+无状态的 `audit_evidence_revocation_list` 只认证单张快照，攻击者仍可把一张序号更低（更旧）的快照重新送达，让长期保存的判定证据被旧清单重新解释。`EvidenceRevocationListState` 与 `EvidenceRevocationListAuditor` 在其之上加一道单调门控，防止已接受快照序号回退。
+
+`EvidenceRevocationListState(version, sequence, digest, signature)` 是冻结的共享密钥签名**前沿检查点记录**：位置构造、按字段相等，字段命名同 CRL 前沿记录。`version=1`；`sequence` 为非布尔 u64（最近接受的 `EvidenceRevocationList.sequence`）；`digest` 恰 32 字节，即那份**确定快照的规范字节** `EvidenceRevocationList.to_bytes()` 的 `SHA256`，把前沿绑定到这一份快照而不是同序号的其他快照；`signature` 恰 32 字节，`signature = HMAC-SHA256(key, b"NPES1" + 去signature规范编码)`，域标签与编码直拼、无定界符、无长度前缀。字段类型错（形状错）抛 `TypeError`，值违约抛 `ValueError`，记录本身不含密钥。
+
+编解码沿用撤销快照的紧凑 JSON 惯例：`to_bytes()` 输出无空白 UTF-8 JSON，键序 `version, sequence, digest, signature`，`digest`/`signature` 小写 hex，无长度前缀。`from_bytes(data)` **仅收 bytes**（非 bytes 抛 `TypeError`）：键必须恰好四个、各一次且依字段序（缺失、多余、重复、乱序即拒），`version == 1`，`sequence` 为非布尔 u64，两个 hex 字段须解码为恰好 32 字节；解析后重编码须与输入**逐字节相等**；解析**不验签**，须交给 `EvidenceRevocationListAuditor` 复核。
+
+`EvidenceRevocationListAuditor(key, *, checkpoint=None)` 持有当前前沿：
+
+- `key` 必须是非空 `bytes`——非 bytes（含 `bytearray`/`str`/`None`）抛 `TypeError`，空值抛 `ValueError`。
+- `checkpoint` 仅限关键字，收前沿对象、其规范字节或 `None`。`None`（默认）为空状态；否则字节先过 `EvidenceRevocationListState.from_bytes` 契约，再以 `key` **恒时**复核其 `NPES1` signature——编码不合契约或 signature 不符抛 `ValueError`，参数种类不对抛 `TypeError`。审计器自身不做任何持久化：**重启时调用方必须把上次保存的最新检查点传回来**（取只读 `checkpoint` 属性、`to_bytes()` 落盘）。
+- `audit(x, now, min=0)` 依次收快照（`EvidenceRevocationList` 对象或其规范字节）、当前时刻与最低序号下限（缺省 `0`）。在同一把审计器锁内：先按既有快照复核语义跑 `audit_evidence_revocation_list`——双层签名恒时复核、`issued_at <= now`、`sequence >= min`；通过后才取快照序号与规范字节 `SHA256` 摘要做前沿门控：
+  - **低序拒绝**：`sequence` 低于前沿抛 `ValueError`；
+  - **同序同摘要重放**：序号相等且 `digest` 相同则按重放接受、返回审计器自身但不改动检查点；序号相等而 `digest` 不同（同序号的另一份快照）抛 `ValueError`；
+  - **高序推进**：序号更高则生成并以 `NPES1` 签名新的 `EvidenceRevocationListState`。
+- 验签、门控与推进在同一把锁内原子完成：任何失败（错钥、篡改、未来时间、序号低于 `min`、旧快照回放、同序异摘要、序号溢出等）都不改动检查点，并发审计按取锁顺序线性化，已接受快照绝不丢失或回退。成功返回审计器自身。
+- 只读属性 `checkpoint: EvidenceRevocationListState | None` 导出当前前沿（首次成功审计前为 `None`）；返回的是冻结对象，外部无法借此改写内部状态。
+
+字段形状错抛 `TypeError`；值违约、非规范字节、空 key 与篡改一律抛 `ValueError`。既有快照签发、整体复核、策略入口与各层账本接口均不变，也不触碰挑战状态。
+
+```python
+from nearproof import EvidenceRevocationListAuditor
+
+auditor = EvidenceRevocationListAuditor(key)
+auditor.audit(snapshot1, now=100.0)        # sequence=1，首次推进
+saved = auditor.checkpoint.to_bytes()      # 调用方自行持久化
+
+# ... 重启后：
+auditor = EvidenceRevocationListAuditor(key, checkpoint=saved)
+auditor.audit(snapshot1, now=100.0)        # 同一份快照：重放接受，状态不变
+auditor.audit(snapshot2, now=100.0)        # 更高序号：推进到新前沿
+auditor.audit(snapshot1, now=100.0)        # 旧快照回放：ValueError，前沿不动
+```
 
 ### 单轮证据撤销签发 `revoke_evidence`
 
