@@ -65,7 +65,16 @@ python3 -m nearproof
   - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON（键序 `version, sequence, digest, mac`，bytes 字段小写 hex）；`from_bytes` 仅收 `bytes`（非 bytes 抛 `TypeError`）、重编码须逐字节相等，不验 MAC
 - `EvidenceRevocationListAuditor(key, *, checkpoint=None)` — 带状态、防回滚的证据撤销快照审计器；`key` 为非空 `bytes`（类型错抛 `TypeError`，空值抛 `ValueError`）；`checkpoint` 仅收前沿对象、其规范字节或 `None`，加载时恒时验前沿 MAC（`None` 为空状态），重启时须由调用方落盘传回保存的最新检查点
   - `audit(x, now, min=0) -> auditor` — 收快照对象或规范字节；**同一把锁内**先按既有快照复核语义恒时验双层签名（`NPERL1`/`NPBR1`）、`issued_at <= now` 与 `sequence >= min`，通过后按前沿门控：低序拒绝、同序同摘要按重放接受且不改状态、高序推进；成功返回自身；同序异摘要、旧快照回放、错钥、篡改及参数违约一律抛 `ValueError`，形状错抛 `TypeError`，失败不改状态，并发审计按取锁顺序线性化
+  - `audit_bundle(x, now, min=0) -> auditor` — 原子整包提交：收 `EvidenceRevocationListBundle` 或其规范字节（余类型抛 `TypeError`，余违约抛 `ValueError`）；同一把锁内先按 `audit_evidence_revocation_list_bundle` 的全部语义验包（包 `NPEB1` MAC、非空起止前沿的 `NPES1` MAC、各快照双层 MAC 与时效/序号下限、严格递增、重放末态逐字节等于 `end`），再要求包 `start` 与当前检查点逐字节相等（空账本仅接受 `b""`）；匹配后一次性把检查点替换为包 `end`；失败不改状态，同包重放因起点不符被拒，与 `audit` 共用一把锁、并发按取锁顺序线性化
+  - `audit_bundle_receipt(x, now, min=0) -> EvidenceRevocationListBundleReceipt` — 参数契约与 `audit_bundle` 完全一致，同锁复用其全部验包语义原子提交整包，**仅在提交成功后**以新提交包签出回执（`NPEBR1`，见下）；失败不改状态也不产出回执，同包重放因起点不符被拒，并发按取锁顺序线性化
   - 只读 `checkpoint` 属性导出当前 `EvidenceRevocationListState | None`
+- `EvidenceRevocationListBundle(version, start, snapshots, end, mac)` — 把一段严格递增的撤销快照链连同起止前沿封进一条记录的防篡改冻结整包（`version=1`；`start` 为规范 `EvidenceRevocationListState` 字节或 `b""`（空起点）；`snapshots` 为非空有序规范快照字节元组；`end` 为规范非空 `EvidenceRevocationListState` 字节；`mac` 恰 32 字节，`mac=HMAC-SHA256(key, b"NPEB1"+去mac字段序紧凑编码)`，直拼无长度前缀；位置构造、冻结、按字段相等；字段错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
+  - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON **对象**（键序 `version, start, snapshots, end, mac`，bytes 字段小写 hex，`snapshots` 为小写 hex 数组）；`from_bytes` 仅收 bytes（非 bytes 抛 `TypeError`），缺/多/重复/乱序键、非规范内层编码及其余违约抛 `ValueError`，重编码须逐字节相等；不验任何 MAC
+- `seal_evidence_revocation_list_bundle(snapshots, key, now, min=0, *, start=None) -> EvidenceRevocationListBundle` — 先按快照复核语义完整验链（`start=None` 为空起点，否则收前沿对象或其规范字节并恒时验 `NPES1` MAC），通过后封出整包；错型抛 `TypeError`，余错（含空 key、错钥、未来快照、序号不严格递增）抛 `ValueError`（见下）
+- `audit_evidence_revocation_list_bundle(x, key, now, min=0) -> EvidenceRevocationListState` — 收整包对象或规范字节；恒时复核包 `NPEB1` MAC 与非空起止前沿的 `NPES1` MAC，再自携带起点逐张重放（双层 MAC、时效与序号下限、严格递增），重放末态须与 `end` 逐字节相等；成功返回终点前沿；纯检查，不触碰任何审计器（见下）
+- `EvidenceRevocationListBundleReceipt(version, start, bundle_digest, end, signature)` — 一次已提交整包的防篡改冻结提交凭证（`version=1`；`start` 为规范 `EvidenceRevocationListState` 字节或 `b""`（空起点）；`bundle_digest` 恰 32 字节，`D=SHA256(bundle.to_bytes())`，只绑定那一个确定的包；`end` 为规范非空 `EvidenceRevocationListState` 字节；`signature` 恰 32 字节，`signature=HMAC-SHA256(key, b"NPEBR1"+C)`，`C` 为前 4 项 `[1,S,D,E]` 的去签名字段序紧凑编码，域标签与 `C` 直拼、无定界与长度前缀；位置构造、冻结、按字段相等；字段错型抛 `TypeError`、余错抛 `ValueError`；不含密钥；见下）
+  - `to_bytes()` / `from_bytes(data)` — 字段序五元素紧凑 UTF-8 JSON 数组 `[1, start, bundle_digest, end, signature]`，bytes 字段小写 hex（空起点为 `""`），无空白、无长度前缀；`from_bytes` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），其余不合契约（含非规范拼写）抛 `ValueError`，重编码须逐字节相等；**解析不验签**
+- `audit_evidence_revocation_list_bundle_receipt(receipt, bundle, key) -> EvidenceRevocationListState` — 收回执/原包对象或各自规范字节及非空 bytes 密钥；恒时复核回执 `NPEBR1` 签名与包摘要 `D`，回执起止与包起止逐字节核对一致后，再整包验包（包 `NPEB1` MAC、起止 `NPES1` MAC、各快照双层 MAC、严格递增、重放末态等于 `end`；本复核不带时钟，不做时效/序号下限检查）；成功返回终点前沿；纯检查，不触碰任何审计器；参数或字段形状错抛 `TypeError`，其余违约含空密钥与错钥一律抛 `ValueError`（见下）
 - `revoke_evidence(sample, revoked_at, key) -> BoundEvidenceRevocation` — 用非空 key 为单轮证据样本（`Evidence` 或其规范字节）签出一条逐轮撤销记录，记录形状与 `revoke_bound` 的产物相同、可互通（见下）
 - `audit(evidence, key)` — 用共享密钥复核 `Evidence`（或其字节编码），返回对应的 `Measurement`
 - `BitEvidence(version, t, context, digest, opening, queries, speed, timeout, limit, mac)` — 一场已接受**位挑战**会话的防篡改记录（`version=1`；`t` 恰 16 字节，`context`/`opening`/`digest`/`mac` 各恰 32 字节，`queries` 非空、每项为 `(b, r, s, e)`；不含密钥；见下）
@@ -610,6 +619,43 @@ if decision.accepted:
 `EvidenceRevocationListAuditor(key, *, checkpoint=None)` 用非空 `bytes` 密钥推进这本账本（非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError`）。`checkpoint` 仅限关键字，收一个 `EvidenceRevocationListState` 对象、其规范字节或 `None`（缺省为空状态）：加载时用 `key` **恒时复核前沿 `NPES1` 签名**，字节无法解析或签名不符抛 `ValueError`，参数种类不对抛 `TypeError`；审计器自身不落盘，重启由调用方把先前导出的检查点传回。只读 `checkpoint` 属性导出当前前沿对象或 `None`。
 
 `audit(x, now, min=0)` 依次收快照（对象或其规范字节）、当前时刻与最低序号下限（缺省 `0`）。**验签、门控与推进在同一把锁内原子完成**：锁内先按既有快照复核语义做双层签名（列表 `NPERL1`、各条目 `NPBR1`）、签发时刻（`issued_at <= now`）与序号下限（`sequence >= min`）的整体复核；通过后再按前沿门控——序号低于前沿拒绝、序号相等且摘要相同按**重放接受且不改状态**、序号更高则推进并把前沿 MAC 成新的 `EvidenceRevocationListState`。成功返回审计器自身。同序异摘要（同序号的另一份快照）、旧快照回放、错钥与篡改一律抛 `ValueError` 且不改状态；快照序号本身为 u64，越界值在记录/快照契约处即被拒。快照参数形状错（`x` 既非对象也非 bytes）抛 `TypeError`，非规范字节、空密钥（构造时）、`now`/`min` 违约及其余值违约抛 `ValueError`。并发审计按取锁顺序线性化，已接受快照绝不丢失或回退。
+
+### 撤销快照整包 `EvidenceRevocationListBundle`、`seal_evidence_revocation_list_bundle` 与 `audit_evidence_revocation_list_bundle`
+
+`EvidenceRevocationListBundle(version, start, snapshots, end, mac)` 是冻结的共享密钥 MAC **整包记录**，把"从某个撤销账本前沿出发、连续若干张严格递增的撤销快照、到达某个新前沿"这一整段旅程作为一条可传输、可独立复核的记录交给第三方：`start` 为 `b""`（从空账本出发）或规范 `EvidenceRevocationListState` 字节；`snapshots` 为非空有序元组，每项是规范 `EvidenceRevocationList` 字节，即依次重放的快照；`end` 为规范非空 `EvidenceRevocationListState` 字节；`mac` 恰 32 字节，`mac = HMAC-SHA256(key, b"NPEB1" + 去mac字段序紧凑编码)`（version、小写 hex 的 start、小写 hex 快照数组、小写 hex 的 end），域标签与编码直拼、无分隔或长度前缀，包本身不含密钥。构造时**字段形状错抛 `TypeError`、值违约（含空快照元组、非规范内层编码）抛 `ValueError`**。编解码沿用撤销快照的紧凑 JSON 惯例：对象键序 `version, start, snapshots, end, mac`、bytes 小写 hex、无空白、无长度前缀；`from_bytes` 仅收 bytes，解析不验任何 MAC（包 `NPEB1`、起止 `NPES1`、快照各层均不在此校验），重编码须逐字节相等。
+
+`seal_evidence_revocation_list_bundle(snapshots, key, now, min=0, *, start=None)` 先验链再封包：`snapshots` 为非空有序可迭代，每项是快照对象或其规范字节；`start` 仅限关键字，`None`（缺省）表示空起点，否则收前沿对象或其规范字节，并以 `key` 恒时复核起点的 `NPES1` MAC。每张快照按 `audit_evidence_revocation_list` 的全部语义复核（双层 MAC、`issued_at <= now`、`sequence >= min`），且序号相对试探前沿必须**严格递增**；全部通过后才产出整包，`end` 为最终前沿的规范字节，包 MAC 为 `NPEB1`。封包不触碰任何审计器状态。
+
+`audit_evidence_revocation_list_bundle(x, key, now, min=0)` 是无状态验包：`x` 收整包对象或其规范字节（余类型抛 `TypeError`，坏字节抛 `ValueError`），`key` 为非空 bytes。先恒时复核包 `NPEB1` MAC，再对非空 `start` 与 `end` 各重算前沿 `NPES1` MAC（两者都恒时比较后才统一判定），然后自携带起点逐张重放快照（双层 MAC、时效与序号下限、严格递增），重放末态必须与包 `end` **逐字节相等**。任何一步失败抛 `ValueError`；验包是纯检查，不触碰任何审计器，成功返回重放到达的冻结 `EvidenceRevocationListState`。
+
+带状态的接收方用 `EvidenceRevocationListAuditor.audit_bundle(x, now, min=0) -> 审计器自身` 做**原子整包入账**：参数契约与验包入口完全一致，与 `audit` **共用一把锁**，锁内先按无状态验包的全部语义验包，额外要求包 `start` 与审计器**当前检查点逐字节相等**——空账本只接受 `b""`，否则须 `start == checkpoint.to_bytes()`；全部通过且起点匹配后才把只读检查点一次性替换为包 `end`。任何失败不改状态，同一包重复提交因起点已不匹配而被拒，`audit` 与 `audit_bundle` 的并发调用按取锁顺序线性化。成功只推进前沿，不签出凭证。
+
+### 整包提交凭证 `EvidenceRevocationListBundleReceipt`、`audit_bundle_receipt` 与 `audit_evidence_revocation_list_bundle_receipt`
+
+`audit_bundle` 整包入账只推进前沿；调用方还需要一张**可传输的提交凭证**，让第三方确认**那个确定的包**已被整段提交。`EvidenceRevocationListBundleReceipt` 就是这样的冻结回执：审计器在提交成功后制证，第三方凭 `audit_evidence_revocation_list_bundle_receipt` 独立复核。
+
+`EvidenceRevocationListBundleReceipt(version, start, bundle_digest, end, signature)` 位置构造、冻结、按字段相等：`version=1`；`start` 为空起点或账本前沿的规范字节；`bundle_digest` 恰 32 字节，`D = SHA256(bundle.to_bytes())`，即整包记录规范字节的哈希，**只绑定那一个确定的包**，而非任何同起止的其他包；`end` 为同种前沿的规范非空字节；`signature` 恰 32 字节，`signature = HMAC-SHA256(key, b"NPEBR1" + C)`，`C` 为去签名的字段序紧凑编码 `[1, start, bundle_digest, end]`（四项均为 version 与小写 hex），域标签与编码直拼、无定界与长度前缀，记录本身不含任何密钥材料。编解码沿用撤销快照的紧凑 JSON 惯例：`to_bytes()` 输出五元素字段序数组，bytes 小写 hex（空起点为 `""`），无空白、无长度前缀；`from_bytes(data)` 仅收 bytes（非 bytes 或字段错型抛 `TypeError`），五元数组形状/`version`/hex 长度/起止规范内层/非规范拼写不合契约抛 `ValueError`，重编码须逐字节相等，**解析不验签**。
+
+带状态的审计器用 `EvidenceRevocationListAuditor.audit_bundle_receipt(x, now, min=0) -> EvidenceRevocationListBundleReceipt` 一步完成整包提交与制证：参数契约与 `audit_bundle` 完全一致（同样的整包对象或规范字节、`now`、`min`），验证与检查点推进在**同一把锁**内复用 `audit_bundle` 的全部语义（与 `audit` 共享一把锁），**仅当提交成功**才以新提交包算出 `D` 与 `NPEBR1` 签名并返回回执；任何失败不改状态、也不产出回执，重放已提交的包因起点不符被拒（故不会签出第二张回执），并发按取锁顺序线性化。
+
+`audit_evidence_revocation_list_bundle_receipt(receipt, bundle, key)` 是**无状态独立复核**：三形参依次收回执、原包与非空密钥，回执与包各收对象或其规范字节。先以 `key` 重算回执 `NPEBR1` 签名、以 `SHA256(bundle.to_bytes())` 重算包摘要——两者都会重算且各用 `hmac.compare_digest` 恒时比较后才统一判定——再把回执 `start`/`end` 与包 `start`/`end` **逐字节核对一致**，最后整包验包：包 `NPEB1` MAC、非空起止前沿的 `NPES1` MAC、每张快照的 `NPERL1`/`NPBR1` 双层 MAC、序号严格递增、重放末态与 `end` 逐字节相等（本复核不带时钟，故不做 `issued_at`/`min` 策略检查——密码学与链完整性已足以确认那个确定的包）。复核是纯检查，**不触碰任何审计器**；成功返回终点前沿。参数或字段**形状**错抛 `TypeError`；其余违约——含非规范字节、**空密钥**、**错钥**、签名或摘要不符、起止不符、包本身验不过——一律抛 `ValueError`。
+
+```python
+s1 = make_evidence_revocation_list([], sequence=1, issued_at=100.0, key=key)
+s2 = make_evidence_revocation_list([], sequence=2, issued_at=100.0, key=key)
+bundle = seal_evidence_revocation_list_bundle([s1, s2], key, now=100.0)
+
+auditor = EvidenceRevocationListAuditor(key)
+receipt = auditor.audit_bundle_receipt(bundle, 100.0)   # 整包提交并制证
+blob = receipt.to_bytes()                               # 回执自行传输
+# auditor.audit_bundle_receipt(bundle, 100.0)           # 重放：起点不符，ValueError
+
+# 第三方独立复核：回执往返一致，返回终点前沿
+carried = EvidenceRevocationListBundleReceipt.from_bytes(blob)
+assert carried == receipt
+final = audit_evidence_revocation_list_bundle_receipt(carried, bundle, key)
+assert final == EvidenceRevocationListState.from_bytes(bundle.end)
+```
 
 ### 单轮证据撤销签发 `revoke_evidence`
 
