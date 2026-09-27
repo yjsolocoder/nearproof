@@ -11,7 +11,8 @@ BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
-Evidence / EvidenceRevocationList /
+Evidence / EvidenceRevocationList / EvidenceRevocationListAuditor /
+EvidenceRevocationListState /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
 JournalBatchReceiptFrontier /
 Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
@@ -127,6 +128,8 @@ __all__ = [
     "CrlState",
     "Evidence",
     "EvidenceRevocationList",
+    "EvidenceRevocationListAuditor",
+    "EvidenceRevocationListState",
     "JournalBatchReceipt",
     "JournalBatchReceiptAuditor",
     "JournalBatchReceiptFrontier",
@@ -263,6 +266,9 @@ _BOUND_EVIDENCE_PREFIX = b"NPBE1"
 _BOUND_REVOCATION_PREFIX = b"NPBR1"
 # Domain separation prefix for the evidence-revocation-list MAC.
 _EVIDENCE_REVOCATION_LIST_PREFIX = b"NPERL1"
+# Domain separation prefix for the rollback-protection evidence-revocation
+# frontier-state MAC.
+_EVIDENCE_REVOCATION_LIST_STATE_PREFIX = b"NPES1"
 # Domain separation prefix for the context revocation MAC.
 _CONTEXT_REVOCATION_PREFIX = b"NPCR1"
 # Domain separation prefix for the verifier-trust MAC.
@@ -703,6 +709,13 @@ _EVIDENCE_REVOCATION_LIST_FIELDS = (
     "sequence",
     "issued_at",
     "entries",
+    "mac",
+)
+
+_EVIDENCE_REVOCATION_LIST_STATE_FIELDS = (
+    "version",
+    "sequence",
+    "digest",
     "mac",
 )
 
@@ -20131,6 +20144,340 @@ def audit_evidence_revocation_list(
         raise ValueError("evidence revocation list is dated in the future")
     if erl.sequence < min:
         raise ValueError("evidence revocation list sequence is below the minimum")
+
+
+def _evidence_revocation_list_state_payload(
+    state: "EvidenceRevocationListState",
+) -> dict:
+    """The JSON-ready evidence-revocation-list-state fields except ``mac``."""
+    return {
+        "version": state.version,
+        "sequence": state.sequence,
+        "digest": state.digest.hex(),
+    }
+
+
+def _evidence_revocation_list_state_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPES1"`` plus the canonical encoding without ``mac``.
+
+    The prefix and the encoding are concatenated directly with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        key,
+        _EVIDENCE_REVOCATION_LIST_STATE_PREFIX + _encode_payload(payload),
+        hashlib.sha256,
+    ).digest()
+
+
+def _parse_evidence_revocation_list_state_hex(value: object, name: str) -> bytes:
+    # Same lowercase, round-tripping hex rule as the other records.
+    if not isinstance(value, str):
+        raise ValueError(
+            f"evidence revocation list state {name} must be a lowercase hex"
+            " string"
+        )
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"evidence revocation list state {name} must be a lowercase hex"
+            " string"
+        ) from error
+    if raw.hex() != value:
+        # Rejects uppercase digits, separators and odd-length input that
+        # bytes.fromhex would otherwise tolerate.
+        raise ValueError(
+            f"evidence revocation list state {name} must be a lowercase hex"
+            " string"
+        )
+    return raw
+
+
+class _OrderedEvidenceRevocationListStateObject(json.JSONDecoder):
+    """JSON decoder rejecting duplicate/out-of-order state object keys."""
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys == list(_EVIDENCE_REVOCATION_LIST_STATE_FIELDS):
+            return dict(pairs)
+        raise ValueError(
+            "evidence revocation list state JSON keys must be exactly"
+            " version, sequence, digest and mac in field order"
+        )
+
+
+@dataclass(frozen=True)
+class EvidenceRevocationListState:
+    """A key-MAC'd, rollback-resistant checkpoint of the audited
+    evidence-revocation-list frontier.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer (the accepted :class:`EvidenceRevocationList` sequence);
+    ``digest`` exactly 32 bytes — ``SHA256(erl)`` over the canonical
+    :meth:`EvidenceRevocationList.to_bytes` bytes of the accepted snapshot,
+    binding the frontier to that one definite snapshot rather than any other
+    snapshot carrying the same sequence; ``mac`` exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPES1" + encoding)`` over the canonical encoding
+    of every field except ``mac`` itself, the prefix and the encoding
+    concatenated directly with no separator or length prefix. A field of
+    the wrong type raises :class:`TypeError` at construction time; a value
+    contract violation raises :class:`ValueError`. Instances are frozen,
+    constructed positionally in field order and compare equal by their
+    fields. No key material is stored.
+    """
+
+    version: int
+    sequence: int
+    digest: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "evidence revocation list state version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError("evidence revocation list state version must be 1")
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "evidence revocation list state sequence must be a non-bool"
+                " integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "evidence revocation list state sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        for name in ("digest", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(
+                    f"evidence revocation list state {name} must be bytes"
+                )
+            if len(value) != 32:
+                raise ValueError(
+                    f"evidence revocation list state {name} must be exactly 32"
+                    " bytes"
+                )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``digest`` and
+        ``mac`` as lowercase hex, no whitespace, no length prefix."""
+        payload = _evidence_revocation_list_state_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "EvidenceRevocationListState":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes``; raises
+        :class:`ValueError` for anything that does not satisfy the contract:
+        an object with exactly the keys ``version, sequence, digest, mac``
+        once each in that order (missing, extra, duplicated or out-of-order
+        keys are rejected), ``version == 1``, a non-bool u64 ``sequence``,
+        and ``digest``/``mac`` lowercase hex strings decoding to exactly 32
+        bytes each. After parsing and field validation the record is
+        re-encoded with :meth:`to_bytes` and the result must equal the input
+        byte for byte, so formatted JSON, whitespace and any non-canonical
+        number or string spelling are rejected as well. The MAC is not
+        verified here — pass the encoding to
+        :class:`EvidenceRevocationListAuditor` (or recompute
+        :func:`_evidence_revocation_list_state_mac` with the key) for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "evidence revocation list state data must be bytes"
+            )
+        try:
+            obj = json.loads(data, cls=_OrderedEvidenceRevocationListStateObject)
+        except ValueError as error:
+            raise ValueError(
+                f"evidence revocation list state is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _EVIDENCE_REVOCATION_LIST_STATE_FIELDS
+        ):
+            raise ValueError(
+                "evidence revocation list state must be a JSON object with"
+                " exactly the version, sequence, digest and mac fields in"
+                " field order"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("evidence revocation list state version must be 1")
+        sequence = _parse_int_field(obj["sequence"], "sequence")
+        if not 0 <= sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "evidence revocation list state sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        digest = _parse_evidence_revocation_list_state_hex(obj["digest"], "digest")
+        if len(digest) != 32:
+            raise ValueError(
+                "evidence revocation list state digest must decode to exactly"
+                " 32 bytes"
+            )
+        mac = _parse_evidence_revocation_list_state_hex(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "evidence revocation list state mac must decode to exactly 32"
+                " bytes"
+            )
+        record = cls(version=version, sequence=sequence, digest=digest, mac=mac)
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError(
+                "evidence revocation list state encoding is not canonical"
+            )
+        return record
+
+
+class EvidenceRevocationListAuditor:
+    """Stateful :class:`EvidenceRevocationList` auditor that refuses snapshot
+    sequence rollback.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    shared key the snapshots and checkpoints are MAC'd with. ``checkpoint``
+    is keyword-only: ``None`` (the default) starts from the empty state;
+    otherwise it must be an :class:`EvidenceRevocationListState` or its
+    canonical :meth:`EvidenceRevocationListState.to_bytes` encoding, and its
+    MAC is recomputed with ``key`` and compared in constant time (a
+    malformed encoding or MAC mismatch raises :class:`ValueError`). Across a
+    restart the caller must pass the value previously exported at
+    :attr:`checkpoint`; nothing is persisted by the auditor itself.
+
+    Each :meth:`audit` accepts an :class:`EvidenceRevocationList` or its
+    canonical bytes and runs, under a single lock, the same two-layer
+    stateless review as :func:`audit_evidence_revocation_list` — the list
+    ``NPERL1`` MAC and every entry's ``NPBR1`` MAC in constant time, plus
+    the ``issued_at <= now`` freshness and ``sequence >= min`` floor checks
+    — and only then gates the snapshot against the checkpoint: a lower
+    sequence is rejected, an equal sequence is accepted solely as a replay
+    of the identical snapshot digest (a different snapshot at the same
+    sequence is rejected), and a higher sequence advances the checkpoint.
+    The verify, gate and update are one atomic critical section, so a
+    rejected snapshot never changes the checkpoint and concurrent audits
+    are linearized in lock-acquisition order with the accepted frontier
+    never lost or moved backwards. A carried sequence outside the unsigned
+    64-bit range cannot reach the gate (the snapshot or state record
+    contract rejects it), so such an overflow attempt raises
+    :class:`ValueError` before the checkpoint changes. Field-shape errors
+    raise :class:`TypeError`; every other failure — an empty key, a
+    malformed or non-canonical encoding, a MAC mismatch, a future snapshot,
+    a sequence below the floor or checkpoint, a same-sequence/
+    different-digest snapshot, an out-of-range sequence, or a tampered
+    checkpoint — raises :class:`ValueError`.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._state: "Optional[EvidenceRevocationListState]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, EvidenceRevocationListState):
+            state = checkpoint
+        elif isinstance(checkpoint, bytes):
+            state = EvidenceRevocationListState.from_bytes(checkpoint)
+        else:
+            raise TypeError(
+                "checkpoint must be an EvidenceRevocationListState instance,"
+                " its canonical bytes, or None"
+            )
+        if not hmac.compare_digest(
+            _evidence_revocation_list_state_mac(
+                self._key, _evidence_revocation_list_state_payload(state)
+            ),
+            state.mac,
+        ):
+            raise ValueError("checkpoint mac does not match the key")
+        self._state = state
+
+    @property
+    def checkpoint(self) -> "Optional[EvidenceRevocationListState]":
+        """The current frontier :class:`EvidenceRevocationListState`, or
+        ``None`` before the first successfully audited snapshot. The
+        returned object is frozen and the property read-only; persist its
+        :meth:`EvidenceRevocationListState.to_bytes` output and pass it back
+        to a new auditor to survive a restart."""
+        return self._state
+
+    def audit(
+        self,
+        x: "EvidenceRevocationList | bytes",
+        now: object,
+        min: object = 0,
+    ) -> "EvidenceRevocationListAuditor":
+        """Authenticate ``x`` and enforce monotone snapshot progress.
+
+        ``x`` must be an :class:`EvidenceRevocationList` or its canonical
+        :meth:`EvidenceRevocationList.to_bytes` encoding — anything else
+        raises :class:`TypeError`, and bytes that do not parse raise
+        :class:`ValueError`. ``now`` must be a finite non-bool number and
+        ``min`` a non-bool integer (default ``0``); both violations raise
+        :class:`ValueError`. The two MAC layers, freshness and sequence
+        floor are reviewed exactly as in
+        :func:`audit_evidence_revocation_list`, and the frontier gate and
+        checkpoint update happen in the same locked critical section, so
+        verification, gating and progress are atomic together. On success
+        the auditor itself is returned.
+        """
+        with self._lock:
+            # Run the existing snapshot review semantics inside the lock so
+            # verification, gating and advancement form one atomic step; the
+            # review is pure and touches no registry or state.
+            audit_evidence_revocation_list(x, self._key, now, min)
+            if isinstance(x, bytes):
+                erl = EvidenceRevocationList.from_bytes(x)
+            else:
+                erl = x
+            digest = hashlib.sha256(erl.to_bytes()).digest()
+            sequence = erl.sequence
+            current = self._state
+            if current is not None:
+                if sequence < current.sequence:
+                    raise ValueError(
+                        "evidence revocation list sequence is below the audited"
+                        " checkpoint"
+                    )
+                if sequence == current.sequence and not hmac.compare_digest(
+                    digest, current.digest
+                ):
+                    raise ValueError(
+                        "evidence revocation list carries a different snapshot"
+                        " at the checkpoint sequence"
+                    )
+                if sequence == current.sequence:
+                    # Identical snapshot: an accepted replay, nothing to
+                    # advance.
+                    return self
+            candidate = EvidenceRevocationListState(
+                version=1,
+                sequence=sequence,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._state = replace(
+                candidate,
+                mac=_evidence_revocation_list_state_mac(
+                    self._key,
+                    _evidence_revocation_list_state_payload(candidate),
+                ),
+            )
+        return self
 
 
 def audit_assess_evidence_policy(
