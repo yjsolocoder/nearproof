@@ -11,7 +11,7 @@ BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
-Evidence /
+Evidence / EvidenceRevocationList /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
 JournalBatchReceiptFrontier /
 Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
@@ -45,7 +45,7 @@ VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
 audit_b / audit_bound /
 audit_bound_policy /
-audit_cert_evidence / audit_crl / audit_map_history /
+audit_cert_evidence / audit_crl / audit_evidence_revocation_list / audit_map_history /
 audit_map_history_evidence / audit_map_history_journal_bundle /
 audit_map_history_journal_receipt /
 audit_map_update /
@@ -63,7 +63,7 @@ audit_stream_commit_receipt_span_receipt /
 audit_stream_receipt / audit_stream_receipt_batch_commit_receipt /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
-locate_cert_evidence / make_crl / prove_crl / revoke_bound /
+locate_cert_evidence / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
 revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
 seal_map_history /
 seal_map_history_journal_bundle / seal_range / seal_range_receipt_batch /
@@ -126,6 +126,7 @@ __all__ = [
     "CrlProofAuditor",
     "CrlState",
     "Evidence",
+    "EvidenceRevocationList",
     "JournalBatchReceipt",
     "JournalBatchReceiptAuditor",
     "JournalBatchReceiptFrontier",
@@ -192,6 +193,7 @@ __all__ = [
     "audit_cert_evidence",
     "audit_commit",
     "audit_crl",
+    "audit_evidence_revocation_list",
     "audit_map_history",
     "audit_map_history_evidence",
     "audit_map_history_journal_bundle",
@@ -223,6 +225,7 @@ __all__ = [
     "locate_cert",
     "locate_cert_evidence",
     "make_crl",
+    "make_evidence_revocation_list",
     "prove_crl",
     "revoke_bound",
     "revoke_context",
@@ -266,6 +269,8 @@ _TRUST_PREFIX = b"NPVT1"
 _TRUST_REVOCATION_PREFIX = b"NPVR1"
 # Domain separation prefix for the trust-revocation-list MAC.
 _TRUST_REVOCATION_LIST_PREFIX = b"NPVRL1"
+# Domain separation prefix for the per-round evidence-revocation-list MAC.
+_EVIDENCE_REVOCATION_LIST_PREFIX = b"NPERL1"
 # Domain separation prefix for the assess-evidence MAC.
 _ASSESS_EVIDENCE_PREFIX = b"NPAE1"
 # Domain separation prefix for the certified-consensus-evidence MAC.
@@ -693,6 +698,14 @@ _BOUND_REVOCATION_FIELDS = (
     "mac",
 )
 
+_EVIDENCE_REVOCATION_LIST_FIELDS = (
+    "version",
+    "sequence",
+    "issued_at",
+    "entries",
+    "mac",
+)
+
 _CONTEXT_REVOCATION_FIELDS = (
     "version",
     "context",
@@ -705,10 +718,12 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
 
     The outer bound-evidence object, the nested evidence object, the
-    bound-evidence-revocation object and the context-revocation object must
-    each contain exactly their own fields, once each, in field order; the
-    field sets are distinguishable by their key lists, so a single hook can
-    check all of them.
+    bound-evidence-revocation object, the context-revocation object and the
+    outer evidence-revocation-list object must each contain exactly their
+    own fields, once each, in field order (the nested entries of an
+    evidence-revocation list carry the bound-evidence-revocation key set);
+    the field sets are distinguishable by their key lists, so a single hook
+    can check all of them.
     """
 
     def __init__(self) -> None:
@@ -722,6 +737,7 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
             list(_EVIDENCE_FIELDS),
             list(_BOUND_REVOCATION_FIELDS),
             list(_CONTEXT_REVOCATION_FIELDS),
+            list(_EVIDENCE_REVOCATION_LIST_FIELDS),
         ):
             return dict(pairs)
         raise ValueError(
@@ -19763,6 +19779,365 @@ def revoke_evidence(
     )
 
 
+def _evidence_revocation_list_payload(
+    snapshot: "EvidenceRevocationList",
+) -> dict:
+    """The JSON-ready evidence-revocation-list fields except ``mac``.
+
+    ``entries`` is encoded as a JSON array of objects, each carrying exactly
+    the :class:`BoundEvidenceRevocation` key set in its own field order.
+    """
+    return {
+        "version": snapshot.version,
+        "sequence": snapshot.sequence,
+        "issued_at": snapshot.issued_at,
+        "entries": [
+            {**_bound_revocation_payload(entry), "mac": entry.mac.hex()}
+            for entry in snapshot.entries
+        ],
+    }
+
+
+def _evidence_revocation_list_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPERL1"`` plus the canonical encoding without ``mac``.
+
+    The prefix and the encoding are concatenated directly, with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        key,
+        _EVIDENCE_REVOCATION_LIST_PREFIX + _encode_payload(payload),
+        hashlib.sha256,
+    ).digest()
+
+
+@dataclass(frozen=True)
+class EvidenceRevocationList:
+    """A keyed, distributable snapshot list of per-round evidence revocations.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer; ``issued_at`` a finite non-bool non-negative number, stored as
+    ``float``; ``entries`` a tuple of :class:`BoundEvidenceRevocation`
+    instances — the same per-round revocation records
+    :func:`revoke_evidence` and :func:`revoke_bound` sign — sorted ascending
+    by ``(round_index, nonce)`` with no duplicate pair; ``mac`` exactly 32
+    bytes — ``HMAC-SHA256(key, b"NPERL1" + encoding)`` over the canonical
+    encoding of every field except ``mac`` itself (entries as an object
+    array), the prefix and the encoding concatenated directly with no length
+    prefix. A field of the wrong type raises :class:`TypeError` at
+    construction time; every other contract violation raises
+    :class:`ValueError`. Instances are frozen, constructed positionally in
+    field order and compare equal by their fields. No key material is
+    stored.
+    """
+
+    version: int
+    sequence: int
+    issued_at: float
+    entries: "tuple[BoundEvidenceRevocation, ...]"
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("evidence revocation list version must be an integer")
+        if self.version != 1:
+            raise ValueError("evidence revocation list version must be 1")
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "evidence revocation list sequence must be a non-bool integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "evidence revocation list sequence must fit in an unsigned"
+                " 64-bit integer"
+            )
+        value = self.issued_at
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(
+                "evidence revocation list issued_at must be a finite"
+                " non-negative number"
+            )
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                "evidence revocation list issued_at must be a finite"
+                " non-negative number"
+            )
+        # The canonical encoding always spells issued_at as a float.
+        object.__setattr__(self, "issued_at", float(value))
+        if not isinstance(self.entries, tuple):
+            raise TypeError(
+                "evidence revocation list entries must be a tuple of"
+                " BoundEvidenceRevocation"
+            )
+        previous = None
+        for entry in self.entries:
+            if not isinstance(entry, BoundEvidenceRevocation):
+                raise TypeError(
+                    "evidence revocation list entries must contain only"
+                    " BoundEvidenceRevocation instances"
+                )
+            pair = (entry.round_index, entry.nonce)
+            if previous is not None and pair <= previous:
+                raise ValueError(
+                    "evidence revocation list entries must be sorted by"
+                    " (round_index, nonce) with no duplicates"
+                )
+            previous = pair
+        if not isinstance(self.mac, bytes):
+            raise TypeError("evidence revocation list mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError(
+                "evidence revocation list mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``entries`` as
+        an array of objects with the bound-evidence-revocation keys in field
+        order, ``issued_at`` as a float, ``mac`` as lowercase hex, no
+        whitespace, no length prefix, no NaN/Infinity."""
+        payload = _evidence_revocation_list_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "EvidenceRevocationList":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes``; raises
+        :class:`ValueError` for anything else that does not satisfy the
+        contract: exactly the list fields appearing once each in field order
+        (missing, extra, duplicated or out-of-order keys are rejected,
+        likewise inside every nested entry object), ``version == 1``, a
+        non-bool u64 ``sequence``, a finite non-bool non-negative
+        ``issued_at`` stored as ``float``, an ``entries`` array of objects
+        satisfying the :class:`BoundEvidenceRevocation` contract, sorted by
+        ``(round_index, nonce)`` with no duplicate pair, and ``mac`` a
+        lowercase hex string decoding to exactly 32 bytes. After parsing and
+        field validation the record is re-encoded with :meth:`to_bytes` and
+        the result must equal the input byte for byte, so formatted JSON,
+        whitespace and any non-canonical number or string spelling are
+        rejected as well. Neither the list MAC nor any entry MAC is verified
+        here — use :func:`audit_evidence_revocation_list` with the shared
+        key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("evidence revocation list data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedBoundEvidenceObject)
+        except ValueError as error:
+            raise ValueError(
+                f"evidence revocation list is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _EVIDENCE_REVOCATION_LIST_FIELDS
+        ):
+            raise ValueError(
+                "evidence revocation list must be a JSON object with exactly"
+                " the evidence revocation list fields"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("evidence revocation list version must be 1")
+        sequence = _parse_int_field(obj["sequence"], "sequence")
+        if not 0 <= sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "evidence revocation list sequence must fit in an unsigned"
+                " 64-bit integer"
+            )
+        issued_at = obj["issued_at"]
+        if isinstance(issued_at, bool) or not isinstance(issued_at, (int, float)):
+            raise ValueError(
+                "evidence revocation list issued_at must be a finite"
+                " non-negative number"
+            )
+        if not math.isfinite(issued_at) or issued_at < 0:
+            raise ValueError(
+                "evidence revocation list issued_at must be a finite"
+                " non-negative number"
+            )
+        raw_entries = obj["entries"]
+        if not isinstance(raw_entries, list):
+            raise ValueError(
+                "evidence revocation list entries must be an array of objects"
+            )
+        entries: list[BoundEvidenceRevocation] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict) or list(raw_entry) != list(
+                _BOUND_REVOCATION_FIELDS
+            ):
+                raise ValueError(
+                    "evidence revocation list entries must be JSON objects"
+                    " with exactly the bound evidence revocation fields"
+                )
+            try:
+                entry = BoundEvidenceRevocation(
+                    version=raw_entry["version"],
+                    round_index=raw_entry["round_index"],
+                    nonce=_parse_hex_field(raw_entry["nonce"], "nonce"),
+                    revoked_at=raw_entry["revoked_at"],
+                    mac=_parse_hex_field(raw_entry["mac"], "mac"),
+                )
+            except TypeError as error:
+                # A nested entry of the right key set but the wrong field
+                # shape makes the whole list encoding non-canonical; the
+                # only TypeError this method raises is for non-bytes data.
+                raise ValueError(
+                    "evidence revocation list entry does not satisfy the"
+                    " bound evidence revocation contract"
+                ) from error
+            entries.append(entry)
+        mac = _parse_hex_field(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "evidence revocation list mac must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=version,
+            sequence=sequence,
+            issued_at=issued_at,
+            entries=tuple(entries),
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings (including an integer issued_at, which
+            # the float spelling would not reproduce).
+            raise ValueError("evidence revocation list encoding is not canonical")
+        return record
+
+
+def make_evidence_revocation_list(
+    entries: object,
+    seq: object,
+    time: object,
+    key: object,
+) -> EvidenceRevocationList:
+    """Sign a distributable snapshot list of per-round evidence revocations.
+
+    ``entries`` is an iterable of :class:`BoundEvidenceRevocation` instances
+    (bytes encodings are not accepted here); it may be empty. The entries
+    are copied into a tuple sorted ascending by ``(round_index, nonce)``,
+    and a duplicate pair raises :class:`ValueError`. ``seq`` must be a
+    non-bool unsigned 64-bit integer and ``time`` a finite non-bool
+    non-negative number (stored as ``float``); any such violation, like a
+    duplicate pair, raises :class:`ValueError`. ``key`` must be non-empty
+    ``bytes`` — a non-bytes value raises :class:`TypeError`, an empty value
+    :class:`ValueError` — and is the same shared key the per-round entries
+    were signed with (the ``NPBR1`` MACs); the entries' own MACs are
+    carried through unchanged. The returned :class:`EvidenceRevocationList`
+    has ``version`` set to ``1`` and
+    ``mac = HMAC-SHA256(key, b"NPERL1" + encoding)`` over the canonical
+    encoding of every field except ``mac`` itself, the prefix and the
+    encoding concatenated directly with no length prefix. Signing is pure
+    data: it reads and mutates no challenge registry or consumption state.
+    """
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must not be empty")
+    if isinstance(seq, bool) or type(seq) is not int:
+        raise ValueError("sequence must be a non-bool integer")
+    if not 0 <= seq <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("sequence must fit in an unsigned 64-bit integer")
+    if isinstance(time, bool) or not isinstance(time, (int, float)):
+        raise ValueError("issued_at must be a finite non-negative number")
+    if not math.isfinite(time) or time < 0:
+        raise ValueError("issued_at must be a finite non-negative number")
+    try:
+        raw_entries = list(entries)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "entries must be an iterable of BoundEvidenceRevocation"
+        ) from error
+    items: list[BoundEvidenceRevocation] = []
+    for entry in raw_entries:
+        if not isinstance(entry, BoundEvidenceRevocation):
+            raise ValueError(
+                "entries must contain only BoundEvidenceRevocation instances"
+            )
+        items.append(entry)
+    items.sort(key=lambda entry: (entry.round_index, entry.nonce))
+    record = EvidenceRevocationList(
+        version=1,
+        sequence=seq,
+        issued_at=time,
+        entries=tuple(items),
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record,
+        mac=_evidence_revocation_list_mac(
+            key, _evidence_revocation_list_payload(record)
+        ),
+    )
+
+
+def audit_evidence_revocation_list(
+    x: "EvidenceRevocationList | bytes",
+    key: object,
+    now: object,
+    min: object = 0,
+) -> None:
+    """Authenticate an :class:`EvidenceRevocationList` snapshot and check
+    freshness.
+
+    Accepts the list itself or its canonical
+    :meth:`EvidenceRevocationList.to_bytes` encoding; anything else raises
+    :class:`ValueError`. ``key`` must be non-empty ``bytes`` (a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`);
+    ``now`` must be a finite non-bool number and ``min`` a non-bool
+    integer (default ``0``). Two MAC layers are recomputed with ``key`` and
+    each compared in constant time: the list MAC is
+    ``HMAC-SHA256(key, b"NPERL1" + encoding)`` over the canonical encoding
+    of every field except the list ``mac``, and every entry's MAC is
+    ``HMAC-SHA256(key, b"NPBR1" + encoding)`` exactly as
+    :func:`audit_assess_evidence_policy` verifies a standalone per-round
+    revocation; a mismatch on either layer — as with any tampering — raises
+    :class:`ValueError`. The snapshot must also be current:
+    ``issued_at > now`` (a future-dated list) or ``sequence < min`` raises
+    :class:`ValueError`. The check is pure: it returns ``None`` on success,
+    touches no challenge registry or consumption state and is no substitute
+    for verification-time replay protection.
+    """
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must not be empty")
+    if isinstance(x, bytes):
+        snapshot = EvidenceRevocationList.from_bytes(x)
+    elif isinstance(x, EvidenceRevocationList):
+        snapshot = x
+    else:
+        raise ValueError(
+            "x must be an EvidenceRevocationList instance or bytes"
+        )
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValueError("now must be a finite number")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be a finite number")
+    if isinstance(min, bool) or type(min) is not int:
+        raise ValueError("min must be a non-bool integer")
+    if not hmac.compare_digest(
+        _evidence_revocation_list_mac(
+            key, _evidence_revocation_list_payload(snapshot)
+        ),
+        snapshot.mac,
+    ):
+        raise ValueError("evidence revocation list mac does not match")
+    for entry in snapshot.entries:
+        if not hmac.compare_digest(
+            _bound_revocation_mac(key, _bound_revocation_payload(entry)),
+            entry.mac,
+        ):
+            raise ValueError("bound evidence revocation mac does not match")
+    if snapshot.issued_at > current:
+        raise ValueError("evidence revocation list is dated in the future")
+    if snapshot.sequence < min:
+        raise ValueError("evidence revocation list sequence is below the minimum")
+
+
 def audit_assess_evidence_policy(
     x: object,
     key: object,
@@ -19796,25 +20171,45 @@ def audit_assess_evidence_policy(
     over-age decision raises :class:`ValueError`, equality at either boundary
     staying valid.
 
-    With ``revocations`` set it must be an iterable of
+    With ``revocations`` set it is either an iterable (the legacy form) of
     :class:`BoundEvidenceRevocation` instances and/or their canonical
     :meth:`BoundEvidenceRevocation.to_bytes` encodings (mixing is allowed;
     these are the same per-round records :func:`revoke_bound` and
-    :func:`revoke_evidence` sign). Every entry is parsed and its MAC
-    recomputed under the same ``key`` and compared in constant time; an item
-    that is neither kind, bytes that do not parse, a wrong key or any
-    tampering raises :class:`ValueError`. Two entries carrying the same
-    ``(round_index, nonce)`` pair are likewise rejected. ``now`` is required
-    exactly as under ``max_age`` (a finite non-bool number): an entry whose
-    ``revoked_at > now`` — a revocation dated in the future — raises
-    :class:`ValueError`. An entry matching none of the carried samples is
-    ignored beyond the MAC and timestamp checks, so unrelated revocations do
-    not reject the decision. An entry matches a carried sample on equal
-    ``round_index`` and ``nonce``; when that sample's completion time is not
-    later than ``revoked_at`` (``end <= revoked_at``) the decision is
-    rejected, while a sample completed strictly after the revocation
-    survives. Samples completed strictly after a matching revocation are
-    unaffected.
+    :func:`revoke_evidence` sign), or a single distributable snapshot
+    :class:`EvidenceRevocationList` (the object itself or its canonical
+    :meth:`EvidenceRevocationList.to_bytes` bytes).
+
+    Every legacy entry is parsed and its MAC recomputed under the same
+    ``key`` and compared in constant time; an item that is neither kind,
+    bytes that do not parse, a wrong key or any tampering raises
+    :class:`ValueError`. Two entries carrying the same
+    ``(round_index, nonce)`` pair are likewise rejected. ``now`` is
+    required exactly as under ``max_age`` (a finite non-bool number): an
+    entry whose ``revoked_at > now`` — a revocation dated in the future —
+    raises :class:`ValueError`. An entry matching none of the carried
+    samples is ignored beyond the MAC and timestamp checks, so unrelated
+    revocations do not reject the decision. An entry matches a carried
+    sample on equal ``round_index`` and ``nonce``; when that sample's
+    completion time is not later than ``revoked_at``
+    (``end <= revoked_at``) the decision is rejected, while a sample
+    completed strictly after the revocation survives. Samples completed
+    strictly after a matching revocation are unaffected.
+
+    A snapshot is a global list, so unlike the legacy iterable entries that
+    match none of the carried samples are simply ignored (the list's own
+    sorted-uniqueness contract already gives each round at most one entry).
+    It is authenticated wholesale first with
+    :func:`audit_evidence_revocation_list` under ``key`` and ``now``
+    (required for a snapshot exactly as on the legacy path: omitting it
+    raises :class:`ValueError`) with ``min`` fixed at ``0``: the list MAC
+    (``NPERL1``) and every per-round entry MAC (``NPBR1``) must verify in
+    constant time, ``issued_at`` must not be in the future relative to
+    ``now`` and ``sequence`` must be non-negative; a bad snapshot
+    signature, a future issue time, malformed bytes or any other violation
+    raises :class:`ValueError`. Only after the whole snapshot has checked
+    out are its entries compared against the carried samples, with the
+    same ``end <= revoked_at`` voiding rule as a standalone per-round
+    revocation.
 
     Like :func:`audit_assess_evidence` this is a pure check: it touches no
     challenge registry or consumption state and is no substitute for
@@ -19845,53 +20240,81 @@ def audit_assess_evidence_policy(
     samples = [Evidence.from_bytes(sample) for sample in record.samples]
     latest_end = max(sample.end for sample in samples)
     if revocations is not None:
-        try:
-            raw_revocations = list(revocations)  # type: ignore[arg-type]
-        except TypeError as error:
-            raise ValueError(
-                "revocations must be an iterable of BoundEvidenceRevocation"
-                " instances or their canonical bytes"
-            ) from error
-        targets = {
-            (sample.round_index, sample.nonce): sample for sample in samples
-        }
-        seen: set[tuple] = set()
-        for entry in raw_revocations:
-            if isinstance(entry, bytes):
-                try:
-                    entry = BoundEvidenceRevocation.from_bytes(entry)
-                except ValueError as error:
-                    raise ValueError(
-                        "revocations bytes must be the canonical"
-                        " BoundEvidenceRevocation encoding"
-                    ) from error
-            if not isinstance(entry, BoundEvidenceRevocation):
-                raise ValueError(
-                    "revocations must contain only BoundEvidenceRevocation"
-                    " instances or their canonical bytes"
-                )
-            identity = (entry.round_index, entry.nonce)
-            if identity in seen:
-                raise ValueError(
-                    "revocations contain a duplicate (round_index, nonce) pair"
-                )
-            seen.add(identity)
-            expected = _bound_revocation_mac(
-                key, _bound_revocation_payload(entry)  # type: ignore[arg-type]
+        if isinstance(revocations, (EvidenceRevocationList, bytes)):
+            # Signed global snapshot: authenticated as a whole (both MAC
+            # layers, issued_at and sequence) under key/now with min fixed
+            # at 0; `now` is mandatory and was validated above. A snapshot
+            # is global, so entries naming rounds this decision does not
+            # carry are ignored rather than rejected.
+            audit_evidence_revocation_list(revocations, key, current, min=0)
+            snapshot = (
+                EvidenceRevocationList.from_bytes(revocations)
+                if isinstance(revocations, bytes)
+                else revocations
             )
-            if not hmac.compare_digest(expected, entry.mac):
-                raise ValueError("bound evidence revocation mac does not match")
-            revoked_at = float(entry.revoked_at)
-            if revoked_at > current:
-                raise ValueError("bound evidence revocation is dated in the future")
-            target = targets.get(identity)
-            # An entry for a round this decision does not carry is irrelevant:
-            # it still had to pass the MAC and future-date checks above.
-            if target is not None and target.end <= revoked_at:
+            targets = {
+                (sample.round_index, sample.nonce): sample for sample in samples
+            }
+            for entry in snapshot.entries:
+                target = targets.get((entry.round_index, entry.nonce))
+                # Uniqueness inside the snapshot gives each round at most
+                # one entry; a miss only has to pass the whole-snapshot
+                # audit above.
+                if target is not None and target.end <= float(entry.revoked_at):
+                    raise ValueError(
+                        "assess evidence carries a sample completed no later than"
+                        " its revocation"
+                    )
+        else:
+            try:
+                raw_revocations = list(revocations)  # type: ignore[arg-type]
+            except TypeError as error:
                 raise ValueError(
-                    "assess evidence carries a sample completed no later than"
-                    " its revocation"
+                    "revocations must be an iterable of BoundEvidenceRevocation"
+                    " instances or their canonical bytes, or an"
+                    " EvidenceRevocationList snapshot"
+                ) from error
+            targets = {
+                (sample.round_index, sample.nonce): sample for sample in samples
+            }
+            seen: set[tuple] = set()
+            for entry in raw_revocations:
+                if isinstance(entry, bytes):
+                    try:
+                        entry = BoundEvidenceRevocation.from_bytes(entry)
+                    except ValueError as error:
+                        raise ValueError(
+                            "revocations bytes must be the canonical"
+                            " BoundEvidenceRevocation encoding"
+                        ) from error
+                if not isinstance(entry, BoundEvidenceRevocation):
+                    raise ValueError(
+                        "revocations must contain only BoundEvidenceRevocation"
+                        " instances or their canonical bytes, or be an"
+                        " EvidenceRevocationList snapshot"
+                    )
+                identity = (entry.round_index, entry.nonce)
+                if identity in seen:
+                    raise ValueError(
+                        "revocations contain a duplicate (round_index, nonce) pair"
+                    )
+                seen.add(identity)
+                expected = _bound_revocation_mac(
+                    key, _bound_revocation_payload(entry)  # type: ignore[arg-type]
                 )
+                if not hmac.compare_digest(expected, entry.mac):
+                    raise ValueError("bound evidence revocation mac does not match")
+                revoked_at = float(entry.revoked_at)
+                if revoked_at > current:
+                    raise ValueError("bound evidence revocation is dated in the future")
+                target = targets.get(identity)
+                # An entry for a round this decision does not carry is irrelevant:
+                # it still had to pass the MAC and future-date checks above.
+                if target is not None and target.end <= revoked_at:
+                    raise ValueError(
+                        "assess evidence carries a sample completed no later than"
+                        " its revocation"
+                    )
     if check_age:
         age = current - latest_end
         if not 0.0 <= age <= age_limit:

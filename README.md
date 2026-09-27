@@ -58,6 +58,11 @@ python3 -m nearproof
 - `audit_assess_evidence(x, key)` — 用共享密钥复核 `AssessEvidence`（对象或规范字节），重算判定并逐字段比对，返回对应的 `RangeDecision`（见下）
 - `audit_assess_evidence_policy(x, key, *, now=None, max_age=None, revocations=None) -> RangeDecision` — 先按 `audit_assess_evidence` 复核，再可选做时效/撤销复核（见下）
 - `revoke_evidence(sample, revoked_at, key) -> BoundEvidenceRevocation` — 用非空 key 为单轮证据样本（`Evidence` 或其规范字节）签出一条逐轮撤销记录，记录形状与 `revoke_bound` 的产物相同、可互通（见下）
+- `EvidenceRevocationList(version, sequence, issued_at, entries, mac)` — 共享密钥 MAC 的冻结逐轮撤销**全局签名快照**（`version=1`，`sequence` 为非布尔 u64，`issued_at` 存为 `float`，`entries` 为按 `(round_index, nonce)` 升序且无重复的 `BoundEvidenceRevocation` 元组，`mac` 恰 32 字节，不含密钥；见下）；字段形状错抛 `TypeError`，其余值违约抛 `ValueError`
+  - `to_bytes()` — 字段序紧凑 UTF-8 JSON：`entries` 为对象数组（每条带自己的 `mac`），外层 `mac` 小写十六进制，无空白、无长度前缀
+  - `from_bytes(data)` — 仅收 `bytes`（否则 `TypeError`）；缺/多/重复/乱序键、entries 不是数组、某条 entry 不合 `BoundEvidenceRevocation` 契约、u64/时刻违约、编码非规范均抛 `ValueError`；成功返回本类且不验任何 MAC
+- `make_evidence_revocation_list(entries, seq, time, key) -> EvidenceRevocationList` — 用与签发逐条记录相同的 key 对一批 `BoundEvidenceRevocation`（可为空；不接受字节）签快照：先按 `(round_index, nonce)` 排序、重复对、序号或时刻违约一律抛 `ValueError`，`mac = HMAC-SHA256(key, b"NPERL1" + 去mac规范JSON)`，直拼无长度前缀；`key` 非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError`
+- `audit_evidence_revocation_list(x, key, now, min=0) -> None` — 收快照对象或字节；恒时复核双层 MAC（列表层 `NPERL1`、每条 entry 的 `NPBR1`，同一 key），并检查 `issued_at <= now`、`sequence >= min`（`min` 为非布尔整数，缺省 `0`）；`key` 形状错抛 `TypeError`，其余（空密钥、对象类型不对、MAC 不符、篡改、未来时间、序号过低）一律抛 `ValueError`
 - `audit(evidence, key)` — 用共享密钥复核 `Evidence`（或其字节编码），返回对应的 `Measurement`
 - `BitEvidence(version, t, context, digest, opening, queries, speed, timeout, limit, mac)` — 一场已接受**位挑战**会话的防篡改记录（`version=1`；`t` 恰 16 字节，`context`/`opening`/`digest`/`mac` 各恰 32 字节，`queries` 非空、每项为 `(b, r, s, e)`；不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, t, C, D, O, Q, V, T, L, M]`，bytes 字段小写 hex
@@ -575,7 +580,7 @@ if decision.accepted:
 `audit_assess_evidence_policy(x, key, *, now=None, max_age=None, revocations=None)` 在 `audit_assess_evidence` 的全部密码学、规范编码与判定重算（及其 `TypeError`/`ValueError` 语义）完全不变的基础上，增加可选的时效与撤销复核：`max_age=None` 且 `revocations=None`（均为默认）时不做任何额外检查——与既有判定证据复核**逐项一致**、返回同样的 `RangeDecision`，`now` 被完全忽略且不读取任何时钟。启用任一选项后仍然**先沿用既有复核**：密码学或编码失败先抛 `ValueError`，再查策略。
 
 - `max_age` 启用时必须是非布尔、有限、非负数，且 `now` 必传——非布尔有限数，缺省或违约均抛 `ValueError`。时效基准取样本集里**最晚完成的那一轮完成时刻**（各样本 `end` 的最大值），须满足闭区间 `0 <= now - 基准 <= max_age`：基准落在未来（基准晚于 `now`）或超出有效期的判定一律抛 `ValueError`；闭区间两端相等（`now == 基准`、`now - 基准 == max_age`）仍然有效。
-- `revocations` 启用时必须是可迭代对象，沿用 `revoke_bound` 的**逐轮撤销记录** `BoundEvidenceRevocation`（亦可由 `revoke_evidence` 签出，见下），可混用记录对象与其规范字节编码；逐条用同一 `key` **恒时**复核 MAC，非法项、无法解析的字节、错误 key 或篡改一律抛 `ValueError`。同一轮（相同 `(round_index, nonce)` 对）出现两条条目抛 `ValueError`；此时 `now` 同样必传（非布尔有限数），用来拦住撤销时刻来自未来的条目——`revoked_at > now` 一律抛 `ValueError`，即使该条目与本判定无关。未命中任何样本的撤销条目在 MAC 与时间检查之外被**忽略**，不因无关条目拒绝整份判定证据。条目在 `round_index`/`nonce` 与某携带样本相同时命中：该轮完成时刻**不晚于**撤销时刻（`end <= revoked_at`，含两端相等）即作废并抛 `ValueError`；完成时刻严格晚于撤销时刻（`end > revoked_at`）的样本不受影响。
+- `revocations` 启用时可以是两种形式之一。**逐次列表（旧形式）**：`BoundEvidenceRevocation` 记录对象（可由 `revoke_bound`/`revoke_evidence` 签出，见下）与其规范字节编码混用的可迭代对象；逐条用同一 `key` **恒时**复核 MAC，非法项、无法解析的字节、错误 key 或篡改一律抛 `ValueError`。同一轮（相同 `(round_index, nonce)` 对）出现两条条目抛 `ValueError`。**签名快照（新形式）**：单个 `EvidenceRevocationList` 对象或其规范字节（见下节）；快照先整体经 `audit_evidence_revocation_list(..., min=0)` 复核——恒时验证列表层 `NPERL1` 与每条 entry 的 `NPBR1` 双层 MAC、`issued_at <= now`、`sequence >= 0`，快照签名不符、未来签发或字节不合契约一律抛 `ValueError`。两种形式都要求 `now` 必传（非布尔有限数），且都拦住撤销时刻来自未来的条目——旧形式逐条检查 `revoked_at > now`（即使该条目与本判定无关）；快照形式的未来检查在整体复核的 `issued_at <= now` 上完成。快照是全局列表，未命中任何携带样本的条目被**忽略**（快照自身的排序唯一契约已保证同一轮至多一条），不因无关条目拒绝整份判定证据；旧形式同样忽略未命中条目（但仍须逐条过 MAC 与时间检查）。条目在 `round_index`/`nonce` 与某携带样本相同时命中：该轮完成时刻**不晚于**撤销时刻（`end <= revoked_at`，含两端相等）即作废并抛 `ValueError`；完成时刻严格晚于撤销时刻（`end > revoked_at`）的样本不受影响。
 - 两项同时启用时各自独立生效：时效超龄或含被撤销样本都会拒绝；二者皆满足才返回与既有复核相同的 `RangeDecision`。
 
 与既有复核一样，策略复核是纯计算：不触碰挑战登记与消费状态，也不替代验证时的重放防护。
@@ -598,6 +603,33 @@ revocation = revoke_evidence(records[0], revoked_at=latest_end + 10.0, key=key)
 # 该轮 end <= revoked_at 时，下面的复核抛 ValueError；严格晚于撤销时刻则不受影响
 audit_assess_evidence_policy(
     blob, key, now=latest_end + 60.0, revocations=[revocation.to_bytes()]
+)
+```
+
+### 逐轮撤销签名快照 `EvidenceRevocationList`、`make_evidence_revocation_list` 与 `audit_evidence_revocation_list`
+
+`EvidenceRevocationList(version, sequence, issued_at, entries, mac)` 是共享密钥 MAC 的冻结**全局逐轮撤销快照**，让长期保存的判定证据按一张全局列表统一作废，按字段序位置构造、冻结且按字段相等，记录本身不含密钥：`version` 必须为 `1`；`sequence` 为非布尔、取值在 u64 范围内的 `int`；`issued_at` 为非布尔、有限、非负的数，**构造时即转为 `float`**；`entries` 必须是 `tuple`，元素全部是 `BoundEvidenceRevocation`（即 `revoke_evidence`/`revoke_bound` 签出的逐轮撤销记录），且按 `(round_index, nonce)` 严格升序、无重复对（相等或逆序均抛 `ValueError`，允许空元组）；`mac` 为恰好 32 字节的 `bytes`。**字段形状错误（类型不对）一律抛 `TypeError`，其余值违约一律抛 `ValueError`。**
+
+紧凑 JSON 惯例与撤销快照一致：`to_bytes()` 产出无空白、无长度前缀、无 NaN/Infinity 的 UTF-8 JSON，键序固定为 `version, sequence, issued_at, entries, mac`，`entries` 是对象数组（每条携带 `BoundEvidenceRevocation` 的完整字段序与自己的 `mac`，字节字段为小写 hex），列表 `mac` 为小写 hex。`from_bytes(data)` **只收 `bytes`**（非 bytes 抛 `TypeError`），解析时**不验任何 MAC**，成功后以 `to_bytes()` 重编码并与输入逐字节比对——缺/多/重复/乱序键、嵌套 entry 不合契约、字段违约、空白与任何非规范拼写一律抛 `ValueError`。
+
+`make_evidence_revocation_list(entries, seq, time, key)` 用与逐条撤销相同的 key 签快照：`entries` 为 `BoundEvidenceRevocation` 的可迭代对象（**不接受字节**，元素类型不对或不可迭代抛 `ValueError`），可为空；条目复制后按 `(round_index, nonce)` 升序排列，重复对抛 `ValueError`；`seq` 为非布尔 u64、`time` 为非布尔有限非负数（存为 `float`），违约一律抛 `ValueError`。`key` 必须是非空 `bytes`（非 bytes 抛 `TypeError`，空 bytes 抛 `ValueError`）。各条 entry 自身的 `NPBR1` MAC 原样带入；列表层 `mac = HMAC-SHA256(key, b"NPERL1" + 去mac规范JSON)`，新域标签 `NPERL1` 与编码直接拼接、无分隔符、无长度前缀。签发是纯计算，不触碰挑战登记与消费状态。
+
+`audit_evidence_revocation_list(x, key, now, min=0) -> None` 收快照对象或其规范字节（其他类型抛 `ValueError`；不合契约的字节同样抛 `ValueError` 且不验签）。`key` 规则同上（非 bytes 抛 `TypeError`，空值抛 `ValueError`）；`now` 必须是非布尔有限数，`min` 必须是**非布尔整数**（缺省 `0`），否则抛 `ValueError`。恒时比较**双层 MAC**：列表层按 `NPERL1` 重算，且每条 entry 的 MAC 按 `NPBR1` 用同一 key 逐一重算——任一层不符（含任何篡改）即抛 `ValueError`。此外 `issued_at > now`（未来快照）或 `sequence < min`（序号过旧）均抛 `ValueError`；成功返回 `None`。复核同样是纯计算，不触碰挑战登记与消费状态，也不替代验证时的重放防护。
+
+`audit_assess_evidence_policy` 的 `revocations` 选项除旧的逐次列表外，也收**单个** `EvidenceRevocationList`（对象或规范字节）：此形式下 `now` 必传。快照先经上面的整体复核（`min=0`），通过后再把条目逐条与携带样本按 `(round_index, nonce)` 比对；未命中样本的条目被忽略，同一轮在快照里天然至多一条，命中样本的完成时刻不晚于该条 `revoked_at`（`end <= revoked_at`）即作废并抛 `ValueError`。缺 `now`、`min` 非布尔整数、快照签名或时间不符均抛 `ValueError`。
+
+```python
+entries = [revoke_evidence(record, revoked_at=ts, key=key)
+           for record, ts in voided]
+snapshot = make_evidence_revocation_list(entries, seq=12, time=now, key=key)
+blob = snapshot.to_bytes()                 # 可分发的紧凑 JSON
+
+# 独立复核：双层 MAC + 签发时刻不晚于当前 + 序号不低于下限
+audit_evidence_revocation_list(blob, key, now, min=0)
+
+# 直接接入判定证据策略：快照先整体复核，再逐条比对样本
+audit_assess_evidence_policy(
+    evidence, key, now=now, revocations=blob
 )
 ```
 
