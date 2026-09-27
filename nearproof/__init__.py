@@ -182,6 +182,7 @@ __all__ = [
     "attest_observation_for_point",
     "audit",
     "audit_assess_evidence",
+    "audit_assess_evidence_policy",
     "audit_b",
     "audit_batch_receipt",
     "audit_bound",
@@ -224,6 +225,7 @@ __all__ = [
     "prove_crl",
     "revoke_bound",
     "revoke_context",
+    "revoke_evidence",
     "revoke_observation",
     "revoke_trust",
     "seal_assess_evidence",
@@ -19711,6 +19713,167 @@ def audit_assess_evidence(x: object, key: object) -> "RangeDecision":
             "assess evidence accepted does not match the recomputed decision"
         )
     return decision
+
+
+def audit_assess_evidence_policy(
+    x: object,
+    key: object,
+    *,
+    now: object = None,
+    max_age: object = None,
+    revocations: object = None,
+) -> "RangeDecision":
+    """Re-verify an :class:`AssessEvidence` and enforce an optional policy.
+
+    ``x`` may be the record itself or its canonical
+    :meth:`AssessEvidence.to_bytes` encoding. The cryptographic,
+    canonical-encoding and decision-recomputation checks are exactly those
+    of :func:`audit_assess_evidence`, which runs first; every check it
+    performs (and every error it raises) applies unchanged, so a bad
+    signature or encoding surfaces as :class:`ValueError` before any policy
+    is consulted.
+
+    With ``max_age=None`` and ``revocations=None`` (both defaults) no extra
+    check is performed: the result is exactly the :func:`audit_assess_evidence`
+    decision and ``now`` is ignored entirely — no clock is read.
+
+    With ``max_age`` set it must be a non-bool finite non-negative number
+    and ``now`` is required — a non-bool finite number; omitting it or
+    violating either contract raises :class:`ValueError`. The baseline is
+    the latest completion time across the carried sample set, i.e. the
+    maximum of the samples' ``end`` fields, and must satisfy the closed
+    interval ``0 <= now - baseline <= max_age``: a baseline in the future
+    or an over-age decision raises :class:`ValueError`, and equality at
+    either boundary is valid.
+
+    With ``revocations`` set it must be an iterable of
+    :class:`BoundEvidenceRevocation` instances and/or their canonical
+    :meth:`BoundEvidenceRevocation.to_bytes` encodings (mixing is
+    allowed); an item that is neither, or bytes that do not parse, raises
+    :class:`ValueError`. Every entry's MAC is recomputed with the same
+    ``key`` the evidence is audited under and compared in constant time,
+    so a wrong key or any tampering raises :class:`ValueError`. Two
+    entries carrying the same ``(round_index, nonce)`` pair are likewise
+    rejected, so at most one entry can match any carried sample. When
+    revocations are given ``now`` is required exactly as under
+    ``max_age``: an entry with ``revoked_at > now`` raises
+    :class:`ValueError`. An entry matches the sample whose
+    ``(round_index, nonce)`` it carries; a matching entry with
+    ``revoked_at >= sample.end`` (i.e. ``end <= revoked_at``) voids that
+    round and the whole decision is rejected with :class:`ValueError`,
+    while a sample completed strictly after its revocation is unaffected.
+    An entry matching no carried sample is ignored beyond the MAC and
+    timestamp checks — an unrelated entry never rejects the decision.
+
+    Like :func:`audit_assess_evidence` this is a pure check: it touches no
+    challenge registry or consumption state and is no substitute for
+    verification-time replay protection.
+    """
+    decision = audit_assess_evidence(x, key)
+    if max_age is None and revocations is None:
+        # No policy at all: `now` is ignored entirely and no clock read.
+        return decision
+    check_age = max_age is not None
+    age_limit = 0.0
+    if check_age:
+        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+            raise ValueError("max_age must be a finite non-negative number")
+        age_limit = float(max_age)
+        if not math.isfinite(age_limit) or age_limit < 0:
+            raise ValueError("max_age must be a finite non-negative number")
+    if now is None:
+        raise ValueError("now is required when max_age or revocations are set")
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValueError("now must be a finite number")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be a finite number")
+    record = _coerce_assess_evidence(x, "x")
+    samples = [Evidence.from_bytes(sample) for sample in record.samples]
+    if revocations is not None:
+        try:
+            raw_revocations = list(revocations)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise ValueError(
+                "revocations must be an iterable of BoundEvidenceRevocation"
+                " instances or bytes"
+            ) from error
+        ends = {
+            (sample.round_index, sample.nonce): sample.end for sample in samples
+        }
+        seen: set[tuple] = set()
+        for entry in raw_revocations:
+            if isinstance(entry, bytes):
+                entry = BoundEvidenceRevocation.from_bytes(entry)
+            if not isinstance(entry, BoundEvidenceRevocation):
+                raise ValueError(
+                    "revocations must contain only BoundEvidenceRevocation"
+                    " instances or bytes"
+                )
+            identity = (entry.round_index, entry.nonce)
+            if identity in seen:
+                raise ValueError(
+                    "revocations contain a duplicate (round_index, nonce) pair"
+                )
+            seen.add(identity)
+            expected = _bound_revocation_mac(
+                bytes(key), _bound_revocation_payload(entry)
+            )
+            if not hmac.compare_digest(expected, entry.mac):
+                raise ValueError("evidence revocation mac does not match")
+            revoked_at = float(entry.revoked_at)
+            if revoked_at > current:
+                raise ValueError("evidence revocation is dated in the future")
+            # Uniqueness above guarantees at most one matching entry.
+            end = ends.get(identity)
+            if end is not None and end <= revoked_at:
+                raise ValueError(
+                    "assess evidence contains a sample that was not completed"
+                    " after its revocation"
+                )
+    if check_age:
+        baseline = max(sample.end for sample in samples)
+        age = current - baseline
+        if not 0.0 <= age <= age_limit:
+            raise ValueError("assess evidence is outside the allowed age")
+    return decision
+
+
+def revoke_evidence(
+    sample: "Evidence | bytes",
+    revoked_at: object,
+    key: object,
+) -> BoundEvidenceRevocation:
+    """Sign a per-round revocation of one evidence sample.
+
+    Returns a :class:`BoundEvidenceRevocation` whose ``round_index`` and
+    ``nonce`` identify ``sample`` — an :class:`Evidence` instance or its
+    canonical :meth:`Evidence.to_bytes` encoding — so the record can be
+    fed to :func:`audit_assess_evidence_policy` (or
+    :func:`audit_bound_policy`) via its ``revocations`` option. ``key``
+    must be non-empty ``bytes`` and ``revoked_at`` a finite non-bool
+    non-negative number (``version`` is set to ``1``); every contract
+    violation, of shape or of value, raises :class:`ValueError`. The
+    record is pure data: signing reads and mutates no verifier state.
+    """
+    if not isinstance(key, bytes) or not key:
+        raise ValueError("key must be non-empty bytes")
+    if isinstance(sample, bytes):
+        sample = Evidence.from_bytes(sample)
+    elif not isinstance(sample, Evidence):
+        raise ValueError(
+            "sample must be an Evidence instance or its canonical bytes"
+        )
+    record = BoundEvidenceRevocation(
+        version=1,
+        round_index=sample.round_index,
+        nonce=sample.nonce,
+        revoked_at=revoked_at,  # type: ignore[arg-type]
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record, mac=_bound_revocation_mac(key, _bound_revocation_payload(record))
+    )
 
 
 def _finite_non_bool(value: object) -> float:

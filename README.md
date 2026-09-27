@@ -56,6 +56,8 @@ python3 -m nearproof
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或结构字段错型抛 `TypeError`，其余不合契约（含非规范编码）抛 `ValueError`（不校验 MAC）
 - `seal_assess_evidence(samples, limit, key, *, min_samples=5) -> AssessEvidence` — 逐份验样本并按 `assess` 口径重算判定，成功才封存（见下）
 - `audit_assess_evidence(x, key)` — 用共享密钥复核 `AssessEvidence`（对象或规范字节），重算判定并逐字段比对，返回对应的 `RangeDecision`（见下）
+- `audit_assess_evidence_policy(x, key, *, now=None, max_age=None, revocations=None) -> RangeDecision` — 先按 `audit_assess_evidence` 复核，再可选做时效/撤销复核（见下）
+- `revoke_evidence(sample, revoked_at, key) -> BoundEvidenceRevocation` — 用密钥为单轮证据样本签发逐轮撤销记录（见下）
 - `audit(evidence, key)` — 用共享密钥复核 `Evidence`（或其字节编码），返回对应的 `Measurement`
 - `BitEvidence(version, t, context, digest, opening, queries, speed, timeout, limit, mac)` — 一场已接受**位挑战**会话的防篡改记录（`version=1`；`t` 恰 16 字节，`context`/`opening`/`digest`/`mac` 各恰 32 字节，`queries` 非空、每项为 `(b, r, s, e)`；不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, t, C, D, O, Q, V, T, L, M]`，bytes 字段小写 hex
@@ -566,12 +568,29 @@ if decision.accepted:
 - `seal_assess_evidence(samples, limit, key, *, min_samples=5)` 收样本集、阈值、密钥与最少样本数。`samples` 必须是可迭代对象，每项为 `Evidence` 或其规范字节（可混用）；`Measurement` 一律不收。不可迭代的 `samples`、元素错型或非 bytes 的 `key` 抛 `TypeError`；空密钥、阈值 / 最少样本数违约、样本签名不符、编码非规范、样本被篡改、样本重复、样本过少或内点不足一律抛 `ValueError`（判定口径与缺省值与 `assess` 一致）。封存先逐份按 `audit` 验样本、再按 `assess` 口径重算中位数 / MAD / 内点 / 结论，**全部通过才产出证据**——封存失败不产出证据。样本按规范字节排序为唯一顺序，故**样本顺序不改产物字节**。封存是纯计算，不触碰挑战登记与消费状态。
 - `audit_assess_evidence(x, key)` 收 `AssessEvidence` 对象或其规范字节与共享密钥；参数既非记录对象也非 bytes、或 `key` 非 bytes 抛 `TypeError`，空密钥抛 `ValueError`。先恒时复核外层 `NPAE1` MAC，再**逐份验样本签名**（MAC、应答 HMAC）并重算应答、耗时与距离，然后按携带的 `limit`/`min_samples` 重算中位数与偏差结论；重算的样本总数 `sample_count`、距离上界 `upper_bound` 与是否接受 `accepted` 须与记录**逐字段相等**，否则抛 `ValueError`。签名不符、编码非规范、样本被篡改、样本重复或样本过少一律抛 `ValueError`。复核是纯计算，不触碰挑战登记与消费状态，成功时返回对应的 `RangeDecision`。
 
-复核**不替代**验证时的重放防护与挑战有效期：时效与撤销不叠加到这层证据。
+复核**不替代**验证时的重放防护与挑战有效期；时效与撤销由下文的可选策略层叠加。
 
 ```python
 evidence = seal_assess_evidence(records, limit=300.0, key=key)
 blob = evidence.to_bytes()
 decision = audit_assess_evidence(blob, key)   # 第三方独立复核
+```
+
+### 判定证据时效与撤销复核 `audit_assess_evidence_policy` 与 `revoke_evidence`
+
+长期保存的判定证据可以叠加**时效与撤销**策略：`audit_assess_evidence_policy(x, key, *, now=None, max_age=None, revocations=None)` 在 `audit_assess_evidence` 的全部密码学、规范编码与判定重算复核（及其 `TypeError`/`ValueError` 语义）完全不变的基础上，增加可选的策略检查——三个选项全部缺省时与 `audit_assess_evidence` 逐项一致，返回同样的 `RangeDecision`，`now` 被完全忽略且不读取任何时钟。启用任一选项后先跑既有复核，签名或编码失败先抛 `ValueError`，再查策略。
+
+- `max_age` 启用时必须是非布尔、有限、非负的数，且 `now` 必传（非布尔有限数，缺省或违约抛 `ValueError`）。基准取**样本集里最晚完成的那一轮**的完成时刻（各样本 `end` 的最大值），必须满足闭区间 `0 <= now - 基准 <= max_age`——基准落在未来或判定超龄一律抛 `ValueError`，两端边界相等均有效。
+- `revocations` 启用时必须是可迭代对象，条目为 `revoke_bound` 同款的逐轮撤销记录 `BoundEvidenceRevocation`（对象与规范字节可混用），且 `now` 同样必传。每条条目用同一 `key` **恒时**复核 MAC：非法项、同一 `(round_index, nonce)` 出现两条、错误 key 或篡改一律抛 `ValueError`；`revoked_at > now` 的"未来撤销"抛 `ValueError`。条目按 `(round_index, nonce)` 命中样本：命中且样本完成时刻**不晚于**撤销时刻（`end <= revoked_at`）时该轮作废、整份判定抛 `ValueError`；严格晚于撤销时刻完成的样本不受影响。未命中任何样本的条目在 MAC 与时间检查之外被忽略，不因无关条目拒绝整份判定证据。
+
+`revoke_evidence(sample, revoked_at, key)` 用非空 `key` 为单轮证据样本（`Evidence` 对象或其规范字节）签发一条 `BoundEvidenceRevocation`（`version` 固定为 `1`，`round_index`/`nonce` 取自样本）；**任何违约不分形状与值一律抛 `ValueError`**。签出的记录（或其字节编码）既可经 `audit_assess_evidence_policy(..., revocations=...)` 生效，也可进既有 `audit_bound_policy(..., revocations=...)` 入口。策略复核与签发都是纯计算：不触碰挑战登记与消费状态，也不替代验证时的重放防护。
+
+```python
+from nearproof import audit_assess_evidence_policy, revoke_evidence
+
+decision = audit_assess_evidence_policy(blob, key, now=time.time(), max_age=3600.0)
+revocation = revoke_evidence(records[0], time.time(), key)
+# audit_assess_evidence_policy(blob, key, now=time.time(), revocations=[revocation])
 ```
 
 ### 二维多验证者共识 `locate`
