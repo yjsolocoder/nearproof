@@ -12,6 +12,7 @@ BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
 Evidence / EvidenceRevocationList / EvidenceRevocationListAuditor /
+EvidenceRevocationListBundle /
 EvidenceRevocationListState /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
 JournalBatchReceiptFrontier /
@@ -46,7 +47,8 @@ VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
 audit_b / audit_bound /
 audit_bound_policy /
-audit_cert_evidence / audit_crl / audit_evidence_revocation_list / audit_map_history /
+audit_cert_evidence / audit_crl / audit_evidence_revocation_list /
+audit_evidence_revocation_list_bundle / audit_map_history /
 audit_map_history_evidence / audit_map_history_journal_bundle /
 audit_map_history_journal_receipt /
 audit_map_update /
@@ -66,6 +68,7 @@ cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
 revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
+seal_evidence_revocation_list_bundle /
 seal_map_history /
 seal_map_history_journal_bundle / seal_range / seal_range_receipt_batch /
 seal_span_bundle_receipt_batch /
@@ -129,6 +132,7 @@ __all__ = [
     "Evidence",
     "EvidenceRevocationList",
     "EvidenceRevocationListAuditor",
+    "EvidenceRevocationListBundle",
     "EvidenceRevocationListState",
     "JournalBatchReceipt",
     "JournalBatchReceiptAuditor",
@@ -197,6 +201,7 @@ __all__ = [
     "audit_commit",
     "audit_crl",
     "audit_evidence_revocation_list",
+    "audit_evidence_revocation_list_bundle",
     "audit_map_history",
     "audit_map_history_evidence",
     "audit_map_history_journal_bundle",
@@ -236,6 +241,7 @@ __all__ = [
     "revoke_observation",
     "revoke_trust",
     "seal_assess_evidence",
+    "seal_evidence_revocation_list_bundle",
     "seal_map_history",
     "seal_map_history_journal_bundle",
     "seal_map_history_journal_receipt_batch",
@@ -269,6 +275,8 @@ _EVIDENCE_REVOCATION_LIST_PREFIX = b"NPERL1"
 # Domain separation prefix for the rollback-protection evidence-revocation
 # frontier-state MAC.
 _EVIDENCE_REVOCATION_LIST_STATE_PREFIX = b"NPES1"
+# Domain separation prefix for the evidence-revocation-list bundle MAC.
+_EVIDENCE_REVOCATION_LIST_BUNDLE_PREFIX = b"NPEB1"
 # Domain separation prefix for the context revocation MAC.
 _CONTEXT_REVOCATION_PREFIX = b"NPCR1"
 # Domain separation prefix for the verifier-trust MAC.
@@ -719,6 +727,14 @@ _EVIDENCE_REVOCATION_LIST_STATE_FIELDS = (
     "mac",
 )
 
+_EVIDENCE_REVOCATION_LIST_BUNDLE_FIELDS = (
+    "version",
+    "start",
+    "snapshots",
+    "end",
+    "mac",
+)
+
 _CONTEXT_REVOCATION_FIELDS = (
     "version",
     "context",
@@ -731,8 +747,9 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
 
     The outer bound-evidence object, the nested evidence object, the
-    bound-evidence-revocation object, the context-revocation object and the
-    outer evidence-revocation-list object must each contain exactly their
+    bound-evidence-revocation object, the context-revocation object, the
+    outer evidence-revocation-list object and the outer
+    evidence-revocation-list-bundle object must each contain exactly their
     own fields, once each, in field order (the nested entries of an
     evidence-revocation list carry the bound-evidence-revocation key set);
     the field sets are distinguishable by their key lists, so a single hook
@@ -751,6 +768,7 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
             list(_BOUND_REVOCATION_FIELDS),
             list(_CONTEXT_REVOCATION_FIELDS),
             list(_EVIDENCE_REVOCATION_LIST_FIELDS),
+            list(_EVIDENCE_REVOCATION_LIST_BUNDLE_FIELDS),
         ):
             return dict(pairs)
         raise ValueError(
@@ -20146,6 +20164,525 @@ def audit_evidence_revocation_list(
         raise ValueError("evidence revocation list sequence is below the minimum")
 
 
+def _evidence_revocation_list_bundle_payload(
+    bundle: "EvidenceRevocationListBundle",
+) -> dict:
+    """The JSON-ready evidence-revocation-list-bundle fields except ``mac``."""
+    return {
+        "version": bundle.version,
+        "start": bundle.start.hex(),
+        "snapshots": [snapshot.hex() for snapshot in bundle.snapshots],
+        "end": bundle.end.hex(),
+    }
+
+
+def _evidence_revocation_list_bundle_mac(
+    key: bytes, bundle: "EvidenceRevocationListBundle"
+) -> bytes:
+    """HMAC-SHA256 over ``b"NPEB1"`` plus the canonical encoding without ``mac``.
+
+    The prefix and the encoding are concatenated directly, with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        key,
+        _EVIDENCE_REVOCATION_LIST_BUNDLE_PREFIX
+        + _encode_payload(_evidence_revocation_list_bundle_payload(bundle)),
+        hashlib.sha256,
+    ).digest()
+
+
+def _require_evidence_revocation_list_state_encoding(
+    value: bytes, name: str, allow_empty: bool
+) -> None:
+    """Enforce the canonical-:class:`EvidenceRevocationListState`-bytes
+    contract of a bundle endpoint.
+
+    ``value`` is already known to be ``bytes``; when ``allow_empty`` holds,
+    ``b""`` (the bundle starts from the empty ledger) is also accepted.
+    :meth:`EvidenceRevocationListState.from_bytes` enforces the full
+    contract including its canonical re-encoding check, and every
+    violation — including the field-shape :class:`TypeError` a malformed
+    inner document would otherwise surface — raises :class:`ValueError`.
+    """
+    if allow_empty and value == b"":
+        return
+    try:
+        EvidenceRevocationListState.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"evidence revocation list bundle {name} must be the canonical"
+            " EvidenceRevocationListState encoding"
+        ) from error
+
+
+def _require_evidence_revocation_list_snapshot_encoding(value: bytes) -> None:
+    """Enforce the canonical-:class:`EvidenceRevocationList`-bytes contract
+    of a bundle ``snapshots`` item.
+
+    ``value`` is already known to be ``bytes``; every violation — including
+    the field-shape :class:`TypeError` a malformed inner document would
+    otherwise surface — raises :class:`ValueError`.
+    """
+    try:
+        EvidenceRevocationList.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "evidence revocation list bundle snapshots items must be the"
+            " canonical EvidenceRevocationList encoding"
+        ) from error
+
+
+@dataclass(frozen=True)
+class EvidenceRevocationListBundle:
+    """A MAC'd, transportable record sealing one contiguous chain of
+    :class:`EvidenceRevocationList` snapshots between two rollback
+    frontiers, for third-party whole-bundle admission.
+
+    ``version`` is always ``1``. ``start`` is the canonical
+    :meth:`EvidenceRevocationListState.to_bytes` encoding of the
+    rollback-protection frontier the chain starts from, or ``b""`` when
+    it starts from the empty ledger. ``snapshots`` is a non-empty ordered
+    tuple of canonical :meth:`EvidenceRevocationList.to_bytes` bytes — the
+    snapshots to replay in order. ``end`` is the canonical non-empty
+    :meth:`EvidenceRevocationListState.to_bytes` encoding of the frontier
+    the chain ends at. ``mac`` is exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPEB1" + encoding)`` over the canonical encoding
+    of every field except ``mac`` itself (the version, the lowercase-hex
+    start, the array of lowercase-hex snapshot encodings and the
+    lowercase-hex end), the prefix and the encoding concatenated directly
+    with no separator or length prefix. Instances are frozen, constructed
+    positionally in field order and compare equal by their fields. A field
+    of the wrong type raises :class:`TypeError` at construction time; a
+    value contract violation (including an empty snapshot tuple or a
+    non-canonical inner encoding) raises :class:`ValueError`. No key
+    material is stored.
+    """
+
+    version: int
+    start: bytes
+    snapshots: tuple
+    end: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "evidence revocation list bundle version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError("evidence revocation list bundle version must be 1")
+        if not isinstance(self.start, bytes):
+            raise TypeError("evidence revocation list bundle start must be bytes")
+        _require_evidence_revocation_list_state_encoding(
+            self.start, "start", allow_empty=True
+        )
+        if not isinstance(self.snapshots, tuple):
+            raise TypeError(
+                "evidence revocation list bundle snapshots must be a tuple"
+            )
+        if not self.snapshots:
+            raise ValueError(
+                "evidence revocation list bundle snapshots must be non-empty"
+            )
+        for snapshot in self.snapshots:
+            if not isinstance(snapshot, bytes):
+                raise TypeError(
+                    "evidence revocation list bundle snapshots items must be"
+                    " bytes"
+                )
+            _require_evidence_revocation_list_snapshot_encoding(snapshot)
+        if not isinstance(self.end, bytes):
+            raise TypeError("evidence revocation list bundle end must be bytes")
+        _require_evidence_revocation_list_state_encoding(
+            self.end, "end", allow_empty=False
+        )
+        if not isinstance(self.mac, bytes):
+            raise TypeError("evidence revocation list bundle mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError(
+                "evidence revocation list bundle mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order (``version``,
+        ``start``, ``snapshots``, ``end``, ``mac``), the ``start``/``end``
+        frontiers and every snapshot as lowercase hex, no whitespace, no
+        length prefix, no NaN/Infinity."""
+        payload = _evidence_revocation_list_bundle_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "EvidenceRevocationListBundle":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes``;
+        raises :class:`ValueError` for anything that does not satisfy the
+        contract: an object with exactly the keys ``version, start,
+        snapshots, end, mac`` once each in field order (missing, extra,
+        duplicated or out-of-order keys are rejected), ``version == 1``,
+        ``start`` a lowercase hex string that is empty or decodes to the
+        canonical :class:`EvidenceRevocationListState` encoding,
+        ``snapshots`` a non-empty array of lowercase hex strings each
+        decoding to a canonical :class:`EvidenceRevocationList`
+        encoding, ``end`` a lowercase hex string decoding to the
+        canonical non-empty :class:`EvidenceRevocationListState`
+        encoding, and ``mac`` a lowercase hex string decoding to exactly
+        32 bytes. After parsing and field validation the record is
+        re-encoded with :meth:`to_bytes` and the result must equal the
+        input byte for byte, so formatted JSON, whitespace and any
+        non-canonical number or string spelling are rejected as well. No
+        MAC is verified here — neither the bundle MAC, the endpoint
+        state MACs nor the snapshot MACs; pass the record to
+        :func:`audit_evidence_revocation_list_bundle` with the shared
+        key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("evidence revocation list bundle data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedBoundEvidenceObject)
+        except ValueError as error:
+            raise ValueError(
+                f"evidence revocation list bundle is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _EVIDENCE_REVOCATION_LIST_BUNDLE_FIELDS
+        ):
+            raise ValueError(
+                "evidence revocation list bundle must be a JSON object with"
+                " exactly the evidence revocation list bundle fields"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("evidence revocation list bundle version must be 1")
+        start = _parse_hex_field(obj["start"], "start")
+        _require_evidence_revocation_list_state_encoding(
+            start, "start", allow_empty=True
+        )
+        raw_snapshots = obj["snapshots"]
+        if not isinstance(raw_snapshots, list):
+            raise ValueError(
+                "evidence revocation list bundle snapshots must be an array"
+            )
+        if not raw_snapshots:
+            raise ValueError(
+                "evidence revocation list bundle snapshots must be non-empty"
+            )
+        snapshots = tuple(
+            _parse_hex_field(raw_snapshot, "snapshot")
+            for raw_snapshot in raw_snapshots
+        )
+        for snapshot in snapshots:
+            _require_evidence_revocation_list_snapshot_encoding(snapshot)
+        end = _parse_hex_field(obj["end"], "end")
+        _require_evidence_revocation_list_state_encoding(
+            end, "end", allow_empty=False
+        )
+        mac = _parse_hex_field(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "evidence revocation list bundle mac must decode to exactly 32"
+                " bytes"
+            )
+        record = cls(
+            version=version,
+            start=start,
+            snapshots=snapshots,
+            end=end,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "evidence revocation list bundle encoding is not canonical"
+            )
+        return record
+
+
+def _coerce_evidence_revocation_list_bundle(
+    x: object, name: str
+) -> "EvidenceRevocationListBundle":
+    """Coerce an :class:`EvidenceRevocationListBundle` or its canonical
+    bytes, splitting the TypeError/ValueError contract exactly as the
+    other public auditors do: the wrong kind of argument raises
+    :class:`TypeError`, a field-shape failure surfacing while parsing byte
+    content of the right kind is a value error."""
+    if isinstance(x, EvidenceRevocationListBundle):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return EvidenceRevocationListBundle.from_bytes(x)
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the evidence revocation list bundle"
+                " field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be an EvidenceRevocationListBundle instance or its"
+        " canonical bytes"
+    )
+
+
+def _verify_evidence_revocation_list_state_mac(
+    key: bytes, state: "EvidenceRevocationListState"
+) -> bool:
+    """Recompute the ``NPES1`` frontier-state MAC and report whether it
+    matches in constant time."""
+    return hmac.compare_digest(
+        _evidence_revocation_list_state_mac(
+            key, _evidence_revocation_list_state_payload(state)
+        ),
+        state.mac,
+    )
+
+
+def _replay_evidence_revocation_list_bundle(
+    key: bytes,
+    frontier: "Optional[EvidenceRevocationListState]",
+    snapshots: "list[EvidenceRevocationList]",
+    now: object,
+    min: object,
+) -> "EvidenceRevocationListState":
+    """Replay a bundle's snapshots onto a tentative frontier.
+
+    ``frontier`` is the parsed and MAC-verified starting frontier or
+    ``None`` for the empty ledger. Each snapshot is reviewed exactly as
+    :func:`audit_evidence_revocation_list` reviews it — both the
+    ``NPERL1`` list MAC and every entry's ``NPBR1`` MAC in constant time,
+    plus the ``issued_at <= now`` freshness and ``sequence >= min`` floor
+    checks — and its sequence must be strictly greater than the tentative
+    frontier sequence (an equal or lower sequence is rejected, including
+    an identical-snapshot replay), before the tentative frontier advances
+    to that snapshot's sequence and digest. The replay touches no shared
+    state; the caller adopts the returned tentative frontier only after
+    its own endpoint comparison, and every failure raises
+    :class:`ValueError`.
+    """
+    for snapshot in snapshots:
+        audit_evidence_revocation_list(snapshot, key, now, min)
+        if frontier is not None and snapshot.sequence <= frontier.sequence:
+            raise ValueError(
+                "evidence revocation list bundle snapshots must carry strictly"
+                " increasing sequences"
+            )
+        digest = hashlib.sha256(snapshot.to_bytes()).digest()
+        candidate = EvidenceRevocationListState(
+            version=1,
+            sequence=snapshot.sequence,
+            digest=digest,
+            mac=b"\x00" * 32,
+        )
+        frontier = replace(
+            candidate,
+            mac=_evidence_revocation_list_state_mac(
+                key, _evidence_revocation_list_state_payload(candidate)
+            ),
+        )
+    # The bundle contract guarantees a non-empty chain, so the result is
+    # always a concrete frontier.
+    return frontier  # type: ignore[return-value]
+
+
+def _verify_evidence_revocation_list_bundle(
+    bundle: "EvidenceRevocationListBundle",
+    key: object,
+    now: object,
+    min: object,
+) -> "EvidenceRevocationListState":
+    """The shared body of :func:`audit_evidence_revocation_list_bundle` and
+    :meth:`EvidenceRevocationListAuditor.audit_bundle`: validate the key
+    and time/sequence parameters, recompute the bundle MAC, recompute
+    both endpoint frontier MACs, replay every carried snapshot from the
+    carried starting frontier and require the tentative frontier to equal
+    the bundle ``end`` byte for byte. Returns the parsed frozen end
+    frontier; every failure raises :class:`TypeError` (a non-``bytes``
+    key) or :class:`ValueError` (everything else).
+    """
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _evidence_revocation_list_bundle_mac(key, bundle), bundle.mac
+    ):
+        raise ValueError("evidence revocation list bundle mac does not match")
+    start_state: "Optional[EvidenceRevocationListState]" = None
+    if bundle.start:
+        start_state = EvidenceRevocationListState.from_bytes(bundle.start)
+    end_state = EvidenceRevocationListState.from_bytes(bundle.end)
+    # Both endpoint frontier MACs are always recomputed and each compared
+    # in constant time before either result is consulted.
+    start_mac_ok = (
+        start_state is None
+        or _verify_evidence_revocation_list_state_mac(key, start_state)
+    )
+    end_mac_ok = _verify_evidence_revocation_list_state_mac(key, end_state)
+    if not start_mac_ok or not end_mac_ok:
+        raise ValueError(
+            "evidence revocation list bundle endpoint mac does not match the"
+            " key"
+        )
+    snapshots = [
+        EvidenceRevocationList.from_bytes(blob) for blob in bundle.snapshots
+    ]
+    frontier = _replay_evidence_revocation_list_bundle(
+        key, start_state, snapshots, now, min
+    )
+    if not hmac.compare_digest(frontier.to_bytes(), bundle.end):
+        raise ValueError(
+            "evidence revocation list bundle end does not match the replayed"
+            " snapshots"
+        )
+    return frontier
+
+
+def seal_evidence_revocation_list_bundle(
+    snapshots: object,
+    key: object,
+    now: object,
+    min: object = 0,
+    *,
+    start: object = None,
+) -> "EvidenceRevocationListBundle":
+    """Review a contiguous chain of evidence-revocation snapshots from a
+    starting frontier and seal the whole chain as a bundle.
+
+    ``snapshots`` must be a non-empty ordered iterable whose items are
+    each an :class:`EvidenceRevocationList` or its canonical
+    :meth:`EvidenceRevocationList.to_bytes` encoding, and ``key`` the
+    non-empty shared ``bytes`` key. ``now`` is the review time — a
+    finite non-bool number — and ``min`` the sequence floor (a non-bool
+    integer, default ``0``); both apply to every carried snapshot
+    exactly as in :func:`audit_evidence_revocation_list`. ``start`` is
+    keyword-only: ``None`` (the default) starts the chain from the empty
+    ledger, otherwise it must be an :class:`EvidenceRevocationListState`
+    or its canonical :meth:`EvidenceRevocationListState.to_bytes`
+    encoding, and its ``NPES1`` MAC is recomputed with ``key`` and
+    compared in constant time. A non-iterable ``snapshots``, a
+    non-``bytes`` ``key``, a wrong-typed item or a wrong-kind ``start``
+    raises :class:`TypeError`; an empty sequence, an empty key, a
+    malformed or non-canonical encoding, a wrong key, a future-dated
+    snapshot, a sequence below the floor, a MAC mismatch, an equal or
+    lower snapshot sequence (sequences must increase strictly), or a
+    tampered starting frontier raises :class:`ValueError`. Every
+    snapshot's two MAC layers, its ``issued_at`` freshness and its
+    sequence floor are reviewed from the starting frontier first, and
+    only on success is the bundle produced: ``start`` carries the
+    starting point (``b""`` when ``start`` is ``None``, else the
+    frontier's canonical encoding), ``snapshots`` the canonical encoding
+    of every snapshot in order and ``end`` the canonical encoding of the
+    final frontier, MAC'd as ``HMAC-SHA256(key, b"NPEB1" + C)`` with the
+    prefix and encoding concatenated directly and no separator or length
+    prefix. Sealing touches no auditor state.
+    """
+    try:
+        items = list(snapshots)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "snapshots must be an iterable of EvidenceRevocationList instances"
+            " or their canonical bytes"
+        ) from error
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if start is None:
+        start_state: "Optional[EvidenceRevocationListState]" = None
+        start_bytes = b""
+    elif isinstance(start, EvidenceRevocationListState):
+        start_state = start
+        start_bytes = start.to_bytes()
+    elif isinstance(start, bytes):
+        try:
+            start_state = EvidenceRevocationListState.from_bytes(start)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "start does not satisfy the evidence revocation list state"
+                " field contract"
+            ) from error
+        start_bytes = start
+    else:
+        raise TypeError(
+            "start must be an EvidenceRevocationListState instance, its"
+            " canonical bytes, or None"
+        )
+    if start_state is not None and not _verify_evidence_revocation_list_state_mac(
+        key, start_state
+    ):
+        raise ValueError("start frontier mac does not match the key")
+    coerced: "list[EvidenceRevocationList]" = []
+    for item in items:
+        if isinstance(item, EvidenceRevocationList):
+            coerced.append(item)
+        elif isinstance(item, bytes):
+            try:
+                coerced.append(EvidenceRevocationList.from_bytes(item))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "snapshots items must be the canonical"
+                    " EvidenceRevocationList encoding"
+                ) from error
+        else:
+            raise TypeError(
+                "snapshots must contain only EvidenceRevocationList instances"
+                " or bytes"
+            )
+    if not coerced:
+        raise ValueError("snapshots must be a non-empty sequence")
+    frontier = _replay_evidence_revocation_list_bundle(
+        key, start_state, coerced, now, min
+    )
+    bundle = EvidenceRevocationListBundle(
+        version=1,
+        start=start_bytes,
+        snapshots=tuple(snapshot.to_bytes() for snapshot in coerced),
+        end=frontier.to_bytes(),
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        bundle, mac=_evidence_revocation_list_bundle_mac(key, bundle)
+    )
+
+
+def audit_evidence_revocation_list_bundle(
+    x: "EvidenceRevocationListBundle | bytes",
+    key: object,
+    now: object,
+    min: object = 0,
+) -> "EvidenceRevocationListState":
+    """Authenticate an :class:`EvidenceRevocationListBundle` and replay it
+    without touching any auditor state.
+
+    Accepts the bundle itself or its canonical
+    :meth:`EvidenceRevocationListBundle.to_bytes` encoding; anything else
+    raises :class:`TypeError`, and bytes that do not parse raise
+    :class:`ValueError`. ``key`` must be non-empty ``bytes`` (a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`);
+    ``now`` must be a finite non-bool number and ``min`` a non-bool
+    integer (default ``0``); both violations raise :class:`ValueError`.
+    The bundle MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPEB1" + C)`` and compared in constant time;
+    then both endpoint frontiers have their ``NPES1`` MACs recomputed and
+    compared in constant time (the empty start carries none); finally
+    the carried snapshots are replayed one by one starting from the
+    carried starting frontier (the empty ledger when ``start`` is
+    empty), each reviewed exactly as
+    :func:`audit_evidence_revocation_list` reviews it — both MAC layers,
+    freshness and the sequence floor — with snapshot sequences required
+    to increase strictly, and the replayed tentative frontier must equal
+    the bundle ``end`` byte for byte. An empty sequence, a broken chain,
+    an equal or lower snapshot sequence, non-canonical bytes, an empty
+    or wrong key, a MAC mismatch and any tampering all raise
+    :class:`ValueError`. The check is pure: it touches no auditor state
+    and returns no partial result — on success the frozen
+    :class:`EvidenceRevocationListState` the chain ends at is returned.
+    """
+    bundle = _coerce_evidence_revocation_list_bundle(x, "x")
+    return _verify_evidence_revocation_list_bundle(bundle, key, now, min)
+
+
 def _evidence_revocation_list_state_payload(
     state: "EvidenceRevocationListState",
 ) -> dict:
@@ -20478,6 +21015,61 @@ class EvidenceRevocationListAuditor:
                 ),
             )
         return self
+
+    def audit_bundle(
+        self,
+        x: "EvidenceRevocationListBundle | bytes",
+        now: object,
+        min: object = 0,
+    ) -> "EvidenceRevocationListAuditor":
+        """Atomically audit one whole
+        :class:`EvidenceRevocationListBundle` and advance the frontier to
+        its ``end`` state.
+
+        ``x`` must be an :class:`EvidenceRevocationListBundle` or its
+        canonical :meth:`EvidenceRevocationListBundle.to_bytes` encoding —
+        anything else raises :class:`TypeError`; ``now`` must be a finite
+        non-bool number and ``min`` a non-bool integer (default ``0``).
+        Everything runs under the same lock as :meth:`audit`, in this
+        order: the bundle is first verified in full exactly as
+        :func:`audit_evidence_revocation_list_bundle` verifies it — the
+        ``NPEB1`` bundle MAC, both endpoint frontier-state ``NPES1`` MACs
+        and, per carried snapshot, both ``NPERL1``/``NPBR1`` MAC layers
+        plus the ``issued_at <= now`` freshness and ``sequence >= min``
+        floor checks, with the snapshot sequences required to increase
+        strictly and the replayed tentative frontier required to equal
+        the bundle ``end`` byte for byte — and only then is the bundle
+        ``start`` matched against the current checkpoint byte for byte:
+        an empty ledger accepts only the empty start (``b""``), and a
+        non-empty ledger demands the current
+        :class:`EvidenceRevocationListState` canonical encoding. Only
+        when the full verification and the start gate both pass is the
+        read-only checkpoint replaced once with the bundle ``end``; any
+        failure — an empty snapshot sequence, a broken chain, a snapshot
+        at an equal or lower sequence, non-canonical bytes, an empty or
+        wrong key, a MAC mismatch, or any tampering — raises
+        :class:`ValueError` and leaves the checkpoint untouched. A bundle
+        already committed is rejected because its ``start`` no longer
+        matches the advanced checkpoint, and concurrent :meth:`audit`
+        and :meth:`audit_bundle` calls linearize in lock-acquisition
+        order so the accepted frontier is never lost or moved backwards.
+        On success the auditor itself is returned.
+        """
+        with self._lock:
+            bundle = _coerce_evidence_revocation_list_bundle(x, "x")
+            end = _verify_evidence_revocation_list_bundle(
+                bundle, self._key, now, min
+            )
+            current = (
+                b"" if self._state is None else self._state.to_bytes()
+            )
+            if bundle.start != current:
+                raise ValueError(
+                    "evidence revocation list bundle start does not match"
+                    " the audited checkpoint"
+                )
+            self._state = end
+            return self
 
 
 def audit_assess_evidence_policy(
