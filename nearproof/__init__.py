@@ -17,6 +17,8 @@ EvidenceRevocationListBundleReceipt /
 EvidenceRevocationListBundleReceiptAuditor /
 EvidenceRevocationListBundleReceiptBatch /
 EvidenceRevocationListBundleReceiptBatchReceipt /
+EvidenceRevocationListBundleReceiptBatchReceiptAuditor /
+EvidenceRevocationListBundleReceiptBatchReceiptFrontier /
 EvidenceRevocationListBundleReceiptFrontier /
 EvidenceRevocationListState /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
@@ -147,6 +149,8 @@ __all__ = [
     "EvidenceRevocationListBundleReceiptAuditor",
     "EvidenceRevocationListBundleReceiptBatch",
     "EvidenceRevocationListBundleReceiptBatchReceipt",
+    "EvidenceRevocationListBundleReceiptBatchReceiptAuditor",
+    "EvidenceRevocationListBundleReceiptBatchReceiptFrontier",
     "EvidenceRevocationListBundleReceiptFrontier",
     "EvidenceRevocationListState",
     "JournalBatchReceipt",
@@ -310,6 +314,11 @@ _EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_PREFIX = b"NPEBR4"
 # Domain separation prefix for the evidence-revocation-list
 # bundle-receipt batch-receipt signature.
 _EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_PREFIX = b"NPEBR5"
+# Domain separation prefixes for the evidence-revocation-list
+# bundle-receipt batch-receipt frontier: the per-batch-receipt
+# digest-chain step and the frontier signature respectively.
+_EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX = b"NPEBR6"
+_EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_FRONTIER_SIGNATURE_PREFIX = b"NPEBR7"
 # Domain separation prefix for the context revocation MAC.
 _CONTEXT_REVOCATION_PREFIX = b"NPCR1"
 # Domain separation prefix for the verifier-trust MAC.
@@ -800,6 +809,14 @@ _EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_FIELDS = (
     "signature",
 )
 
+_EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_FRONTIER_FIELDS = (
+    "version",
+    "sequence",
+    "end",
+    "digest",
+    "signature",
+)
+
 _CONTEXT_REVOCATION_FIELDS = (
     "version",
     "context",
@@ -817,10 +834,12 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
     evidence-revocation-list-bundle object, the outer
     evidence-revocation-list-bundle-receipt object, the outer
     evidence-revocation-list-bundle-receipt-batch object and the outer
-    evidence-revocation-list-bundle-receipt-batch-receipt object must each
-    contain exactly their own fields, once each, in field order (the
-    nested entries of an evidence-revocation list carry the
-    bound-evidence-revocation key set); the field sets are
+    evidence-revocation-list-bundle-receipt-batch-receipt object, and the
+    outer
+    evidence-revocation-list-bundle-receipt-batch-receipt-frontier
+    object must each contain exactly their own fields, once each, in
+    field order (the nested entries of an evidence-revocation list carry
+    the bound-evidence-revocation key set); the field sets are
     distinguishable by their key lists, so a single hook can check all
     of them.
     """
@@ -842,6 +861,9 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
             list(_EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_FIELDS),
             list(
                 _EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_FIELDS
+            ),
+            list(
+                _EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_FRONTIER_FIELDS
             ),
         ):
             return dict(pairs)
@@ -23271,6 +23293,552 @@ def audit_evidence_revocation_list_bundle_receipt_batch_receipt(
     return audit_evidence_revocation_list_bundle_receipt_batch(
         sealed, key
     )
+
+
+def _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_payload(
+    frontier: "EvidenceRevocationListBundleReceiptBatchReceiptFrontier",
+) -> dict:
+    """The JSON-ready evidence-revocation-list bundle-receipt
+    batch-receipt frontier fields except ``signature``, in field order."""
+    return {
+        "version": frontier.version,
+        "sequence": frontier.sequence,
+        "end": frontier.end.hex(),
+        "digest": frontier.digest.hex(),
+    }
+
+
+def _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_content_bytes(
+    frontier: "EvidenceRevocationListBundleReceiptBatchReceiptFrontier",
+) -> bytes:
+    """The canonical compact encoding ``C`` of the first four frontier
+    fields."""
+    return _encode_payload(
+        _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_payload(
+            frontier
+        )
+    )
+
+
+def _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_signature(
+    key: bytes,
+    frontier: "EvidenceRevocationListBundleReceiptBatchReceiptFrontier",
+) -> bytes:
+    """``HMAC-SHA256(key, b"NPEBR7" + C)`` where ``C`` is the canonical
+    field-order compact encoding of the first four fields (the version,
+    sequence, lowercase-hex end and lowercase-hex digest, without
+    ``signature``). The prefix and ``C`` are concatenated directly with
+    no delimiter or length prefix."""
+    return hmac.new(
+        key,
+        _EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_FRONTIER_SIGNATURE_PREFIX
+        + _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_content_bytes(
+            frontier
+        ),
+        hashlib.sha256,
+    ).digest()
+
+
+def _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_next_digest(
+    previous: bytes, sequence: int, receipt: bytes
+) -> bytes:
+    """One digest-chain step:
+    ``SHA256(b"NPEBR6" + d + u64be(n) + R)``.
+
+    The prefix, the previous 32-byte digest, the fixed 8-byte big-endian
+    sequence and the canonical batch-receipt bytes are concatenated
+    directly with no separator or length prefix."""
+    return hashlib.sha256(
+        _EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_FRONTIER_DIGEST_PREFIX
+        + previous
+        + _bit_map_history_journal_u64be(sequence)
+        + receipt
+    ).digest()
+
+
+def _require_evidence_revocation_list_bundle_receipt_batch_receipt_frontier_end(
+    value: bytes,
+) -> None:
+    """Enforce that a batch-receipt frontier ``end`` is the canonical
+    non-empty :class:`EvidenceRevocationListBundleReceiptFrontier`
+    encoding. ``value`` is already known to be ``bytes``;
+    :meth:`EvidenceRevocationListBundleReceiptFrontier.from_bytes`
+    enforces the full contract including its canonical re-encoding
+    check, and every violation — including the field-shape
+    :class:`TypeError` a malformed inner document would otherwise
+    surface — raises :class:`ValueError`."""
+    try:
+        EvidenceRevocationListBundleReceiptFrontier.from_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "evidence revocation list bundle receipt batch receipt"
+            " frontier end must be the canonical non-empty"
+            " EvidenceRevocationListBundleReceiptFrontier encoding"
+        ) from error
+
+
+@dataclass(frozen=True)
+class EvidenceRevocationListBundleReceiptBatchReceiptFrontier:
+    """A key-signed, digest-chained frontier over the audited
+    :class:`EvidenceRevocationListBundleReceiptBatchReceipt` commit
+    stream.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer (the number of audited
+    :class:`EvidenceRevocationListBundleReceiptBatchReceipt` commits);
+    ``end`` the canonical non-empty
+    :meth:`EvidenceRevocationListBundleReceiptFrontier.to_bytes`
+    encoding of the receipt ledger frontier the audited commit chain
+    currently ends at; ``digest`` exactly 32 bytes — the head of a hash
+    chain with ``d0`` fixed at 32 zero bytes and each accepted batch
+    receipt extending it as
+    ``d' = SHA256(b"NPEBR6" + d + u64be(n) + R)`` where ``n`` is the new
+    sequence, ``u64be(n)`` its fixed 8-byte big-endian encoding and
+    ``R`` the canonical
+    :meth:`EvidenceRevocationListBundleReceiptBatchReceipt.to_bytes`
+    bytes, every part concatenated directly with no delimiter or length
+    prefix; ``signature`` exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPEBR7" + C)`` where ``C`` is the canonical
+    compact encoding of the first four fields (the version, sequence,
+    lowercase-hex end and lowercase-hex digest, without
+    ``signature``), the prefix and ``C`` concatenated directly with no
+    delimiter or length prefix. Instances are frozen, constructed
+    positionally in field order and compare equal by their fields. A
+    field of the wrong type raises :class:`TypeError`; every other
+    contract violation raises :class:`ValueError`. No key material is
+    stored.
+    """
+
+    version: int
+    sequence: int
+    end: bytes
+    digest: bytes
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier version must be 1"
+            )
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier sequence must be a non-bool integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier sequence must fit in an unsigned 64-bit"
+                " integer"
+            )
+        if not isinstance(self.end, bytes):
+            raise TypeError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier end must be bytes"
+            )
+        _require_evidence_revocation_list_bundle_receipt_batch_receipt_frontier_end(
+            self.end
+        )
+        for name in ("digest", "signature"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(
+                    "evidence revocation list bundle receipt batch receipt"
+                    f" frontier {name} must be bytes"
+                )
+            if len(value) != 32:
+                raise ValueError(
+                    "evidence revocation list bundle receipt batch receipt"
+                    f" frontier {name} must be exactly 32 bytes"
+                )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order (``version``,
+        ``sequence``, ``end``, ``digest``, ``signature``), the ``end``
+        frontier, ``digest`` and ``signature`` each as lowercase hex, no
+        whitespace, no length prefix, no NaN/Infinity."""
+        payload = _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_payload(
+            self
+        )
+        payload["signature"] = self.signature.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(
+        cls, data: bytes
+    ) -> "EvidenceRevocationListBundleReceiptBatchReceiptFrontier":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes``;
+        raises :class:`ValueError` for anything that does not satisfy
+        the contract: an object with exactly the keys ``version,
+        sequence, end, digest, signature`` once each in field order
+        (missing, extra, duplicated or out-of-order keys are rejected),
+        ``version == 1``, ``sequence`` a non-bool u64, ``end`` a
+        lowercase hex string decoding to the canonical non-empty
+        :class:`EvidenceRevocationListBundleReceiptFrontier` encoding,
+        and ``digest``/``signature`` lowercase hex strings each decoding
+        to exactly 32 bytes. After parsing and field validation the
+        record is re-encoded with :meth:`to_bytes` and the result must
+        equal the input byte for byte, so formatted JSON, whitespace and
+        any non-canonical number or string spelling are rejected too. No
+        signature is verified here — neither the frontier signature nor
+        any signature of the nested ``end`` receipt frontier; pass the
+        record to
+        :class:`EvidenceRevocationListBundleReceiptBatchReceiptAuditor`
+        for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier data must be bytes"
+            )
+        try:
+            obj = json.loads(data, cls=_OrderedBoundEvidenceObject)
+        except ValueError as error:
+            raise ValueError(
+                "evidence revocation list bundle receipt batch receipt"
+                f" frontier is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _EVIDENCE_REVOCATION_LIST_BUNDLE_RECEIPT_BATCH_RECEIPT_FRONTIER_FIELDS
+        ):
+            raise ValueError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier must be a JSON object with exactly the"
+                " version, sequence, end, digest and signature fields in"
+                " field order"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier version must be 1"
+            )
+        sequence = _parse_int_field(obj["sequence"], "sequence")
+        if not 0 <= sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier sequence must fit in an unsigned 64-bit"
+                " integer"
+            )
+        end = _parse_hex_field(obj["end"], "end")
+        _require_evidence_revocation_list_bundle_receipt_batch_receipt_frontier_end(
+            end
+        )
+        digest = _parse_hex_field(obj["digest"], "digest")
+        if len(digest) != 32:
+            raise ValueError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier digest must decode to exactly 32 bytes"
+            )
+        signature = _parse_hex_field(obj["signature"], "signature")
+        if len(signature) != 32:
+            raise ValueError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier signature must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=version,
+            sequence=sequence,
+            end=end,
+            digest=digest,
+            signature=signature,
+        )
+        if record.to_bytes() != data:
+            raise ValueError(
+                "evidence revocation list bundle receipt batch receipt"
+                " frontier encoding is not canonical"
+            )
+        return record
+
+
+def _coerce_evidence_revocation_list_bundle_receipt_batch_receipt_frontier(
+    x: object, name: str
+) -> "EvidenceRevocationListBundleReceiptBatchReceiptFrontier":
+    """Coerce an
+    :class:`EvidenceRevocationListBundleReceiptBatchReceiptFrontier` or
+    its canonical bytes, splitting the TypeError/ValueError contract
+    exactly as the other public auditors do: the wrong kind of argument
+    raises :class:`TypeError`, a field-shape failure surfacing while
+    parsing byte content of the right kind is a value error."""
+    if isinstance(
+        x, EvidenceRevocationListBundleReceiptBatchReceiptFrontier
+    ):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return EvidenceRevocationListBundleReceiptBatchReceiptFrontier.from_bytes(
+                x
+            )
+        except TypeError as error:
+            # The argument had the right kind; a field-shape failure
+            # surfacing while parsing its byte content is a value error.
+            raise ValueError(
+                f"{name} does not satisfy the evidence revocation list"
+                " bundle receipt batch receipt frontier field contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be an"
+        " EvidenceRevocationListBundleReceiptBatchReceiptFrontier"
+        " instance or its canonical bytes"
+    )
+
+
+def _verify_evidence_revocation_list_bundle_receipt_batch_receipt_frontier_signatures(
+    key: bytes,
+    frontier: "EvidenceRevocationListBundleReceiptBatchReceiptFrontier",
+) -> None:
+    """Recompute the signature layers of a parsed batch-receipt
+    frontier — the frontier's own ``NPEBR7`` signature over the
+    canonical encoding of its first four fields, and every signature
+    layer of its ``end`` receipt ledger frontier exactly as
+    :func:`_verify_evidence_revocation_list_bundle_receipt_frontier_macs`
+    recomputes them: the ledger frontier's own ``NPEBR3`` MAC and the
+    ``NPES1`` MAC of its end state. Every layer is always recomputed and
+    each compared in constant time before any result is consulted."""
+    frontier_signature_ok = hmac.compare_digest(
+        _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_signature(
+            key, frontier
+        ),
+        frontier.signature,
+    )
+    endpoint_ok = True
+    try:
+        # _verify_evidence_revocation_list_bundle_receipt_frontier_macs
+        # recomputes the ledger frontier's own NPEBR3 MAC and the NPES1
+        # MAC of its end state.
+        _verify_evidence_revocation_list_bundle_receipt_frontier_macs(
+            key,
+            EvidenceRevocationListBundleReceiptFrontier.from_bytes(
+                frontier.end
+            ),
+        )
+    except (TypeError, ValueError):
+        endpoint_ok = False
+    if not frontier_signature_ok or not endpoint_ok:
+        raise ValueError(
+            "evidence revocation list bundle receipt batch receipt"
+            " frontier signature does not match the key"
+        )
+
+
+class EvidenceRevocationListBundleReceiptBatchReceiptAuditor:
+    """Stateful anti-rollback ledger chaining audited
+    :class:`EvidenceRevocationListBundleReceiptBatchReceipt` commits into
+    one monotone, restartable, sequence-numbered
+    :class:`EvidenceRevocationListBundleReceiptBatchReceiptFrontier`.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the
+    same shared key the batch receipts, batches, receipt-ledger
+    frontiers and every nested frontier are signed or MAC'd with.
+    ``checkpoint`` is keyword-only: ``None`` (the default) starts from
+    sequence zero with no commit at all and the digest chain rooted at
+    ``d0`` (32 zero bytes); otherwise it must be an
+    :class:`EvidenceRevocationListBundleReceiptBatchReceiptFrontier`, its
+    canonical
+    :meth:`EvidenceRevocationListBundleReceiptBatchReceiptFrontier.to_bytes`
+    encoding or ``None`` (any other type raises :class:`TypeError`). A
+    supplied frontier is checked with every signature layer always
+    recomputed and each compared in constant time before any result is
+    consulted: the frontier's own ``NPEBR7`` signature over the
+    canonical encoding of its first four fields, and every signature
+    layer of its ``end`` receipt ledger frontier — that endpoint's own
+    ``NPEBR3`` MAC and the ``NPES1`` MAC of its end state. A malformed
+    or non-canonical encoding or any signature mismatch raises
+    :class:`ValueError`. Across a restart the caller must persist the
+    value exported at :attr:`checkpoint` and pass it back; nothing is
+    persisted by the auditor itself.
+
+    Each :meth:`audit` accepts one
+    :class:`EvidenceRevocationListBundleReceiptBatchReceipt` and the
+    original :class:`EvidenceRevocationListBundleReceiptBatch` it
+    attests (either as objects or as their canonical bytes) and, under
+    the auditor lock, first re-verifies the pair exactly like
+    :func:`audit_evidence_revocation_list_bundle_receipt_batch_receipt`
+    — the ``NPEBR5`` receipt signature, the batch digest, the endpoint
+    equality and the whole batch verification, including the ``NPEBR4``
+    batch signature and every MAC layer of both of its endpoint
+    receipt-ledger frontiers — and then demands the receipt's ``start``
+    continue exactly where the commit frontier currently stands: with no
+    frontier the receipt's ``start`` must be empty, and otherwise it
+    must equal the frontier ``end`` byte for byte. Only then does the
+    frontier advance, all in the same atomic step: ``n`` is the old
+    sequence plus one, the new ``end`` is the receipt's ``end``, the new
+    digest is
+    ``SHA256(b"NPEBR6" + d + u64be(n) + R)`` over the previous digest,
+    the fixed 8-byte big-endian ``n`` and the canonical receipt bytes,
+    and the new commit frontier is signed as
+    ``HMAC-SHA256(key, b"NPEBR7" + C)``. An old receipt, a replay, a
+    broken link, an old fork, a wrong key or a tampered record raises
+    :class:`ValueError` and leaves the frontier exactly where it stood;
+    a sequence that would overflow u64 raises :class:`ValueError`
+    likewise, and a wrong-typed argument or field raises
+    :class:`TypeError`; verification, the start gate and the advance
+    happen under one lock so concurrent audits linearize in
+    lock-acquisition order and an accepted commit is never lost or
+    rolled back.
+    """
+
+    def __init__(self, key: object, *, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._frontier: (
+            "Optional[EvidenceRevocationListBundleReceiptBatchReceiptFrontier]"
+        ) = None
+        if checkpoint is None:
+            return
+        if isinstance(
+            checkpoint,
+            EvidenceRevocationListBundleReceiptBatchReceiptFrontier,
+        ):
+            frontier = checkpoint
+        elif isinstance(checkpoint, bytes):
+            try:
+                frontier = (
+                    EvidenceRevocationListBundleReceiptBatchReceiptFrontier.from_bytes(
+                        checkpoint
+                    )
+                )
+            except TypeError as error:
+                # The argument had the right kind; a field-shape failure
+                # surfacing while parsing its byte content is a value
+                # error.
+                raise ValueError(
+                    "checkpoint does not satisfy the evidence revocation"
+                    " list bundle receipt batch receipt frontier field"
+                    " contract"
+                ) from error
+        else:
+            raise TypeError(
+                "checkpoint must be an"
+                " EvidenceRevocationListBundleReceiptBatchReceiptFrontier"
+                " instance, its canonical bytes, or None"
+            )
+        _verify_evidence_revocation_list_bundle_receipt_batch_receipt_frontier_signatures(
+            self._key, frontier
+        )
+        self._frontier = frontier
+
+    @property
+    def checkpoint(
+        self,
+    ) -> "Optional[EvidenceRevocationListBundleReceiptBatchReceiptFrontier]":
+        """The current
+        :class:`EvidenceRevocationListBundleReceiptBatchReceiptFrontier`
+        checkpoint, or ``None`` before the first successfully audited
+        commit. The returned object is frozen and the property
+        read-only; persist its
+        :meth:`EvidenceRevocationListBundleReceiptBatchReceiptFrontier.to_bytes`
+        output and pass it back to a new auditor to survive a restart.
+        There is no ``state`` alias."""
+        return self._frontier
+
+    def audit(
+        self, receipt: object, batch: object
+    ) -> "EvidenceRevocationListBundleReceiptBatchReceiptAuditor":
+        """Audit one committed
+        :class:`EvidenceRevocationListBundleReceiptBatchReceipt` against
+        its original
+        :class:`EvidenceRevocationListBundleReceiptBatch` and advance
+        the ledger.
+
+        ``receipt`` must be an
+        :class:`EvidenceRevocationListBundleReceiptBatchReceipt` or its
+        canonical
+        :meth:`EvidenceRevocationListBundleReceiptBatchReceipt.to_bytes`
+        encoding and ``batch`` the attested
+        :class:`EvidenceRevocationListBundleReceiptBatch` or its
+        canonical
+        :meth:`EvidenceRevocationListBundleReceiptBatch.to_bytes`
+        encoding — any other type raises :class:`TypeError`; a malformed
+        or non-canonical encoding, an empty or wrong key, a signature or
+        digest mismatch, endpoints that do not match the batch, a batch
+        that fails verification, a receipt ``start`` that does not equal
+        the current frontier ``end`` byte for byte (empty when no commit
+        has happened yet), or a sequence that would overflow u64 raises
+        :class:`ValueError`. The pair is re-verified exactly as
+        :func:`audit_evidence_revocation_list_bundle_receipt_batch_receipt`
+        verifies it and the start matched against the frontier under the
+        auditor lock, and the sequence, digest-chain head, end frontier
+        and frontier signature are all advanced in the same atomic step,
+        so a failed audit changes nothing — an old receipt, a replay, a
+        broken link and an old fork all fail the same start-linkage
+        check — and concurrent audits are serialized in lock-acquisition
+        order. Returns the auditor itself.
+        """
+        with self._lock:
+            record = (
+                _coerce_evidence_revocation_list_bundle_receipt_batch_receipt(
+                    receipt, "receipt"
+                )
+            )
+            sealed = _coerce_evidence_revocation_list_bundle_receipt_batch(
+                batch, "batch"
+            )
+            # audit_evidence_revocation_list_bundle_receipt_batch_receipt
+            # is a pure check: the NPEBR5 receipt signature, the batch
+            # digest, the endpoints and the whole attested batch chain,
+            # returning the frozen EvidenceRevocationListBundleReceiptFrontier
+            # at the batch end.
+            audit_evidence_revocation_list_bundle_receipt_batch_receipt(
+                record, sealed, self._key
+            )
+            current = (
+                b"" if self._frontier is None else self._frontier.end
+            )
+            if record.start != current:
+                raise ValueError(
+                    "evidence revocation list bundle receipt batch receipt"
+                    " start does not match the frontier end"
+                )
+            previous_sequence = (
+                0 if self._frontier is None else self._frontier.sequence
+            )
+            if previous_sequence >= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    "evidence revocation list bundle receipt batch receipt"
+                    " frontier sequence would overflow the unsigned 64-bit"
+                    " range"
+                )
+            sequence = previous_sequence + 1
+            previous_digest = (
+                b"\x00" * 32
+                if self._frontier is None
+                else self._frontier.digest
+            )
+            digest = _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_next_digest(
+                previous_digest, sequence, record.to_bytes()
+            )
+            candidate = (
+                EvidenceRevocationListBundleReceiptBatchReceiptFrontier(
+                    version=1,
+                    sequence=sequence,
+                    end=record.end,
+                    digest=digest,
+                    signature=b"\x00" * 32,
+                )
+            )
+            self._frontier = replace(
+                candidate,
+                signature=(
+                    _evidence_revocation_list_bundle_receipt_batch_receipt_frontier_signature(
+                        self._key, candidate
+                    )
+                ),
+            )
+            return self
 
 
 def audit_assess_evidence_policy(
