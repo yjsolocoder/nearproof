@@ -11,6 +11,7 @@ BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
+DelayBoundEvidence /
 Evidence / EvidenceRevocationList / EvidenceRevocationListAuditor /
 EvidenceRevocationListBundle /
 EvidenceRevocationListBundleReceipt /
@@ -54,7 +55,8 @@ VerifierTrust / assess / attest_observation /
 attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
 audit_b / audit_bound /
 audit_bound_policy /
-audit_cert_evidence / audit_crl / audit_evidence_revocation_list /
+audit_cert_evidence / audit_crl / audit_delay_bound /
+audit_evidence_revocation_list /
 audit_evidence_revocation_list_bundle /
 audit_evidence_revocation_list_bundle_receipt /
 audit_evidence_revocation_list_bundle_receipt_batch /
@@ -141,6 +143,7 @@ __all__ = [
     "CrlProof",
     "CrlProofAuditor",
     "CrlState",
+    "DelayBoundEvidence",
     "Evidence",
     "EvidenceRevocationList",
     "EvidenceRevocationListAuditor",
@@ -219,6 +222,7 @@ __all__ = [
     "audit_cert_evidence",
     "audit_commit",
     "audit_crl",
+    "audit_delay_bound",
     "audit_evidence_revocation_list",
     "audit_evidence_revocation_list_bundle",
     "audit_evidence_revocation_list_bundle_receipt",
@@ -291,6 +295,8 @@ _DIGEST_PREFIX = b"NPC1"
 _RESPONSE_PREFIX = b"NPR1"
 # Domain separation prefix for the bound-evidence MAC.
 _BOUND_EVIDENCE_PREFIX = b"NPBE1"
+# Domain separation prefix for the delay-bound-evidence MAC.
+_DELAY_BOUND_EVIDENCE_PREFIX = b"NPDB1"
 # Domain separation prefix for the bound-evidence revocation MAC.
 _BOUND_REVOCATION_PREFIX = b"NPBR1"
 # Domain separation prefix for the evidence-revocation-list MAC.
@@ -746,6 +752,17 @@ _BOUND_EVIDENCE_FIELDS = (
     "mac",
 )
 
+_DELAY_BOUND_EVIDENCE_FIELDS = (
+    "version",
+    "evidence",
+    "context",
+    "digest",
+    "opening",
+    "issued_at",
+    "max_delay_seconds",
+    "mac",
+)
+
 _BOUND_REVOCATION_FIELDS = (
     "version",
     "round_index",
@@ -828,7 +845,8 @@ _CONTEXT_REVOCATION_FIELDS = (
 class _OrderedBoundEvidenceObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
 
-    The outer bound-evidence object, the nested evidence object, the
+    The outer bound-evidence object, the outer delay-bound-evidence object,
+    the nested evidence object, the
     bound-evidence-revocation object, the context-revocation object, the
     outer evidence-revocation-list object, the outer
     evidence-revocation-list-bundle object, the outer
@@ -852,6 +870,7 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
         keys = [key for key, _value in pairs]
         if keys in (
             list(_BOUND_EVIDENCE_FIELDS),
+            list(_DELAY_BOUND_EVIDENCE_FIELDS),
             list(_EVIDENCE_FIELDS),
             list(_BOUND_REVOCATION_FIELDS),
             list(_CONTEXT_REVOCATION_FIELDS),
@@ -998,6 +1017,181 @@ class BoundEvidence:
             # no whitespace, pretty-printing, framing or non-canonical
             # number/string spellings.
             raise ValueError("bound evidence encoding is not canonical")
+        return record
+
+
+def _delay_bound_evidence_payload(record: "DelayBoundEvidence") -> dict:
+    """The JSON-ready delay-bound-evidence fields except ``mac``, in order.
+
+    As with :func:`_bound_evidence_payload`, the nested evidence keeps its
+    own canonical field order and carries its own ``mac`` as lowercase hex.
+    """
+    evidence = _evidence_payload(record.evidence)
+    evidence["mac"] = record.evidence.mac.hex()
+    return {
+        "version": record.version,
+        "evidence": evidence,
+        "context": record.context.hex(),
+        "digest": record.digest.hex(),
+        "opening": record.opening.hex(),
+        "issued_at": record.issued_at,
+        "max_delay_seconds": record.max_delay_seconds,
+    }
+
+
+def _delay_bound_evidence_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPDB1"`` plus the canonical encoding without ``mac``."""
+    return hmac.new(
+        key, _DELAY_BOUND_EVIDENCE_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+@dataclass(frozen=True)
+class DelayBoundEvidence:
+    """A tamper-evident record of one accepted delay-bound round.
+
+    Produced by :meth:`Verifier.verify_delay_bound`. ``version`` is always
+    ``1``; ``evidence`` the :class:`Evidence` of the round (its ``start`` is
+    ``float(issued_at)`` and its ``end`` the single verification clock
+    reading); ``context``, ``digest`` and ``opening`` the 32-byte commitment
+    values, with ``digest == SHA256(b"NPC1" + context + opening)``;
+    ``issued_at`` the verifier clock reading bound to the challenge at issue
+    time (a finite non-bool number); ``max_delay_seconds`` a finite non-bool
+    strictly positive number; ``mac`` exactly 32 bytes —
+    HMAC-SHA256 over ``b"NPDB1"`` plus the canonical encoding of every field
+    except ``mac`` itself, so a holder of the shared key can re-check the
+    record later with :func:`audit_delay_bound`. Any contract violation
+    raises :class:`ValueError` at construction time. No key material is
+    stored.
+    """
+
+    version: int
+    evidence: Evidence
+    context: bytes
+    digest: bytes
+    opening: bytes
+    issued_at: float
+    max_delay_seconds: float
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("delay bound evidence version must be 1")
+        if not isinstance(self.evidence, Evidence):
+            raise ValueError("delay bound evidence evidence must be an Evidence")
+        _validate_evidence(self.evidence)
+        for name in ("context", "digest", "opening", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes) or len(value) != 32:
+                raise ValueError(
+                    f"delay bound evidence {name} must be exactly 32 bytes"
+                )
+        issued = self.issued_at
+        if isinstance(issued, bool) or not isinstance(issued, (int, float)):
+            raise ValueError("delay bound evidence issued_at must be a finite number")
+        if not math.isfinite(issued):
+            raise ValueError("delay bound evidence issued_at must be a finite number")
+        limit = self.max_delay_seconds
+        if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+            raise ValueError(
+                "delay bound evidence max_delay_seconds must be a finite"
+                " positive number"
+            )
+        if not math.isfinite(limit) or limit <= 0:
+            raise ValueError(
+                "delay bound evidence max_delay_seconds must be a finite"
+                " positive number"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``evidence`` as
+        a nested object with its own keys in field order, byte fields as
+        lowercase hex, no whitespace, no NaN/Infinity."""
+        payload = _delay_bound_evidence_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "DelayBoundEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: exactly the delay-bound-evidence fields
+        appearing once each in field order (missing, extra, duplicated or
+        out-of-order keys are rejected, likewise inside the nested evidence
+        object, which must satisfy the full :meth:`Evidence.from_bytes`
+        contract), ``version == 1``, the four byte fields as lowercase hex
+        strings decoding to exactly 32 bytes each, ``issued_at`` a finite
+        non-bool number and ``max_delay_seconds`` a finite non-bool strictly
+        positive number. The two time fields keep their parsed type: a JSON
+        integer stays an ``int`` and a JSON float stays a ``float``. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for byte,
+        so formatted JSON, whitespace and any non-canonical number or string
+        spelling are rejected as well. Neither MAC is verified here — use
+        :func:`audit_delay_bound` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("delay bound evidence data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedBoundEvidenceObject)
+        except ValueError as error:
+            raise ValueError(
+                f"delay bound evidence is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _DELAY_BOUND_EVIDENCE_FIELDS
+        ):
+            raise ValueError(
+                "delay bound evidence must be a JSON object with exactly the"
+                " delay bound evidence fields"
+            )
+        raw_evidence = obj["evidence"]
+        if not isinstance(raw_evidence, dict) or list(raw_evidence) != list(
+            _EVIDENCE_FIELDS
+        ):
+            raise ValueError(
+                "delay bound evidence evidence must be a JSON object with"
+                " exactly the evidence fields"
+            )
+        evidence = Evidence.from_bytes(_encode_payload(raw_evidence))
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("delay bound evidence version must be 1")
+        fields: dict[str, bytes] = {}
+        for name in ("context", "digest", "opening", "mac"):
+            fields[name] = _parse_hex_field(obj[name], name)
+        issued_at = obj["issued_at"]
+        # Keep the parsed type (an integer re-encodes as an integer, a float
+        # as the same float), exactly as the bound revocation does for
+        # revoked_at, so the canonical re-encoding comparison below holds.
+        if isinstance(issued_at, bool) or not isinstance(issued_at, (int, float)):
+            raise ValueError("delay bound evidence issued_at must be a finite number")
+        if not math.isfinite(issued_at):
+            raise ValueError("delay bound evidence issued_at must be a finite number")
+        max_delay = obj["max_delay_seconds"]
+        if isinstance(max_delay, bool) or not isinstance(max_delay, (int, float)):
+            raise ValueError(
+                "delay bound evidence max_delay_seconds must be a finite"
+                " positive number"
+            )
+        if not math.isfinite(max_delay) or max_delay <= 0:
+            raise ValueError(
+                "delay bound evidence max_delay_seconds must be a finite"
+                " positive number"
+            )
+        record = cls(
+            version=version,
+            evidence=evidence,
+            context=fields["context"],
+            digest=fields["digest"],
+            opening=fields["opening"],
+            issued_at=issued_at,
+            max_delay_seconds=max_delay,
+            mac=fields["mac"],
+        )
+        if record.to_bytes() != data:
+            raise ValueError("delay bound evidence encoding is not canonical")
         return record
 
 
@@ -1657,9 +1851,12 @@ class Verifier:
                 if self._challenge_ttl is not None:
                     deadline = self._clock() + self._challenge_ttl
                 # Entries always carry the bound context/digest in slots 3/4;
-                # both are None for an unbound challenge.
+                # both are None for an unbound challenge. Slot 5 is the delay
+                # binding ``(issued_at, max_delay_seconds)`` for a challenge
+                # issued by new_delay_challenge, None otherwise.
                 self._challenges[id(challenge)] = [
-                    challenge, _PENDING, deadline, bound_context, bound_digest
+                    challenge, _PENDING, deadline, bound_context, bound_digest,
+                    None,
                 ]
         else:
             self._round += 1
@@ -1683,6 +1880,72 @@ class Verifier:
         if len(digest) != DIGEST_BYTES:
             raise ValueError(f"digest must be exactly {DIGEST_BYTES} bytes")
         return context, digest
+
+    def new_delay_challenge(
+        self,
+        context: object,
+        digest: object,
+        *,
+        max_delay_seconds: object,
+    ) -> tuple[Challenge, float]:
+        """Issue a context-bound challenge with a response-delay upper bound.
+
+        Like the bound form of :meth:`new_challenge`, but the challenge is
+        additionally bound to the verifier clock reading at issue time: the
+        returned ``issued_at`` is that single reading and the verifier
+        remembers ``issued_at`` and ``max_delay_seconds`` with the challenge.
+        :meth:`verify_delay_bound` requires the caller's ``started_at`` to
+        equal ``issued_at`` exactly and rejects any round whose verification
+        clock reading is more than ``max_delay_seconds`` later.
+
+        Delay binding is only available with ``replay_protection=True``; with
+        protection disabled this raises :class:`ValueError` (argument shape
+        and value violations, including a non-bool ``max_delay_seconds``,
+        still surface first, exactly as on the bound form of
+        :meth:`new_challenge`) without issuing anything. ``context`` and
+        ``digest`` must be provided as a pair of exactly 32-byte ``bytes``
+        values (a non-bytes value raises :class:`TypeError`, a wrong length
+        :class:`ValueError`) and ``max_delay_seconds`` must be a non-bool
+        finite strictly positive number. Returns ``(challenge, issued_at)``;
+        the prover answers with :meth:`Prover.reveal`.
+        """
+        if not isinstance(context, bytes):
+            raise TypeError("context must be bytes")
+        if not isinstance(digest, bytes):
+            raise TypeError("digest must be bytes")
+        if len(context) != CONTEXT_BYTES:
+            raise ValueError(f"context must be exactly {CONTEXT_BYTES} bytes")
+        if len(digest) != DIGEST_BYTES:
+            raise ValueError(f"digest must be exactly {DIGEST_BYTES} bytes")
+        if isinstance(max_delay_seconds, bool) or not isinstance(
+            max_delay_seconds, (int, float)
+        ):
+            raise ValueError("max_delay_seconds must be a finite positive number")
+        max_delay = float(max_delay_seconds)
+        if not math.isfinite(max_delay) or max_delay <= 0:
+            raise ValueError("max_delay_seconds must be a finite positive number")
+        if not self._replay_protection:
+            raise ValueError(
+                "delay-bound challenges require replay_protection=True"
+            )
+        challenge = Challenge(
+            round_index=self._round + 1, nonce=os.urandom(NONCE_BYTES)
+        )
+        with self._lock:
+            issued_at = self._clock()
+            if isinstance(issued_at, bool) or not isinstance(
+                issued_at, (int, float)
+            ) or not math.isfinite(issued_at):
+                raise ValueError("clock readings must be finite numbers")
+            self._round += 1
+            deadline = None
+            if self._challenge_ttl is not None:
+                deadline = issued_at + self._challenge_ttl
+            self._challenges[id(challenge)] = [
+                challenge, _PENDING, deadline, context, digest,
+                (issued_at, max_delay),
+            ]
+        return challenge, issued_at
 
     def _entry_for(self, challenge: Challenge) -> list | None:
         """Return the registry entry for the exact issued challenge object."""
@@ -1884,6 +2147,160 @@ class Verifier:
             record, mac=_bound_evidence_mac(self._key, _bound_evidence_payload(record))
         )
 
+    def verify_delay_bound(
+        self,
+        challenge: Challenge,
+        response: bytes,
+        started_at: float,
+        *,
+        opening: bytes,
+    ) -> "DelayBoundEvidence":
+        """Verify a delay-bound round and return a :class:`DelayBoundEvidence`.
+
+        Only a challenge issued by :meth:`new_delay_challenge` can be verified
+        this way: an unknown, consumed, revoked or expired challenge raises
+        :class:`ChallengeStateError`, and a registered challenge that carries
+        no delay binding raises :class:`ValueError`. The clock is read once,
+        after the state and expiry checks and while holding the verifier
+        lock; all subsequent checks run under that same lock so the pending
+        -> consumed transition is atomic and a failure never consumes the
+        challenge. The checks after the clock read are, in order:
+
+        1. ``started_at`` must equal the ``issued_at`` returned at issue time
+           exactly (a float comparison); a mismatch raises
+           :class:`ValueError` mentioning the time mismatch;
+        2. the delay, ``end - issued_at`` for the single clock reading
+           ``end``, must be finite, non-negative and at most
+           ``max_delay_seconds``; exceeding the bound raises
+           :class:`ValueError` mentioning the delay limit;
+        3. ``opening`` must be 32-byte ``bytes`` (a non-bytes value,
+           ``None`` included, raises :class:`TypeError`) with
+           ``SHA256(b"NPC1" + context + opening) == digest`` — a commitment
+           mismatch raises :class:`ValueError` mentioning the commitment;
+        4. ``response`` must be the :meth:`Prover.reveal` response
+           ``HMAC-SHA256(key, b"NPR1" + digest + u64be(round_index) +
+           nonce)`` — a mismatch raises :class:`ValueError`.
+
+        The returned record embeds the round's :class:`Evidence` (with
+        ``start == float(issued_at)`` and ``end`` the single clock reading,
+        MAC'd exactly as :meth:`verify_evidence` produces), the registered
+        ``context``/``digest`` pair, the revealed ``opening``, ``issued_at``
+        and ``max_delay_seconds``, and is itself MAC'd:
+        ``mac = HMAC-SHA256(key, b"NPDB1" + encoding)`` over the canonical
+        encoding of every field except ``mac`` itself.
+        """
+        if not isinstance(challenge, Challenge):
+            raise TypeError("challenge must be a Challenge")
+        with self._lock:
+            entry = self._entry_for(challenge)
+            if entry is None:
+                raise ChallengeStateError("challenge was not issued by this verifier")
+            state = entry[1]
+            if state == _CONSUMED:
+                raise ChallengeStateError("challenge has already been verified")
+            if state == _REVOKED:
+                raise ChallengeStateError("challenge has been revoked")
+            if state == _EXPIRED:
+                raise ChallengeStateError("challenge has expired")
+
+            # One clock reading, under the lock, for both the TTL deadline
+            # and the delay measurement; pin expiry terminally as elsewhere.
+            end = self._clock()
+            if entry[2] is not None and end >= entry[2]:
+                entry[1] = _EXPIRED
+                raise ChallengeStateError("challenge has expired")
+
+            delay_binding = entry[5]
+            if delay_binding is None:
+                raise ValueError(
+                    "challenge was not issued with a delay binding"
+                )
+            issued_at, max_delay = delay_binding
+            if isinstance(started_at, bool) or not isinstance(
+                started_at, (int, float)
+            ):
+                raise TypeError("started_at must be a finite number")
+            start = float(started_at)
+            if not math.isfinite(start) or not math.isfinite(end):
+                raise ValueError("time values must be finite numbers")
+            if start != issued_at:
+                raise ValueError(
+                    "started_at does not match the challenge issued_at"
+                )
+            delay = end - issued_at
+            if not math.isfinite(delay) or delay < 0:
+                raise ValueError("delay must be a finite non-negative number")
+            if delay > max_delay:
+                raise ValueError(
+                    "delay exceeds the challenge max_delay_seconds bound"
+                )
+            elapsed = end - start
+            distance = elapsed * self._speed / 2.0
+            # Every recorded number must be finite before anything is
+            # consumed, exactly as verify_evidence does with require_finite.
+            _require_finite(
+                start, end, elapsed, self._speed, distance,
+                issued_at, max_delay,
+            )
+            if opening is None:
+                # Mirror verify_bound's opening_required handling: a missing
+                # opening is a shape error, not the "bound challenge needs an
+                # opening" ValueError _expected_response would raise.
+                raise TypeError("opening must be bytes")
+            expected = self._expected_response(
+                challenge, entry[3], entry[4], opening
+            )
+            if not isinstance(response, bytes):
+                # Explicit shape check: bytes(int) would otherwise coerce a
+                # non-response into zero bytes and mask the type error.
+                raise TypeError("response must be bytes")
+            response_bytes = bytes(response)
+            if not hmac.compare_digest(expected, response_bytes):
+                raise ValueError("response does not match the challenge")
+            entry[1] = _CONSUMED
+
+        payload = {
+            "version": 1,
+            "round_index": challenge.round_index,
+            "nonce": challenge.nonce.hex(),
+            "response": response_bytes.hex(),
+            "start": start,
+            "end": end,
+            "speed": self._speed,
+            "elapsed": elapsed,
+            "distance": distance,
+            "result": "accepted",
+        }
+        evidence = Evidence(
+            version=1,
+            round_index=challenge.round_index,
+            nonce=challenge.nonce,
+            response=response_bytes,
+            start=start,
+            end=end,
+            speed=self._speed,
+            elapsed=elapsed,
+            distance=distance,
+            result="accepted",
+            mac=_evidence_mac(self._key, payload),
+        )
+        record = DelayBoundEvidence(
+            version=1,
+            evidence=evidence,
+            context=entry[3],
+            digest=entry[4],
+            opening=opening,
+            issued_at=issued_at,
+            max_delay_seconds=max_delay,
+            mac=b"\x00" * 32,
+        )
+        return replace(
+            record,
+            mac=_delay_bound_evidence_mac(
+                self._key, _delay_bound_evidence_payload(record)
+            ),
+        )
+
     def _verify_round(
         self,
         challenge: Challenge,
@@ -1948,6 +2365,15 @@ class Verifier:
                 _require_finite(start, now, elapsed, self._speed, distance)
             if elapsed < 0:
                 raise ValueError("elapsed time must not be negative")
+            if entry[5] is not None:
+                # A delay-bound challenge can only be consumed through
+                # verify_delay_bound; verify/verify_evidence/verify_bound
+                # never enforce issued_at/max_delay, so accepting it here
+                # would silently downgrade the delay binding.
+                raise ValueError(
+                    "challenge was issued with a delay binding and must be"
+                    " verified with verify_delay_bound"
+                )
             # Opening/binding validation is part of response validation, so
             # it runs after state, expiry and ranging checks and leaves the
             # challenge pending on failure.
@@ -19108,6 +19534,101 @@ def audit_bound(bound: "BoundEvidence | bytes", key: bytes) -> Measurement:
     distance = elapsed * evidence.speed / 2.0
     if distance != evidence.distance:
         raise ValueError("bound evidence distance does not match elapsed and speed")
+    return Measurement(
+        round_index=evidence.round_index,
+        nonce=evidence.nonce,
+        response=evidence.response,
+        elapsed_seconds=evidence.elapsed,
+        distance_meters=evidence.distance,
+    )
+
+
+def audit_delay_bound(
+    record: "DelayBoundEvidence | bytes", key: bytes
+) -> Measurement:
+    """Re-verify a :class:`DelayBoundEvidence` record against the shared ``key``.
+
+    Accepts the record itself or its ``to_bytes()`` encoding and rejects an
+    empty ``key``. All comparisons that involve a secret are made in constant
+    time. The checks are, each raising :class:`ValueError` on mismatch:
+
+    - the outer MAC: ``HMAC-SHA256(key, b"NPDB1" + encoding)`` over the
+      canonical encoding of every field except ``mac`` itself;
+    - the inner evidence MAC, exactly as :func:`audit` recomputes it;
+    - the commitment: ``SHA256(b"NPC1" + context + opening)`` must equal the
+      recorded ``digest``;
+    - the bound response: ``HMAC-SHA256(key, b"NPR1" + digest +
+      u64be(round_index) + nonce)`` must equal the recorded response;
+    - the round trip: the nested evidence's ``start`` must equal
+      ``issued_at``, ``elapsed`` must equal ``end - start`` and ``distance``
+      must equal ``elapsed * speed / 2``;
+    - the delay upper bound: ``delay = end - issued_at`` must equal
+      ``elapsed``, be non-negative, and be at most ``max_delay_seconds``.
+
+    On success the audited values are returned as a :class:`Measurement`.
+    Auditing is a pure check: it touches no verifier state and neither
+    revives nor consumes any challenge. A non-bytes/non-record argument
+    raises :class:`TypeError`; an empty key, malformed or non-canonical
+    encoding, and every failed check raise :class:`ValueError`.
+    """
+    if not isinstance(record, (DelayBoundEvidence, bytes)):
+        raise TypeError(
+            "record must be a DelayBoundEvidence instance or bytes"
+        )
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must not be empty")
+    if isinstance(record, bytes):
+        record = DelayBoundEvidence.from_bytes(record)
+    evidence = record.evidence
+    if not hmac.compare_digest(
+        _delay_bound_evidence_mac(key, _delay_bound_evidence_payload(record)),
+        record.mac,
+    ):
+        raise ValueError("delay bound evidence mac does not match")
+    if not hmac.compare_digest(
+        _evidence_mac(key, _evidence_payload(evidence)), evidence.mac
+    ):
+        raise ValueError("delay bound evidence evidence mac does not match")
+    if not hmac.compare_digest(
+        context_digest(record.context, record.opening), record.digest
+    ):
+        raise ValueError(
+            "delay bound evidence digest does not match context and opening"
+        )
+    if not hmac.compare_digest(
+        bound_response(key, record.digest, evidence.round_index, evidence.nonce),
+        evidence.response,
+    ):
+        raise ValueError(
+            "delay bound evidence response does not match the key and binding"
+        )
+    if evidence.start != record.issued_at:
+        raise ValueError(
+            "delay bound evidence start does not match issued_at"
+        )
+    elapsed = evidence.end - evidence.start
+    if elapsed != evidence.elapsed:
+        raise ValueError(
+            "delay bound evidence elapsed does not match start and end"
+        )
+    distance = elapsed * evidence.speed / 2.0
+    if distance != evidence.distance:
+        raise ValueError(
+            "delay bound evidence distance does not match elapsed and speed"
+        )
+    delay = evidence.end - record.issued_at
+    if delay != elapsed:
+        raise ValueError(
+            "delay bound evidence delay does not match the round-trip elapsed"
+        )
+    if delay < 0:
+        raise ValueError("delay bound evidence delay must not be negative")
+    if delay > record.max_delay_seconds:
+        raise ValueError(
+            "delay bound evidence delay exceeds max_delay_seconds"
+        )
     return Measurement(
         round_index=evidence.round_index,
         nonce=evidence.nonce,
