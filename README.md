@@ -44,6 +44,8 @@ python3 -m nearproof
   - `verify(challenge, response, started_at, *, opening=None) -> Measurement` — 校验应答并把往返时间折半换算为距离；`opening=None` 为旧行为，传入 32 字节 `opening` 则走上下文绑定协议（见下）
   - `verify_evidence(challenge, response, started_at)` — 同 `verify` 的参数与语义，成功时返回 `Evidence`
   - `verify_bound(challenge, response, started_at, *, opening) -> BoundEvidence` — 仅限上下文绑定挑战的 `verify_evidence`（见下）
+  - `new_delay_challenge(context, digest, *, max_delay_seconds) -> (Challenge, issued_at)` — 签发带**延迟上界**的上下文绑定挑战（要求 `replay_protection=True`；`context`/`digest` 成对各 32 字节；`max_delay_seconds` 为非布尔有限正数；见下）
+  - `verify_delay_bound(challenge, response, started_at, *, opening) -> DelayBoundEvidence` — 仅限 `new_delay_challenge` 签发的挑战；`started_at` 必须精确等于 `issued_at`，时钟读数减 `issued_at` 为延迟、超过 `max_delay_seconds` 拒绝（见下）
   - `measure(prover)` — 一次完整往返
   - `bits(prover, context, opening, *, rounds=32, timeout=0.001) -> bytes` — 跑一场位挑战会话，返回 `BitEvidence.to_bytes()` 的字节证据；`context`/`opening` 各 32 字节（见下）
   - `start_bits(context, opening, *, rounds=32, timeout=0.001) -> BitSession` — 开始一场**步进驱动**的位挑战会话（同 `bits` 参数契约）；`BitSession.next() -> BitRound` 发一轮、`submit(round, response)` 交应答、`finish() -> bytes` 产出与 `bits` 相同的 `BitEvidence` 字节、`revoke()` 放弃
@@ -116,6 +118,10 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`evidence` 为规范嵌套对象，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
 - `audit_bound(bound, key)` — 用共享密钥复核 `BoundEvidence`（或其字节编码），返回对应的 `Measurement`
+- `DelayBoundEvidence(version, evidence, context, digest, opening, issued_at, max_delay_seconds, mac)` — 一轮已接受**延迟绑定**验证的防篡改记录（`version=1`；`evidence` 为本轮 `Evidence`，其 `start` 恰为 `issued_at`；`context`/`digest`/`opening`/`mac` 各恰 32 字节；`issued_at` 为有限非布尔数、`max_delay_seconds` 为非布尔有限正数，二者均存为 `float`；`mac = HMAC-SHA256(key, b"NPDB1" + 去mac规范JSON)`，不含密钥；非 bytes 字节字段抛 `TypeError`，其余字段违约（含数值违约）抛 `ValueError`；见下）
+  - `to_bytes()` — 无空白 UTF-8 JSON：键依字段顺序（`version, evidence, context, digest, opening, issued_at, max_delay_seconds, mac`），`evidence` 为规范嵌套对象，bytes 字段小写十六进制，两个数值字段恒为 float 拼写
+  - `from_bytes(data)` — 非 bytes 抛 `TypeError`；缺/多/重复/乱序键（含嵌套 evidence）、hex 违约、非有限数值、非正 `max_delay_seconds`、整数拼写及任何非规范编码均抛 `ValueError`，重编码须逐字节相等；不校验 MAC
+- `audit_delay_bound(record, key)` — 用共享密钥复核 `DelayBoundEvidence`（或其字节编码）：依次恒时复核外层 `NPDB1` MAC、内层证据 MAC、承诺、绑定应答、往返（`evidence.start == issued_at`、耗时与折半距离）和延迟上界（`0 <= end - issued_at <= max_delay_seconds`，上界闭区间）；`record`/`key` 形状错抛 `TypeError`，空 key 与其余不符抛 `ValueError`；纯函数不改状态，返回对应的 `Measurement`
 - `audit_bound_policy(bound, key, *, now=None, max_age=None, revocations=None) -> Measurement` — 先按 `audit_bound` 复核，再可选做时效/撤销复核（见下）
 - `BoundEvidenceRevocation(version, round_index, nonce, revoked_at, mac)` — 带 HMAC 签名的冻结绑定证据撤销记录（`version=1`，`round_index` 为非布尔 u64，`nonce` 恰 16 字节，`mac` 恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`nonce`/`mac` 为小写十六进制
@@ -271,6 +277,36 @@ response = prover.reveal(challenge, context, opening)
 bound = verifier.verify_bound(challenge, response, verifier.clock(), opening=opening)
 blob = bound.to_bytes()                          # 可持久化或传输
 measurement = audit_bound(BoundEvidence.from_bytes(blob), key)
+```
+
+### 延迟绑定挑战 `new_delay_challenge`、`verify_delay_bound` 与 `DelayBoundEvidence`
+
+普通上下文绑定轮次的 `started_at` 由调用方给出，应答本身不绑定签发时刻，也没有延迟上界。延迟绑定在此之上**只新增**一条签发路径与一条验证路径，既有公开入口与默认（`replay_protection=False`）无重放保护的行为完全不变。
+
+- `new_delay_challenge(context, digest, *, max_delay_seconds)` 返回 `(challenge, issued_at)`：**仅在 `replay_protection=True` 时可用**，否则抛 `ValueError`；`context`、`digest` 成对且各须恰好 32 字节（非 bytes 抛 `TypeError`，只给一个或长度不对抛 `ValueError`）；`max_delay_seconds` 为非布尔有限正数，**任何**违约（`bool`、0、负数、`inf`、`nan`、非数值）均抛 `ValueError`，与 `challenge_ttl_seconds` 的口径一致。签发时读取一次 `clock()` 作为 `issued_at`（返回为 `float`）连同绑定与延迟上界登记到挑战；返回的 `Challenge` 形状仍为 `(round_index, nonce)`。TTL 配置照旧生效：截止时刻 = `issued_at + challenge_ttl_seconds`。
+- 证明者无需新接口，仍用 `Prover.reveal(challenge, context, opening)` 应答（同一 `NPR1` 公式）。
+- `verify_delay_bound(challenge, response, started_at, *, opening) -> DelayBoundEvidence` 只接受 `new_delay_challenge` 签发的挑战：
+  - 校验顺序与 `verify_bound` 相同——**状态/到期先于一切**：未知、已消费、已撤销、已过期一律抛 `ChallengeStateError`（即使 opening 畸形）；TTL 语义、原子消费与并发至多一次成功完全不变；
+  - `started_at` 必须**精确等于**登记的 `issued_at`（`float(started_at) == issued_at`），不符抛 `ValueError`，异常文本为 “started_at does not match the challenge issue time”；
+  - 本次调用唯一的时钟读数减 `issued_at` 为延迟；负延迟抛 `ValueError`，延迟**严格大于** `max_delay_seconds` 抛 `ValueError`（文本 “delay exceeds the challenge bound”，等于上界有效）；
+  - opening 与应答按既有绑定协议复核：opening 非 bytes（含 `None`）抛 `TypeError`，长度不对、承诺不匹配（文本含 “binding”）或应答不符抛 `ValueError`；
+  - 延迟超限、时间不一致、承诺/应答失败、opening 形状错都**不消费**挑战，修正后可在 TTL 截止前重试；只有成功才原子转为已消费。
+- 协议模式不能混用：对延迟挑战调用 `verify`/`verify_bound`、或对普通/普通绑定挑战调用 `verify_delay_bound`，一律抛 `ValueError`。
+- 成功返回冻结的 `DelayBoundEvidence(version, evidence, context, digest, opening, issued_at, max_delay_seconds, mac)`：嵌套 `Evidence` 的 `start` 恰为 `issued_at`、`end` 为验证时的时钟读数、`elapsed` 为实测延迟；记录含 `Evidence`、`context`、`digest`、`opening`、`issued_at`、`max_delay_seconds` 与独立的外层 MAC `mac = HMAC-SHA256(key, b"NPDB1" + 去mac规范JSON)`，不含密钥。
+- `to_bytes()`/`from_bytes(data)` 使用固定域 HMAC-SHA256 与紧凑规范编码：无空白 UTF-8 JSON，键序 `version, evidence, context, digest, opening, issued_at, max_delay_seconds, mac`，嵌套 evidence 保持其自身键序，bytes 小写 hex，`issued_at`/`max_delay_seconds` 恒为 float 拼写；`from_bytes` 拒绝缺/多/重复/乱序键、非规范数字/字符串拼写（整数写法因重编码不等也被拒），重编码须逐字节相等；`from_bytes` 非 bytes 抛 `TypeError`，其余违约抛 `ValueError`；不验任何 MAC。
+- `audit_delay_bound(record, key)` 是纯函数，不改任何状态：收 `DelayBoundEvidence` 对象或其规范字节（形状错抛 `TypeError`）与非空 bytes `key`（非 bytes 抛 `TypeError`，空抛 `ValueError`），依次恒时复核外层 `NPDB1` MAC、内层证据 MAC、承诺 `SHA256(b"NPC1" + context + opening) == digest`、绑定应答 `NPR1`、往返一致性（嵌套 `evidence.start == issued_at`、`elapsed = end - issued_at`、折半距离）以及延迟上界闭区间 `0 <= end - issued_at <= max_delay_seconds`；任何不符抛 `ValueError`，全部通过返回对应的 `Measurement`。
+
+```python
+challenge, issued_at = verifier.new_delay_challenge(
+    context, digest, max_delay_seconds=0.002
+)
+response = prover.reveal(challenge, context, opening)
+# 应答往返后，started_at 必须原样回传签发时刻：
+record = verifier.verify_delay_bound(
+    challenge, response, issued_at, opening=opening
+)
+blob = record.to_bytes()
+measurement = audit_delay_bound(DelayBoundEvidence.from_bytes(blob), key)
 ```
 
 ### 绑定证据撤销 `BoundEvidenceRevocation` 与 `revoke_bound`
