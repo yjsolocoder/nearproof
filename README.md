@@ -41,6 +41,7 @@ python3 -m nearproof
 - `Observation(id, x, y, decision)` — 二维共识中一个验证者的冻结观察：`id` 为非空字符串，`(x, y)` 为非布尔有限数坐标，`decision` 为 `RangeDecision`（仅其有限非负的 `upper_bound` 参与共识，`accepted` 不参与）
 - `Prover(shared_key)` — `respond(challenge) -> bytes`（HMAC-SHA256 应答）；`reveal(challenge, context, opening) -> bytes` 用于上下文绑定轮次（见下）；`bit(t, d, i, b) -> bytes` 用于位挑战轮次（`t` 16 字节、`d` 32 字节、`i` 非布尔 u32、`b` 仅 0/1；见下）
 - `RangeDecision(sample_count, upper_bound, accepted)` — `assess` 的冻结结果：`sample_count` 统计全部输入样本（含离群点），`upper_bound` 为内点最大距离，`accepted` 表示其不超过 limit
+- `NoiseDecision(sample_count, inlier_count, center, mad, coverage, lower_bound, upper_bound, accepted)` — `assess_confidence` 的冻结结果：`sample_count` 统计全部输入样本（含离群点），`inlier_count` 只计中位数/MAD 内点，`center`/`mad` 由全部合法距离计算，`lower_bound`/`upper_bound` 为按 `coverage` 取的内点距离次序统计量，`accepted` 当且仅当 `upper_bound <= limit`
 - `Verifier(shared_key, *, speed_mps=SPEED_OF_LIGHT_MPS, clock=time.perf_counter, replay_protection=False, challenge_ttl_seconds=None)`
   - `new_challenge(*, context=None, digest=None)` — 默认（均为 `None`）生成 16 字节随机 nonce，行为与旧版一致；成对传入 32 字节 `context`/`digest` 则签发上下文绑定挑战（要求 `replay_protection=True`，只传一个抛 `ValueError`）；配置有效期时按 `clock()` 记录签发时刻
   - `verify(challenge, response, started_at, *, opening=None) -> Measurement` — 校验应答并把往返时间折半换算为距离；`opening=None` 为旧行为，传入 32 字节 `opening` 则走上下文绑定协议（见下）
@@ -55,6 +56,7 @@ python3 -m nearproof
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
   - `clock` — 只读属性，暴露计时函数
 - `assess(samples, limit, *, key=None, min_samples=5) -> RangeDecision` — 基于一批轮次的稳健距离判定（见下）
+- `assess_confidence(samples, limit, *, key=None, min_samples=5, coverage=0.95) -> NoiseDecision` — 沿用 `assess` 的样本/证据/参数契约与中位数-MAD 内点规则，再对内点距离按覆盖度取双侧次序统计量给出区间估计（见下）
 - `AssessEvidence(version, samples, limit, min_samples, sample_count, upper_bound, accepted, mac)` — 把一次 `assess` 判定连同其样本集、阈值、最少样本数与结论冻结的共享密钥签名记录（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, S, L, M, C, U, A, MAC]`，`S` 为各样本规范 `Evidence` 字节的小写 hex 数组，`MAC` 小写 hex
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或结构字段错型抛 `TypeError`，其余不合契约（含非规范编码）抛 `ValueError`（不校验 MAC）
@@ -623,6 +625,26 @@ measurements = [verifier.measure(prover) for _ in range(10)]
 decision = assess(measurements, limit=300.0)
 if decision.accepted:
     print(decision.sample_count, decision.upper_bound)
+```
+
+### 测距噪声的区间估计 `assess_confidence`
+
+`assess_confidence(samples, limit, *, key=None, min_samples=5, coverage=0.95)` 在 `assess` 的同一套样本契约、证据先审计与中位数-MAD 内点规则之上，把单点最大内点距离扩展为内点散布的**双侧区间估计**，返回冻结的 `NoiseDecision(sample_count, inlier_count, center, mad, coverage, lower_bound, upper_bound, accepted)`：
+
+- `samples`（`Measurement` 或 `Evidence`/规范 bytes，可混证据对象与字节；混合家族、其他类型、不可迭代抛 `ValueError`）、证据必需的非空 `key`、重复 `(round_index, nonce)` 对、坏数值、坏证据、样本/内点少于 `min_samples`、`limit` 与 `min_samples` 的约束，**全部沿用 `assess`**：证据样本先逐项 `audit` 再做统计。
+- `coverage` 必须是**非 bool 且严格位于 0 与 1 之间的有限数**（`int`/`float`；`0`、`1`、`True`/`False`、负数、`inf`、`nan`、非数值一律抛 `ValueError`），缺省 `0.95`。
+
+统计步骤：先按 `assess` 的全样本中位数与 MAD 规则确定内点——`center`（中位数）与 `mad`（绝对偏差中位数）由**全部合法距离**计算，`MAD > 0` 时闭区间 `[center - 3*mad, center + 3*mad]` 内为内点，`MAD == 0` 时仅距离恰等于 `center` 者为内点；`inlier_count` 只计内点。随后把内点距离升序排列，设内点数为 `n`、覆盖度为 `p`、`alpha = 1 - p`：
+
+- `lower_bound` 取第 `max(1, ceil(alpha*n/2))` 个值；
+- `upper_bound` 取第 `min(n, ceil((1-alpha/2)*n))` 个值。
+
+`sample_count` 含离群点；`accepted` 当且仅当 `upper_bound <= limit` 为 `True`；`coverage` 原样回填。结果与输入顺序无关，浮点值不自行舍入，且为纯计算（不读取也不修改任何验证者状态）。
+
+```python
+noise = assess_confidence(measurements, limit=300.0, coverage=0.95)
+if noise.accepted:
+    print(noise.inlier_count, noise.lower_bound, noise.upper_bound, noise.mad)
 ```
 
 ### 判定证据封存与复核 `AssessEvidence`、`seal_assess_evidence` 与 `audit_assess_evidence`
