@@ -9,7 +9,8 @@ BitMapHistoryJournalState / BitMapUpdate /
 BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
-BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
+BoundEvidenceRevocation / BoundSeriesEvidence /
+CertifiedConsensusEvidence / Challenge /
 ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus /
 ConsensusPolicy / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
 DelayBoundEvidence /
@@ -55,7 +56,7 @@ TrustRevocationList / Verifier /
 VerifierTrust / WeightedConsensus / assess / attest_observation /
 attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
 audit_b / audit_bound /
-audit_bound_policy /
+audit_bound_policy / audit_bound_series /
 audit_cert_evidence / audit_crl / audit_delay_bound /
 audit_evidence_revocation_list /
 audit_evidence_revocation_list_bundle /
@@ -82,6 +83,7 @@ cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / locate_weighted / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
 revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
+seal_bound_series /
 seal_evidence_revocation_list_bundle /
 seal_evidence_revocation_list_bundle_receipt_batch /
 seal_map_history /
@@ -135,6 +137,7 @@ __all__ = [
     "BoundAttestedObservation",
     "BoundEvidence",
     "BoundEvidenceRevocation",
+    "BoundSeriesEvidence",
     "CertifiedConsensusEvidence",
     "Challenge",
     "ChallengeStateError",
@@ -222,6 +225,7 @@ __all__ = [
     "audit_batch_receipt",
     "audit_bound",
     "audit_bound_policy",
+    "audit_bound_series",
     "audit_bundle_receipt",
     "audit_cert_evidence",
     "audit_commit",
@@ -272,6 +276,7 @@ __all__ = [
     "revoke_observation",
     "revoke_trust",
     "seal_assess_evidence",
+    "seal_bound_series",
     "seal_evidence_revocation_list_bundle",
     "seal_evidence_revocation_list_bundle_receipt_batch",
     "seal_map_history",
@@ -340,6 +345,10 @@ _TRUST_REVOCATION_PREFIX = b"NPVR1"
 _TRUST_REVOCATION_LIST_PREFIX = b"NPVRL1"
 # Domain separation prefix for the assess-evidence MAC.
 _ASSESS_EVIDENCE_PREFIX = b"NPAE1"
+# Domain separation prefixes for the bound-series evidence: the ordered
+# chain digest and the record MAC respectively.
+_BOUND_SERIES_CHAIN_PREFIX = b"NPBS1"
+_BOUND_SERIES_MAC_PREFIX = b"NPBS2"
 # Domain separation prefix for the certified-consensus-evidence MAC.
 _CERT_EVIDENCE_PREFIX = b"NPCCE1"
 # Domain separation prefix for the CRL-snapshot proof MAC.
@@ -833,6 +842,21 @@ _BOUND_EVIDENCE_FIELDS = (
     "mac",
 )
 
+_BOUND_SERIES_FIELDS = (
+    "version",
+    "session_id",
+    "first_round_index",
+    "last_round_index",
+    "samples",
+    "limit",
+    "min_samples",
+    "sample_count",
+    "upper_bound",
+    "accepted",
+    "chain_digest",
+    "mac",
+)
+
 _DELAY_BOUND_EVIDENCE_FIELDS = (
     "version",
     "evidence",
@@ -929,6 +953,7 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
     The outer bound-evidence object, the outer delay-bound-evidence object,
     the nested evidence object, the
     bound-evidence-revocation object, the context-revocation object, the
+    outer bound-series-evidence object, the
     outer evidence-revocation-list object, the outer
     evidence-revocation-list-bundle object, the outer
     evidence-revocation-list-bundle-receipt object, the outer
@@ -938,9 +963,10 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
     evidence-revocation-list-bundle-receipt-batch-receipt-frontier
     object must each contain exactly their own fields, once each, in
     field order (the nested entries of an evidence-revocation list carry
-    the bound-evidence-revocation key set); the field sets are
-    distinguishable by their key lists, so a single hook can check all
-    of them.
+    the bound-evidence-revocation key set, and the bound-series samples
+    are carried as an array of lowercase-hex strings rather than nested
+    objects); the field sets are distinguishable by their key lists, so a
+    single hook can check all of them.
     """
 
     def __init__(self) -> None:
@@ -951,6 +977,7 @@ class _OrderedBoundEvidenceObject(json.JSONDecoder):
         keys = [key for key, _value in pairs]
         if keys in (
             list(_BOUND_EVIDENCE_FIELDS),
+            list(_BOUND_SERIES_FIELDS),
             list(_DELAY_BOUND_EVIDENCE_FIELDS),
             list(_EVIDENCE_FIELDS),
             list(_BOUND_REVOCATION_FIELDS),
@@ -1098,6 +1125,380 @@ class BoundEvidence:
             # no whitespace, pretty-printing, framing or non-canonical
             # number/string spellings.
             raise ValueError("bound evidence encoding is not canonical")
+        return record
+
+
+def _bound_series_u64be(value: int) -> bytes:
+    """The fixed 8-byte big-endian encoding of a non-bool u64 round index."""
+    return value.to_bytes(8, byteorder="big", signed=False)
+
+
+def _bound_series_chain_digest(
+    session_id: bytes,
+    first_round_index: int,
+    last_round_index: int,
+    samples: tuple,
+) -> bytes:
+    """The ordered chain digest of one bound series.
+
+    The chain is seeded as
+    ``d0 = SHA256(b"NPBS1" + session_id + u64be(first) + u64be(last))``
+    and each sample then extends it in measurement order as
+    ``d = SHA256(b"NPBS1" + d + S)`` where ``S`` is the sample's canonical
+    :meth:`BoundEvidence.to_bytes` bytes. Folding every sample through the
+    previous digest binds the session, the round range and the exact ordered
+    sample sequence (a permutation of the same samples lands on a different
+    digest), with every part concatenated directly and no length prefix.
+    """
+    digest = hashlib.sha256(
+        _BOUND_SERIES_CHAIN_PREFIX
+        + session_id
+        + _bound_series_u64be(first_round_index)
+        + _bound_series_u64be(last_round_index)
+    ).digest()
+    for sample in samples:
+        digest = hashlib.sha256(
+            _BOUND_SERIES_CHAIN_PREFIX + digest + sample
+        ).digest()
+    return digest
+
+
+def _bound_series_payload(record: "BoundSeriesEvidence") -> dict:
+    """The JSON-ready bound-series fields except ``mac``, in field order.
+
+    The samples are the lowercase hex strings of their canonical
+    :meth:`BoundEvidence.to_bytes` encodings, kept in measurement order.
+    """
+    return {
+        "version": record.version,
+        "session_id": record.session_id.hex(),
+        "first_round_index": record.first_round_index,
+        "last_round_index": record.last_round_index,
+        "samples": [sample.hex() for sample in record.samples],
+        "limit": record.limit,
+        "min_samples": record.min_samples,
+        "sample_count": record.sample_count,
+        "upper_bound": record.upper_bound,
+        "accepted": record.accepted,
+        "chain_digest": record.chain_digest.hex(),
+    }
+
+
+def _bound_series_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPBS2"`` plus the canonical encoding without ``mac``."""
+    return hmac.new(
+        key, _BOUND_SERIES_MAC_PREFIX + _encode_payload(payload), hashlib.sha256
+    ).digest()
+
+
+def _require_bound_series_sample(value: bytes) -> None:
+    """Enforce the canonical-:class:`BoundEvidence`-bytes contract of a
+    carried bound-series sample.
+
+    ``value`` is already known to be ``bytes``; the record must satisfy the
+    full :class:`BoundEvidence` field contract (nested evidence included) and
+    its canonical re-encoding must match the input byte for byte. Every
+    violation raises :class:`ValueError`.
+    """
+    try:
+        record = BoundEvidence.from_bytes(value)
+    except ValueError as error:
+        raise ValueError(
+            "bound series evidence samples items must be the canonical"
+            " BoundEvidence encoding"
+        ) from error
+    if record.to_bytes() != value:
+        raise ValueError(
+            "bound series evidence samples items must be the canonical"
+            " BoundEvidence encoding"
+        )
+
+
+@dataclass(frozen=True)
+class BoundSeriesEvidence:
+    """A key-MAC'd, ordered and independently auditable run of consecutive
+    context-bound ranging rounds under one commitment.
+
+    Produced by :func:`seal_bound_series`. ``version`` is always ``1``;
+    ``session_id`` exactly 32 bytes, naming the ranging session; the round
+    range is the non-bool unsigned 64-bit integers
+    ``first_round_index``/``last_round_index`` (``last >= first``);
+    ``samples`` a non-empty tuple of canonical
+    :meth:`BoundEvidence.to_bytes` bytes kept in measurement order; ``limit``
+    the finite non-bool non-negative assess limit (stored as ``float``);
+    ``min_samples`` the non-bool positive assess minimum; ``sample_count``,
+    ``upper_bound`` and ``accepted`` the :class:`RangeDecision` obtained by
+    running the :func:`assess` median/MAD rule over the nested bound
+    evidences, with ``sample_count == len(samples) == last - first + 1``;
+    ``chain_digest`` exactly 32 bytes — the :func:`_bound_series_chain_digest`
+    value binding the session, round range and ordered samples under
+    ``b"NPBS1"``; ``mac`` exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPBS2" + encoding)`` over the canonical encoding of
+    every field except ``mac`` itself, so a holder of the shared key can
+    re-check the whole series independently with :func:`audit_bound_series`.
+    Structural fields of the wrong shape (``version`` a non-integer,
+    ``samples`` a non-tuple, a sample or one of the three byte fields
+    non-bytes) raise :class:`TypeError`; every other contract violation
+    raises :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    session_id: bytes
+    first_round_index: int
+    last_round_index: int
+    samples: tuple
+    limit: float
+    min_samples: int
+    sample_count: int
+    upper_bound: float
+    accepted: bool
+    chain_digest: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("bound series evidence version must be an integer")
+        if self.version != 1:
+            raise ValueError("bound series evidence version must be 1")
+        if not isinstance(self.session_id, bytes):
+            raise TypeError("bound series evidence session_id must be bytes")
+        if len(self.session_id) != 32:
+            raise ValueError(
+                "bound series evidence session_id must be exactly 32 bytes"
+            )
+        for name in ("first_round_index", "last_round_index"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or type(value) is not int:
+                raise ValueError(
+                    f"bound series evidence {name} must be a non-negative"
+                    " integer"
+                )
+            if not 0 <= value <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    f"bound series evidence {name} must fit in an unsigned"
+                    " 64-bit integer"
+                )
+        if self.last_round_index < self.first_round_index:
+            raise ValueError(
+                "bound series evidence last_round_index must not precede"
+                " first_round_index"
+            )
+        if not isinstance(self.samples, tuple):
+            raise TypeError("bound series evidence samples must be a tuple")
+        if not self.samples:
+            raise ValueError("bound series evidence samples must be non-empty")
+        for sample in self.samples:
+            if not isinstance(sample, bytes):
+                raise TypeError(
+                    "bound series evidence samples items must be bytes"
+                )
+            _require_bound_series_sample(sample)
+        if self.last_round_index - self.first_round_index + 1 != len(
+            self.samples
+        ):
+            raise ValueError(
+                "bound series evidence round range must span exactly the"
+                " samples"
+            )
+        if isinstance(self.limit, bool) or not isinstance(
+            self.limit, (int, float)
+        ):
+            raise ValueError(
+                "bound series evidence limit must be a finite non-negative"
+                " number"
+            )
+        if not math.isfinite(float(self.limit)) or float(self.limit) < 0:
+            raise ValueError(
+                "bound series evidence limit must be a finite non-negative"
+                " number"
+            )
+        for name in ("min_samples", "sample_count"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or type(value) is not int:
+                raise ValueError(
+                    f"bound series evidence {name} must be a positive integer"
+                )
+            if value < 1:
+                raise ValueError(
+                    f"bound series evidence {name} must be positive"
+                )
+        if self.sample_count != len(self.samples):
+            raise ValueError(
+                "bound series evidence sample_count must equal the number of"
+                " samples"
+            )
+        if isinstance(self.upper_bound, bool) or not isinstance(
+            self.upper_bound, (int, float)
+        ):
+            raise ValueError(
+                "bound series evidence upper_bound must be a finite"
+                " non-negative number"
+            )
+        if not math.isfinite(float(self.upper_bound)) or float(
+            self.upper_bound
+        ) < 0:
+            raise ValueError(
+                "bound series evidence upper_bound must be a finite"
+                " non-negative number"
+            )
+        if not isinstance(self.accepted, bool):
+            raise ValueError("bound series evidence accepted must be a bool")
+        for name in ("chain_digest", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(f"bound series evidence {name} must be bytes")
+            if len(value) != 32:
+                raise ValueError(
+                    f"bound series evidence {name} must be exactly 32 bytes"
+                )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, the byte fields
+        (``session_id``, ``chain_digest``, ``mac``) as lowercase hex,
+        ``samples`` as an array of lowercase-hex canonical
+        :class:`BoundEvidence` encodings in measurement order, no whitespace,
+        no NaN/Infinity."""
+        payload = _bound_series_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BoundSeriesEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: exactly the bound-series fields appearing
+        once each in field order (missing, extra, duplicated or out-of-order
+        keys rejected), ``version == 1``, ``session_id``/``chain_digest``/
+        ``mac`` lowercase hex decoding to exactly 32 bytes each, non-bool u64
+        non-negative ``first_round_index``/``last_round_index`` with the
+        range spanning the samples, a non-empty ``samples`` array whose items
+        are each the canonical :class:`BoundEvidence` encoding, a finite
+        non-bool non-negative ``limit``/``upper_bound``, positive non-bool
+        integers for ``min_samples``/``sample_count`` (the latter equal to
+        the sample count), and a bool ``accepted``. After parsing and field
+        validation the record is re-encoded with :meth:`to_bytes` and the
+        result must equal the input byte for byte, so formatted JSON,
+        whitespace and any non-canonical spelling are rejected too. Neither
+        the chain digest nor either MAC layer is verified here — use
+        :func:`audit_bound_series` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("bound series evidence data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedBoundEvidenceObject)
+        except ValueError as error:
+            raise ValueError(
+                f"bound series evidence is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(_BOUND_SERIES_FIELDS):
+            raise ValueError(
+                "bound series evidence must be a JSON object with exactly the"
+                " bound series evidence fields"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("bound series evidence version must be 1")
+        session_id = _parse_hex_field(obj["session_id"], "session_id")
+        if len(session_id) != 32:
+            raise ValueError(
+                "bound series evidence session_id must decode to exactly 32"
+                " bytes"
+            )
+        first_round_index = _parse_int_field(
+            obj["first_round_index"], "first_round_index"
+        )
+        if not 0 <= first_round_index <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "bound series evidence first_round_index must fit in an"
+                " unsigned 64-bit integer"
+            )
+        last_round_index = _parse_int_field(
+            obj["last_round_index"], "last_round_index"
+        )
+        if not 0 <= last_round_index <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "bound series evidence last_round_index must fit in an"
+                " unsigned 64-bit integer"
+            )
+        if last_round_index < first_round_index:
+            raise ValueError(
+                "bound series evidence last_round_index must not precede"
+                " first_round_index"
+            )
+        raw_samples = obj["samples"]
+        if not isinstance(raw_samples, list) or not raw_samples:
+            raise ValueError(
+                "bound series evidence samples must be a non-empty array"
+            )
+        samples = tuple(
+            _parse_hex_field(raw_sample, "samples item")
+            for raw_sample in raw_samples
+        )
+        for sample in samples:
+            _require_bound_series_sample(sample)
+        if last_round_index - first_round_index + 1 != len(samples):
+            raise ValueError(
+                "bound series evidence round range must span exactly the"
+                " samples"
+            )
+        limit = _parse_float_field(obj["limit"], "limit")
+        if limit < 0:
+            raise ValueError(
+                "bound series evidence limit must be a finite non-negative"
+                " number"
+            )
+        min_samples = _parse_int_field(obj["min_samples"], "min_samples")
+        if min_samples < 1:
+            raise ValueError(
+                "bound series evidence min_samples must be positive"
+            )
+        sample_count = _parse_int_field(obj["sample_count"], "sample_count")
+        if sample_count < 1:
+            raise ValueError(
+                "bound series evidence sample_count must be positive"
+            )
+        if sample_count != len(samples):
+            raise ValueError(
+                "bound series evidence sample_count must equal the number of"
+                " samples"
+            )
+        upper_bound = _parse_float_field(obj["upper_bound"], "upper_bound")
+        if upper_bound < 0:
+            raise ValueError(
+                "bound series evidence upper_bound must be a finite"
+                " non-negative number"
+            )
+        accepted = obj["accepted"]
+        if not isinstance(accepted, bool):
+            raise ValueError("bound series evidence accepted must be a bool")
+        chain_digest = _parse_hex_field(obj["chain_digest"], "chain_digest")
+        if len(chain_digest) != 32:
+            raise ValueError(
+                "bound series evidence chain_digest must decode to exactly 32"
+                " bytes"
+            )
+        mac = _parse_hex_field(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "bound series evidence mac must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            session_id=session_id,
+            first_round_index=first_round_index,
+            last_round_index=last_round_index,
+            samples=samples,
+            limit=limit,
+            min_samples=min_samples,
+            sample_count=sample_count,
+            upper_bound=upper_bound,
+            accepted=accepted,
+            chain_digest=chain_digest,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError("bound series evidence encoding is not canonical")
         return record
 
 
@@ -20457,6 +20858,318 @@ def audit_assess_evidence(x: object, key: object) -> "RangeDecision":
     if decision.accepted is not record.accepted:
         raise ValueError(
             "assess evidence accepted does not match the recomputed decision"
+        )
+    return decision
+
+
+def _coerce_bound_series_sample(item: object) -> "tuple[BoundEvidence, bytes]":
+    """Canonicalize one :func:`seal_bound_series` sample.
+
+    Accepts a :class:`BoundEvidence` instance or its canonical
+    :meth:`BoundEvidence.to_bytes` encoding and returns the record together
+    with its canonical bytes. A value of any other type raises
+    :class:`TypeError`; malformed or non-canonical bytes (or an invalid
+    record) raise :class:`ValueError`.
+    """
+    if isinstance(item, BoundEvidence):
+        return item, item.to_bytes()
+    if isinstance(item, bytes):
+        try:
+            record = BoundEvidence.from_bytes(item)
+        except ValueError as error:
+            raise ValueError(
+                "samples items must be BoundEvidence instances or their"
+                " canonical bytes"
+            ) from error
+        if record.to_bytes() != item:
+            raise ValueError(
+                "samples items must be BoundEvidence instances or their"
+                " canonical bytes"
+            )
+        return record, item
+    raise TypeError(
+        "samples items must be BoundEvidence instances or their canonical"
+        " bytes"
+    )
+
+
+def _check_bound_series_round_params(
+    first_round_index: object, expected_rounds: object
+) -> "tuple[int, int]":
+    """Validate the round-range parameters for :func:`seal_bound_series`.
+
+    ``first_round_index`` must be a non-bool non-negative unsigned 64-bit
+    integer and ``expected_rounds`` a non-bool positive integer whose range
+    (``first_round_index`` through ``first_round_index + expected_rounds
+    - 1``) stays within the unsigned 64-bit bound. Every violation raises
+    :class:`ValueError`.
+    """
+    if isinstance(first_round_index, bool) or type(first_round_index) is not int:
+        raise ValueError("first_round_index must be a non-negative integer")
+    if not 0 <= first_round_index <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(
+            "first_round_index must fit in an unsigned 64-bit integer"
+        )
+    if isinstance(expected_rounds, bool) or type(expected_rounds) is not int:
+        raise ValueError("expected_rounds must be a positive integer")
+    if expected_rounds < 1:
+        raise ValueError("expected_rounds must be a positive integer")
+    last_round_index = first_round_index + expected_rounds - 1
+    if last_round_index > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(
+            "the round range must fit in an unsigned 64-bit integer"
+        )
+    return first_round_index, last_round_index
+
+
+def seal_bound_series(
+    samples: object,
+    session_id: object,
+    first_round_index: object,
+    expected_rounds: object,
+    limit: object,
+    min_samples: object,
+    key: object,
+) -> "BoundSeriesEvidence":
+    """Audit an ordered run of consecutive context-bound rounds and seal it.
+
+    ``samples`` must be an iterable in measurement order whose items are each
+    a :class:`BoundEvidence` instance or its canonical
+    :meth:`BoundEvidence.to_bytes` encoding (objects and bytes may be mixed);
+    a non-iterable ``samples`` or an element of any other type raises
+    :class:`TypeError`. ``session_id`` must be exactly 32 ``bytes`` — a
+    non-bytes value raises :class:`TypeError`, any other length
+    :class:`ValueError`. ``first_round_index`` must be a non-bool
+    non-negative integer and ``expected_rounds`` a non-bool positive integer,
+    together spanning an unsigned-64-bit range; ``limit`` a non-bool finite
+    non-negative number and ``min_samples`` a non-bool positive integer,
+    exactly as for :func:`assess`; ``key`` must be non-empty ``bytes`` — a
+    non-bytes value raises :class:`TypeError`, an empty value
+    :class:`ValueError`.
+
+    Every sample is re-verified with :func:`audit_bound` first (outer and
+    inner MACs, commitment, bound response and recomputed elapsed/distance),
+    so a bad signature, a malformed or non-canonical sample encoding or a
+    wrong key raises :class:`ValueError`. The samples must then:
+
+    - number exactly ``expected_rounds`` (an empty or wrong-length iterable
+      raises :class:`ValueError`);
+    - all carry one identical ``context`` and one identical commitment
+      ``digest`` — mixing contexts or commitments raises
+      :class:`ValueError`;
+    - have nested round indices ``first_round_index, first_round_index + 1,
+      ...`` in input order, one per round with no gaps or repeats — a
+      duplicate, missing or out-of-order round raises :class:`ValueError`.
+
+    The robust decision is then computed over the nested evidences with
+    exactly the :func:`assess` median/MAD semantics under ``limit`` and
+    ``min_samples``, so too few samples or too few inliers raise
+    :class:`ValueError` and no evidence is produced. Only on success is the
+    :class:`BoundSeriesEvidence` sealed: the canonical sample bytes are kept
+    in input order (unlike :class:`AssessEvidence`, the order is the
+    evidence — different permutations of the same samples produce different
+    ``chain_digest`` and artifact bytes), the chain digest is folded as
+    ``d0 = SHA256(b"NPBS1" + session_id + u64be(first) + u64be(last))`` and
+    ``d = SHA256(b"NPBS1" + d + sample_bytes)`` per ordered sample, and the
+    record MAC is ``HMAC-SHA256(key, b"NPBS2" + encoding)`` over the
+    canonical encoding of every field but ``mac``. Sealing is pure
+    computation: it touches no challenge registry or consumption state.
+    """
+    try:
+        items = list(samples)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "samples must be an iterable of BoundEvidence instances or their"
+            " canonical bytes"
+        ) from error
+    for item in items:
+        if not isinstance(item, (BoundEvidence, bytes)):
+            raise TypeError(
+                "samples items must be BoundEvidence instances or their"
+                " canonical bytes"
+            )
+    if not isinstance(session_id, bytes):
+        raise TypeError("session_id must be bytes")
+    if len(session_id) != 32:
+        raise ValueError("session_id must be exactly 32 bytes")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    first, last = _check_bound_series_round_params(
+        first_round_index, expected_rounds
+    )
+    bound, minimum = _check_assess_params(limit, min_samples)
+    records_and_blobs = [_coerce_bound_series_sample(item) for item in items]
+    # Every bound evidence is verified exactly as a standalone audit_bound()
+    # call would: both MACs, commitment, bound response and round-trip math.
+    measurements = [
+        audit_bound(blob, key) for _record, blob in records_and_blobs
+    ]
+    records = [record for record, _blob in records_and_blobs]
+    if len(records) != expected_rounds:
+        raise ValueError(
+            f"expected {expected_rounds} samples, got {len(records)}"
+        )
+    context = records[0].context
+    digest = records[0].digest
+    for index, record in enumerate(records):
+        if record.context != context or record.digest != digest:
+            raise ValueError(
+                "bound series samples must share one context and one digest"
+            )
+        expected_round = first + index
+        if record.evidence.round_index != expected_round:
+            raise ValueError(
+                "bound series round indices must run consecutively from"
+                f" first_round_index: expected {expected_round}, got"
+                f" {record.evidence.round_index}"
+            )
+    # assess's duplicate (round_index, nonce) guard, min-sample/inlier counts
+    # and the median/MAD decision all apply unchanged to the inner evidence.
+    decision = _assess_measurements(measurements, bound, minimum)
+    ordered = tuple(blob for _record, blob in records_and_blobs)
+    chain_digest = _bound_series_chain_digest(session_id, first, last, ordered)
+    sealed = BoundSeriesEvidence(
+        version=1,
+        session_id=session_id,
+        first_round_index=first,
+        last_round_index=last,
+        samples=ordered,
+        limit=bound,
+        min_samples=minimum,
+        sample_count=decision.sample_count,
+        upper_bound=decision.upper_bound,
+        accepted=decision.accepted,
+        chain_digest=chain_digest,
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        sealed,
+        mac=_bound_series_mac(key, _bound_series_payload(sealed)),
+    )
+
+
+def _coerce_bound_series(x: object, name: str) -> "BoundSeriesEvidence":
+    """Coerce a :class:`BoundSeriesEvidence` or its canonical bytes,
+    splitting the TypeError/ValueError contract exactly as the public
+    auditors do: the wrong kind of argument raises :class:`TypeError`, a
+    field-shape failure surfacing while parsing byte content of the right
+    kind is a value error."""
+    if isinstance(x, BoundSeriesEvidence):
+        return x
+    if isinstance(x, bytes):
+        try:
+            return BoundSeriesEvidence.from_bytes(x)
+        except ValueError as error:
+            raise ValueError(
+                f"{name} does not satisfy the bound series evidence field"
+                " contract"
+            ) from error
+    raise TypeError(
+        f"{name} must be a BoundSeriesEvidence instance or its canonical"
+        " bytes"
+    )
+
+
+def audit_bound_series(x: object, key: object) -> "RangeDecision":
+    """Independently re-verify a :class:`BoundSeriesEvidence` against ``key``.
+
+    ``x`` must be a :class:`BoundSeriesEvidence` or its canonical
+    :meth:`BoundSeriesEvidence.to_bytes` encoding — anything else raises
+    :class:`TypeError`; ``key`` must be non-empty ``bytes`` — a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`.
+
+    The outer MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPBS2" + encoding)`` and compared in constant time;
+    the chain digest is recomputed as
+    ``SHA256(b"NPBS1" + session_id + u64be(first) + u64be(last))`` folded
+    with every ordered sample's canonical bytes and compared in constant
+    time; every carried sample is then re-verified with
+    :func:`audit_bound` exactly as a standalone call. The samples must all
+    share one ``context`` and one commitment ``digest``, their nested round
+    indices must run ``first_round_index, first_round_index + 1, ...``
+    through ``last_round_index`` with no duplicate or missing round, and
+    their count must equal the recorded round range and ``sample_count``.
+    Finally the whole robust determination is rerun with exactly the
+    :func:`assess` semantics against the carried ``limit`` and
+    ``min_samples``; the recomputed total sample count, largest inlier
+    distance and accept flag must each equal the recorded fields. A bad
+    outer or sample signature, wrong chain digest, non-canonical encoding,
+    tampered sample, threshold or conclusion, mixed contexts or digests, a
+    duplicate, missing or gap round, too few samples or too few inliers all
+    raise :class:`ValueError`; no partial result is returned. Auditing is
+    pure computation: it touches no challenge registry or consumption state.
+    """
+    record = _coerce_bound_series(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _bound_series_mac(key, _bound_series_payload(record)), record.mac
+    ):
+        raise ValueError("bound series evidence mac does not match the key")
+    chain_digest = _bound_series_chain_digest(
+        record.session_id,
+        record.first_round_index,
+        record.last_round_index,
+        record.samples,
+    )
+    if not hmac.compare_digest(chain_digest, record.chain_digest):
+        raise ValueError(
+            "bound series evidence chain_digest does not match the session,"
+            " round range and ordered samples"
+        )
+    expected_count = (
+        record.last_round_index - record.first_round_index + 1
+    )
+    if len(record.samples) != expected_count:
+        raise ValueError(
+            "bound series evidence samples do not span the recorded round"
+            " range"
+        )
+    if record.sample_count != len(record.samples):
+        raise ValueError(
+            "bound series evidence sample_count does not match the samples"
+        )
+    measurements = []
+    context = None
+    digest = None
+    for index, blob in enumerate(record.samples):
+        bound = BoundEvidence.from_bytes(blob)
+        measurement = audit_bound(bound, key)
+        if context is None:
+            context = bound.context
+            digest = bound.digest
+        elif bound.context != context or bound.digest != digest:
+            raise ValueError(
+                "bound series samples must share one context and one digest"
+            )
+        expected_round = record.first_round_index + index
+        if bound.evidence.round_index != expected_round:
+            raise ValueError(
+                "bound series round indices must run consecutively from"
+                f" first_round_index: expected {expected_round}, got"
+                f" {bound.evidence.round_index}"
+            )
+        measurements.append(measurement)
+    bound, minimum = _check_assess_params(record.limit, record.min_samples)
+    decision = _assess_measurements(measurements, bound, minimum)
+    if decision.sample_count != record.sample_count:
+        raise ValueError(
+            "bound series evidence sample_count does not match the"
+            " recomputed decision"
+        )
+    if decision.upper_bound != record.upper_bound:
+        raise ValueError(
+            "bound series evidence upper_bound does not match the recomputed"
+            " decision"
+        )
+    if decision.accepted is not record.accepted:
+        raise ValueError(
+            "bound series evidence accepted does not match the recomputed"
+            " decision"
         )
     return decision
 

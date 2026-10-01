@@ -125,6 +125,11 @@ python3 -m nearproof
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约（含非规范拼写）一律抛 `ValueError`（不校验 MAC）
 - `audit_delay_bound(record, key)` — 用共享密钥复核 `DelayBoundEvidence`（或其字节编码）：两层 MAC、承诺、应答、往返与延迟上界，返回对应的 `Measurement`；`record`/`key` 类型错抛 `TypeError`，纯函数不改状态（见下）
 - `audit_bound_policy(bound, key, *, now=None, max_age=None, revocations=None) -> Measurement` — 先按 `audit_bound` 复核，再可选做时效/撤销复核（见下）
+- `BoundSeriesEvidence(version, session_id, first_round_index, last_round_index, samples, limit, min_samples, sample_count, upper_bound, accepted, chain_digest, mac)` — 把同一承诺下一段**按测量顺序连续**的绑定轮次连同 `assess` 统计结论冻结的共享密钥签名记录（`version=1`，`session_id`/`chain_digest`/`mac` 各恰 32 字节，`samples` 为按序的规范 `BoundEvidence.to_bytes()` 字节元组，不含密钥；见下）；字段形状错抛 `TypeError`，值违约抛 `ValueError`
+  - `to_bytes()` — 无空白 UTF-8 JSON **对象**（键序 `version, session_id, first_round_index, last_round_index, samples, limit, min_samples, sample_count, upper_bound, accepted, chain_digest, mac`，各一次；`samples` 为按序小写 hex 数组，bytes 小写 hex；无空白、无 NaN/Infinity）
+  - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，仅收 bytes（非 bytes 抛 `ValueError`），缺/多/重复/乱序键、轮次范围不跨满样本数、样本非规范 `BoundEvidence` 编码、长度数值违约及任何非规范拼写均抛 `ValueError`；不校验链摘要与任何 MAC
+- `seal_bound_series(samples, session_id, first_round_index, expected_rounds, limit, min_samples, key) -> BoundSeriesEvidence` — 逐份按 `audit_bound` 验样本，校验同一 context/digest、轮号从 `first_round_index` 逐项连续且样本数恰为 `expected_rounds`，再按 `assess` 中位数/MAD 口径重算判定，全部通过才封存；输入顺序保留，不同排列产生不同 `chain_digest`（见下）
+- `audit_bound_series(x, key) -> RangeDecision` — 收对象或规范字节与非空 bytes 密钥；恒时复核外层 `NPBS2` MAC 与 `NPBS1` 链摘要，逐份 `audit_bound`，再校验承诺一致、连续轮号、样本数并重跑 `assess`，全部值一致才返回 `RangeDecision`；形状错抛 `TypeError`，空 key、坏编码、签名/链摘要不符、重复或缺失轮次、上下文混用、统计结论不符均抛 `ValueError`（见下）
 - `BoundEvidenceRevocation(version, round_index, nonce, revoked_at, mac)` — 带 HMAC 签名的冻结绑定证据撤销记录（`version=1`，`round_index` 为非布尔 u64，`nonce` 恰 16 字节，`mac` 恰 32 字节，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`nonce`/`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）；`revoked_at` 保留解析类型：JSON 整数仍为 `int`、浮点仍为 `float`，两种写法均可往返
@@ -644,6 +649,35 @@ if decision.accepted:
 - 两项同时启用时各自独立生效：时效超龄或含被撤销样本都会拒绝；二者皆满足才返回与既有复核相同的 `RangeDecision`。
 
 与既有复核一样，策略复核是纯计算：不触碰挑战登记与消费状态，也不替代验证时的重放防护。
+
+### 连续绑定测距序列 `BoundSeriesEvidence`、`seal_bound_series` 与 `audit_bound_series`
+
+单轮 `BoundEvidence` 与无状态 `assess` 能证明每一轮各自合法、能对一批轮次做统计判定，却**不能证明轮次顺序、连续性与同一承诺上下文**：同一批样本可任意排列、可混入别的承诺。`BoundSeriesEvidence` 把同一承诺下一段**按测量顺序连续**的绑定测距连同统计结论冻结成一条可独立审计的序列证据。
+
+`BoundSeriesEvidence(version, session_id, first_round_index, last_round_index, samples, limit, min_samples, sample_count, upper_bound, accepted, chain_digest, mac)` 是冻结的共享密钥 MAC **序列证据记录**：按字段序位置构造、冻结且按字段相等，不含密钥。`version` 固定为 `1`；`session_id` 恰 32 字节，命名本次测距会话；`first_round_index`/`last_round_index` 为非布尔、取值于 `[0, 2^64-1]` 的整数且 `last >= first`，范围恰跨满样本；`samples` 为**按测量顺序保留**的非空规范 `BoundEvidence.to_bytes()` 字节元组；`limit` 为非布尔有限非负数（存为 `float`）、`min_samples` 为非布尔正整数；`sample_count`/`upper_bound`/`accepted` 是对内层证据按 `assess` 中位数 / MAD 规则得出的 `RangeDecision` 三字段，且 `sample_count == len(samples) == last - first + 1`；`chain_digest` 与 `mac` 各恰 32 字节。结构字段错型（`version` 非整数、`samples` 非元组或某项非 bytes、`session_id`/`chain_digest`/`mac` 非 bytes）抛 `TypeError`，其余契约违约抛 `ValueError`。
+
+证据为紧凑 UTF-8 JSON **对象**（无空白、bytes 小写 hex、不允许 NaN/Infinity），键序 `version, session_id, first_round_index, last_round_index, samples, limit, min_samples, sample_count, upper_bound, accepted, chain_digest, mac`，`samples` 是各样本规范编码的小写 hex 数组（**顺序即测量顺序**）。`from_bytes(data)` 要求外层键恰好是各字段、各一次且依序，三个 bytes 字段解码后恰 32 字节，每个样本都解码为**规范** `BoundEvidence` 编码，并把解析结果重编码与输入逐字节比对；格式化 JSON、空白等非规范写法一律拒绝；非 bytes 或不合契约抛 `ValueError`，它不校验链摘要与任何 MAC。
+
+链摘要以 `NPBS1` 为域前缀，绑定会话、轮次范围与按序样本：先令 `d0 = SHA256(b"NPBS1" + session_id + u64be(first) + u64be(last))`（两个轮号均为固定 8 字节大端），再对每个样本按序折叠 `d = SHA256(b"NPBS1" + d + sample_bytes)`，各段直拼、无分隔或长度前缀；因此**同批样本的不同排列落在不同 `chain_digest`**，改动会话或轮次范围亦然。记录 MAC 为 `HMAC-SHA256(key, b"NPBS2" + C)`，其中 `C` 是除 `mac` 外全部字段的紧凑编码（含已算好的 `chain_digest`），前缀与 `C` 直拼。
+
+- `seal_bound_series(samples, session_id, first_round_index, expected_rounds, limit, min_samples, key)` 收按测量顺序排列的样本（每项为 `BoundEvidence` 或其规范字节，可混用）、32 字节 `session_id`、非负 `first_round_index`、正整数 `expected_rounds`、`limit`、`min_samples` 与非空 bytes `key`。不可迭代的 `samples`、元素既非 `BoundEvidence` 也非 bytes、`session_id`/`key` 非 bytes 抛 `TypeError`；`session_id` 长度非 32、空密钥、`first_round_index` 非法（负数、bool、非整数、使末轮超 u64）、`expected_rounds` 非正整数、`limit`/`min_samples` 违约、样本签名不符或编码非规范均抛 `ValueError`。封存先**逐份按 `audit_bound` 复核**（两层 MAC、承诺、绑定应答、耗时与折半距离），再要求：样本数恰为 `expected_rounds`；所有样本的 `context` 与承诺 `digest` 完全相同（上下文混用抛 `ValueError`）；内层轮号依次为 `first_round_index, first_round_index + 1, ...`，无重复、无缺口、无错位。全部满足后对内层证据按 `assess` 中位数 / MAD 口径重算判定（样本过少或内点不足抛 `ValueError`），**全部通过才产出证据**；输入顺序逐字节保留，封存是纯计算，不触碰挑战登记与消费状态。
+- `audit_bound_series(x, key)` 收 `BoundSeriesEvidence` 对象或其规范字节与非空 bytes 密钥；`x` 既非对象也非 bytes、或 `key` 非 bytes 抛 `TypeError`，空密钥抛 `ValueError`。它先恒时复核外层 `NPBS2` MAC，再重算并恒时比对 `NPBS1` 链摘要，然后**逐份 `audit_bound` 复核样本**（含各自承诺与绑定应答），并独立校验：所有样本同一 `context`/`digest`、轮号从 `first_round_index` 逐项连续（重复或缺失轮次抛 `ValueError`）、样本数等于轮次范围与 `sample_count`，最后按携带的 `limit`/`min_samples` **重跑 `assess`** 统计，重算的 `sample_count`/`upper_bound`/`accepted` 须与记录逐字段相等。签名不符、链摘要错误、坏编码、上下文混用、轮次重复/缺失/乱序、统计结论不符一律抛 `ValueError`；成功返回对应的 `RangeDecision`。复核是纯计算，不触碰挑战登记与消费状态，也不替代验证时的重放防护。
+
+```python
+bounds = []
+for _ in range(10):
+    challenge = verifier.new_challenge(context=context, digest=digest)
+    started = verifier.clock()
+    response = prover.reveal(challenge, context, opening)
+    bounds.append(verifier.verify_bound(challenge, response, started, opening=opening))
+
+first = bounds[0].evidence.round_index
+series = seal_bound_series(bounds, session_id, first, len(bounds), 300.0, 5, key)
+blob = series.to_bytes()                         # 可持久化或分发
+decision = audit_bound_series(blob, key)        # 第三方独立审计整段
+if decision.accepted:
+    print(series.first_round_index, series.last_round_index, decision.upper_bound)
+```
 
 ### 逐轮证据撤销快照 `EvidenceRevocationList` / `make_evidence_revocation_list` / `audit_evidence_revocation_list`
 
