@@ -38,6 +38,7 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：JSON 对象的键必须恰好是十一个字段且各出现一次、顺序与字段顺序一致（重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
 - `Measurement(round_index, nonce, response, elapsed_seconds, distance_meters)`
+- `NoiseDecision(sample_count, inlier_count, center, mad, coverage, lower_bound, upper_bound, accepted)` — `assess_confidence` 的冻结结果：`sample_count` 统计全部输入样本（含离群点），`inlier_count` 只计内点，`center`/`mad` 由全部合法距离计算，`lower_bound`/`upper_bound` 为内点距离的次序统计量区间，`accepted` 表示上界不超过 limit
 - `Observation(id, x, y, decision)` — 二维共识中一个验证者的冻结观察：`id` 为非空字符串，`(x, y)` 为非布尔有限数坐标，`decision` 为 `RangeDecision`（仅其有限非负的 `upper_bound` 参与共识，`accepted` 不参与）
 - `Prover(shared_key)` — `respond(challenge) -> bytes`（HMAC-SHA256 应答）；`reveal(challenge, context, opening) -> bytes` 用于上下文绑定轮次（见下）；`bit(t, d, i, b) -> bytes` 用于位挑战轮次（`t` 16 字节、`d` 32 字节、`i` 非布尔 u32、`b` 仅 0/1；见下）
 - `RangeDecision(sample_count, upper_bound, accepted)` — `assess` 的冻结结果：`sample_count` 统计全部输入样本（含离群点），`upper_bound` 为内点最大距离，`accepted` 表示其不超过 limit
@@ -55,6 +56,7 @@ python3 -m nearproof
   - `revoke(challenge)` — 显式撤销一个仍待验证的挑战（仅在 `replay_protection=True` 时可用）
   - `clock` — 只读属性，暴露计时函数
 - `assess(samples, limit, *, key=None, min_samples=5) -> RangeDecision` — 基于一批轮次的稳健距离判定（见下）
+- `assess_confidence(samples, limit, *, key=None, min_samples=5, coverage=0.95) -> NoiseDecision` — 沿用 `assess` 的样本契约与中位数/MAD 内点规则，额外给出测距噪声的覆盖区间与统计判定（见下）
 - `AssessEvidence(version, samples, limit, min_samples, sample_count, upper_bound, accepted, mac)` — 把一次 `assess` 判定连同其样本集、阈值、最少样本数与结论冻结的共享密钥签名记录（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, S, L, M, C, U, A, MAC]`，`S` 为各样本规范 `Evidence` 字节的小写 hex 数组，`MAC` 小写 hex
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或结构字段错型抛 `TypeError`，其余不合契约（含非规范编码）抛 `ValueError`（不校验 MAC）
@@ -623,6 +625,21 @@ measurements = [verifier.measure(prover) for _ in range(10)]
 decision = assess(measurements, limit=300.0)
 if decision.accepted:
     print(decision.sample_count, decision.upper_bound)
+```
+
+### 噪声区间判定 `assess_confidence`
+
+`assess_confidence(samples, limit, *, key=None, min_samples=5, coverage=0.95)` 在 `assess` 同一套样本契约与内点规则之上，把“最大内点距离”这一单点上界扩展为测距噪声的**双侧区间估计**，返回冻结的 `NoiseDecision(sample_count, inlier_count, center, mad, coverage, lower_bound, upper_bound, accepted)`：
+
+- 样本类型、证据先审计、混合样本、重复轮次、缺密钥、坏数值、坏证据、样本总数 / 内点数下限以及 `limit`、`min_samples` 的契约与 `assess` **完全一致**，违约同样抛 `ValueError`。
+- `coverage` 必须是**非 bool、有限且严格位于 `0` 与 `1` 之间**的数（`int`/`float`，排除 `True`/`False`、`0`、`1`、负数、`inf`、`nan` 与非数值类型），否则抛 `ValueError`。
+- 先按 `assess` 的全样本中位数与 MAD 规则确定内点：`center`、`mad` 由**全部合法距离**计算，`inlier_count` 只计内点（内点少于 `min_samples` 抛 `ValueError`）。
+- 把内点距离升序排列为 `x_1 <= ... <= x_n`（`n = inlier_count`），记 `p = coverage`、`alpha = 1 - p`，则 `lower_bound = x_max(1, ceil(alpha*n/2))`、`upper_bound = x_min(n, ceil((1-alpha/2)*n))`（名次从 1 起算，越界名次分别夹到 `1`、`n`）。小样本、低覆盖时区间自然退化为中位数附近的同名次值。
+- `sample_count` 含离群点；`accepted` 当且仅当 `upper_bound <= limit`；浮点值**不做额外舍入**，结果与输入顺序无关。
+
+```python
+noise = assess_confidence(measurements, limit=300.0, coverage=0.95)
+print(noise.inlier_count, noise.lower_bound, noise.upper_bound, noise.accepted)
 ```
 
 ### 判定证据封存与复核 `AssessEvidence`、`seal_assess_evidence` 与 `audit_assess_evidence`

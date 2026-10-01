@@ -166,6 +166,7 @@ __all__ = [
     "JournalBatchReceiptAuditor",
     "JournalBatchReceiptFrontier",
     "Measurement",
+    "NoiseDecision",
     "Observation",
     "ObservationRevocation",
     "Prover",
@@ -217,6 +218,7 @@ __all__ = [
     "WeightedCertifiedConsensusEvidence",
     "WeightedConsensus",
     "assess",
+    "assess_confidence",
     "attest_observation",
     "attest_observation_for_point",
     "audit",
@@ -536,6 +538,30 @@ class RangeDecision:
     """
 
     sample_count: int
+    upper_bound: float
+    accepted: bool
+
+
+@dataclass(frozen=True)
+class NoiseDecision:
+    """The result of :func:`assess_confidence` over a batch of rounds.
+
+    ``sample_count`` counts every input sample (including outliers),
+    ``inlier_count`` only the inliers kept by the :func:`assess`
+    median/MAD rule, ``center`` and ``mad`` are the full-sample median
+    and median absolute deviation, ``coverage`` is the requested
+    two-sided level, and ``lower_bound``/``upper_bound`` are the
+    order-statistic interval over the sorted inlier distances.
+    ``accepted`` says whether ``upper_bound`` is at most the configured
+    limit.
+    """
+
+    sample_count: int
+    inlier_count: int
+    center: float
+    mad: float
+    coverage: float
+    lower_bound: float
     upper_bound: float
     accepted: bool
 
@@ -20304,6 +20330,42 @@ def assess(
     return _assess_measurements(measurements, bound, minimum)
 
 
+def assess_confidence(
+    samples: object,
+    limit: object,
+    *,
+    key: object = None,
+    min_samples: object = 5,
+    coverage: object = 0.95,
+) -> "NoiseDecision":
+    """Like :func:`assess`, but bound the ranging noise with an interval.
+
+    The sample contract is exactly that of :func:`assess`: all
+    :class:`Measurement` or all :class:`Evidence`/canonical bytes, evidence
+    audited first under a non-empty ``key``, with the same duplicate-round,
+    bad-value, minimum-count and ``limit``/``min_samples`` checks.
+    ``coverage`` must additionally be a non-bool finite number strictly
+    between ``0`` and ``1``; anything else raises :class:`ValueError`.
+
+    The inliers are found with the same full-sample median and MAD rule as
+    :func:`assess`; ``center`` and ``mad`` come from every valid distance
+    and ``inlier_count`` counts only the inliers (fewer than ``min_samples``
+    inliers raises :class:`ValueError`). The inlier distances are sorted
+    ascending and, with ``n`` the inlier count, ``p`` the coverage and
+    ``alpha = 1 - p``, ``lower_bound`` is the
+    ``max(1, ceil(alpha*n/2))``-th value and ``upper_bound`` the
+    ``min(n, ceil((1 - alpha/2)*n))``-th value, using 1-based ranks.
+    ``sample_count`` includes outliers and ``accepted`` is ``True`` exactly
+    when ``upper_bound <= limit``. Floating-point values are returned
+    unrounded and the result does not depend on input order.
+    """
+    bound, minimum = _check_assess_params(limit, min_samples)
+    level = _check_coverage(coverage)
+
+    measurements = _coerce_assess_samples(samples, key)
+    return _assess_confidence_measurements(measurements, bound, minimum, level)
+
+
 def _coerce_assess_samples(samples: object, key: object) -> list:
     """Turn an ``assess`` sample iterable into a list of :class:`Measurement`.
 
@@ -20341,10 +20403,30 @@ def _coerce_assess_samples(samples: object, key: object) -> list:
     return list(raw_samples)  # type: ignore[arg-type]
 
 
-def _assess_measurements(
-    measurements: list, bound: float, minimum: int
-) -> "RangeDecision":
-    """The robust inlier decision over already-validated measurements."""
+def _check_coverage(coverage: object) -> float:
+    """Validate the :func:`assess_confidence` coverage level.
+
+    It must be a non-bool finite number strictly between ``0`` and ``1``;
+    every other value (including ``bool``) raises :class:`ValueError`.
+    """
+    if isinstance(coverage, bool) or not isinstance(coverage, (int, float)):
+        raise ValueError(
+            "coverage must be a finite number strictly between 0 and 1"
+        )
+    level = float(coverage)
+    if not math.isfinite(level) or not 0.0 < level < 1.0:
+        raise ValueError(
+            "coverage must be a finite number strictly between 0 and 1"
+        )
+    return level
+
+
+def _validated_assess_distances(measurements: list, minimum: int) -> list:
+    """Apply the :func:`assess` sample checks and return float distances.
+
+    Enforces the total sample count, unique ``(round_index, nonce)`` pairs
+    and the finite non-negative elapsed/distance contract.
+    """
     if len(measurements) < minimum:
         raise ValueError(f"need at least {minimum} samples, got {len(measurements)}")
 
@@ -20369,7 +20451,16 @@ def _assess_measurements(
             if not math.isfinite(number) or number < 0:
                 raise ValueError(f"sample {name} must be a finite non-negative number")
         distances.append(float(measurement.distance_meters))
+    return distances
 
+
+def _assess_inliers(distances: list) -> tuple[float, float, list]:
+    """Full-sample median/MAD and the robust inlier distances.
+
+    Returns ``(center, mad, inliers)`` with both statistics taken over
+    every distance; when ``mad`` is zero only distances equal to the
+    median are inliers.
+    """
     center = median(distances)
     mad = median(abs(distance - center) for distance in distances)
     if mad > 0:
@@ -20379,6 +20470,15 @@ def _assess_measurements(
         ]
     else:
         inliers = [distance for distance in distances if distance == center]
+    return center, mad, inliers
+
+
+def _assess_measurements(
+    measurements: list, bound: float, minimum: int
+) -> "RangeDecision":
+    """The robust inlier decision over already-validated measurements."""
+    distances = _validated_assess_distances(measurements, minimum)
+    _center, _mad, inliers = _assess_inliers(distances)
 
     if len(inliers) < minimum:
         raise ValueError(
@@ -20388,6 +20488,37 @@ def _assess_measurements(
     upper_bound = max(inliers)
     return RangeDecision(
         sample_count=len(measurements),
+        upper_bound=upper_bound,
+        accepted=upper_bound <= bound,
+    )
+
+
+def _assess_confidence_measurements(
+    measurements: list, bound: float, minimum: int, level: float
+) -> "NoiseDecision":
+    """The order-statistic interval decision over validated measurements."""
+    distances = _validated_assess_distances(measurements, minimum)
+    center, mad, inliers = _assess_inliers(distances)
+
+    if len(inliers) < minimum:
+        raise ValueError(
+            f"need at least {minimum} inliers, got {len(inliers)}"
+        )
+
+    ordered = sorted(inliers)
+    n = len(ordered)
+    alpha = 1.0 - level
+    lower_rank = max(1, math.ceil(alpha * n / 2))
+    upper_rank = min(n, math.ceil((1.0 - alpha / 2.0) * n))
+    lower_bound = ordered[lower_rank - 1]
+    upper_bound = ordered[upper_rank - 1]
+    return NoiseDecision(
+        sample_count=len(measurements),
+        inlier_count=n,
+        center=center,
+        mad=mad,
+        coverage=level,
+        lower_bound=lower_bound,
         upper_bound=upper_bound,
         accepted=upper_bound <= bound,
     )
