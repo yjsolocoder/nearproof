@@ -32,6 +32,8 @@ python3 -m nearproof
 - `Challenge(round_index, nonce)` — 验证者发出的挑战
 - `ChallengeStateError(ValueError)` — 挑战未由本验证者签发、已成功验证、已撤销或已过期
 - `Consensus(total, support, rejected, accepted)` — `locate` 的冻结共识结果：`rejected` 为不支持的验证者 id 按字典序排列的字符串元组
+- `ConsensusPolicy(weights, threshold)` — `locate_weighted` 的冻结权重策略：`weights` 为 id 到正整数权重的只读映射（构造时复制），`threshold` 为不超过总权重的正整数；按字段相等、可哈希
+- `WeightedConsensus(total_weight, support_weight, rejected, accepted)` — `locate_weighted` 的冻结共识结果：前两项分别为全部与支持者的权重和，`rejected` 为不支持者 id 按字典序排列的字符串元组，`accepted` 当且仅当 `support_weight >= threshold`
 - `Evidence(version, round_index, nonce, response, start, end, speed, elapsed, distance, result, mac)` — 一轮已接受验证的防篡改记录（`version=1`、`result="accepted"`，不含密钥）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：JSON 对象的键必须恰好是十一个字段且各出现一次、顺序与字段顺序一致（重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
@@ -132,6 +134,7 @@ python3 -m nearproof
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对（不校验 MAC）：非 bytes 或字段类型错抛 `TypeError`，其余不合契约一律抛 `ValueError`
 - `revoke_context(context, revoked_at, key) -> ContextRevocation` — 用非空 key 对一个 32 字节 context 签发批量撤销记录（见下）
 - `locate(observations, point, *, quorum=3, tolerance=0.0) -> Consensus` — 二维多验证者位置共识（见下）
+- `locate_weighted(observations, point, policy, *, tolerance=0.0) -> WeightedConsensus` — 与 `locate` 同几何，但按 `ConsensusPolicy` 的声明权重汇总支持票而非按验证者条数（见下）
 - `AttestedObservation(version, id, x, y, decision, issued_at, mac)` — 带 HMAC 签名与时间戳的冻结观察（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 为嵌套对象且键同样依字段顺序，`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：外层与嵌套 `decision` 对象的键都必须恰好是各自字段、各出现一次且依字段顺序（缺、多、重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
@@ -763,6 +766,35 @@ consensus = locate(observations, (0.0, 0.0))
 consensus.total, consensus.support     # (3, 3)
 consensus.rejected                     # ()
 consensus.accepted                     # True
+```
+
+### 按可信权重计票的共识 `locate_weighted`
+
+`locate_weighted(observations, point, policy, *, tolerance=0.0)` 与 `locate` 使用完全相同的几何（闭圆盘、边界计入、`decision.accepted` 被忽略、`rejected` 按字典序、与输入顺序无关、无状态、不修改传入对象），区别只在计票方式：不再按验证者条数，而是按 `policy` 中声明的可信权重汇总。
+
+`ConsensusPolicy(weights, threshold)` 是冻结的权重策略：`weights` 为 id 到**非布尔正整数**权重的映射（构造时复制为只读映射，后续改动原字典不影响策略），id 必须是非空字符串、互不重复；`threshold` 必须是非布尔正整数且不超过权重总和。构造违约（非映射、空/重复 id、非正整数权重、非法 threshold、threshold 超过总权重）一律抛 `ValueError`。
+
+- 观察的全部契约（`Observation` 成员、非空唯一 id、非布尔有限坐标、`RangeDecision` 且 `upper_bound` 有限非负）、`point` 与 `tolerance` 的契约与 `locate` 一致；但加权路径**没有至少三条观察的下限**——参与集合由权重 id 集合界定。
+- **权重 id 集合必须与观察 id 集合完全一致**：缺 id、多 id、同数但不同名均抛 `ValueError`。
+- `tolerance` 仅限关键字传入（默认 `0.0`）；`policy` 必须是 `ConsensusPolicy` 实例。
+
+返回冻结的 `WeightedConsensus(total_weight, support_weight, rejected, accepted)`：`total_weight` 为全部权重之和，`support_weight` 为支持者（闭圆盘覆盖候选点的观察）权重之和，`rejected` 是不支持者 id 按字典序排列的 tuple，`accepted` 当且仅当 `support_weight >= policy.threshold`。矛盾圆盘同样只体现在 `rejected` 中，不抛异常。`locate` 家族原有的条数 quorum 与既有编码行为不受影响。
+
+```python
+from nearproof import ConsensusPolicy, Observation, RangeDecision, locate_weighted
+
+observations = [
+    Observation("alpha", 0.0, 0.0, RangeDecision(5, 0.0, True)),
+    Observation("bravo", 3.0, 4.0, RangeDecision(5, 5.0, False)),
+    Observation("charlie", 10.0, 0.0, RangeDecision(5, 1.0, True)),
+]
+# alpha、bravo 的圆盘覆盖原点（权重 1+2），charlie（权重 4）不覆盖。
+policy = ConsensusPolicy({"alpha": 1, "bravo": 2, "charlie": 4}, threshold=5)
+consensus = locate_weighted(observations, (0.0, 0.0), policy)
+consensus.total_weight      # 7
+consensus.support_weight    # 3
+consensus.rejected          # ('charlie',)
+consensus.accepted          # False（按条数 quorum=2 本会接受）
 ```
 
 ### 带签名的观察 `AttestedObservation` 与 `locate_attested`

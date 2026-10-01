@@ -10,7 +10,8 @@ BitRound /
 BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / CertifiedConsensusEvidence / Challenge /
-ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
+ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus /
+ConsensusPolicy / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
 DelayBoundEvidence /
 Evidence / EvidenceRevocationList / EvidenceRevocationListAuditor /
 EvidenceRevocationListBundle /
@@ -51,7 +52,7 @@ StreamCommitReceiptSpanReceipt /
 StreamReceiptBatchCommitReceipt / StreamReceiptFrontier /
 TrustRevocation /
 TrustRevocationList / Verifier /
-VerifierTrust / assess / attest_observation /
+VerifierTrust / WeightedConsensus / assess / attest_observation /
 attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
 audit_b / audit_bound /
 audit_bound_policy /
@@ -79,7 +80,7 @@ audit_stream_commit_receipt_span_receipt /
 audit_stream_receipt / audit_stream_receipt_batch_commit_receipt /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
-locate_cert_evidence / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
+locate_cert_evidence / locate_weighted / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
 revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
 seal_evidence_revocation_list_bundle /
 seal_evidence_revocation_list_bundle_receipt_batch /
@@ -106,6 +107,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from statistics import median
+from types import MappingProxyType
 from typing import Callable, Optional
 
 __all__ = [
@@ -139,6 +141,7 @@ __all__ = [
     "CommitRange",
     "CommitRangeAuditor",
     "Consensus",
+    "ConsensusPolicy",
     "ContextRevocation",
     "CrlProof",
     "CrlProofAuditor",
@@ -208,6 +211,7 @@ __all__ = [
     "TrustRevocationList",
     "Verifier",
     "VerifierTrust",
+    "WeightedConsensus",
     "assess",
     "attest_observation",
     "attest_observation_for_point",
@@ -258,6 +262,7 @@ __all__ = [
     "locate_bound_attested",
     "locate_cert",
     "locate_cert_evidence",
+    "locate_weighted",
     "make_crl",
     "make_evidence_revocation_list",
     "prove_crl",
@@ -550,6 +555,82 @@ class Consensus:
 
     total: int
     support: int
+    rejected: tuple[str, ...]
+    accepted: bool
+
+
+@dataclass(frozen=True, init=False, eq=False)
+class ConsensusPolicy:
+    """The declared-trust weights used by :func:`locate_weighted`.
+
+    ``weights`` maps each participating verifier id to its positive integer
+    weight (stored as a read-only mapping copy) and ``threshold`` is the
+    total supporting weight needed for acceptance. The set of weight ids
+    must match the observations' ids exactly and ``threshold`` must not
+    exceed the sum of all weights.
+    """
+
+    weights: Mapping[str, int]
+    threshold: int
+
+    def __init__(self, weights: object, threshold: object) -> None:
+        if not isinstance(weights, Mapping):
+            raise ValueError("weights must be a mapping of id to positive integer")
+        try:
+            items = list(weights.items())
+        except TypeError as error:
+            raise ValueError(
+                "weights must be a mapping of id to positive integer"
+            ) from error
+        checked: dict[str, int] = {}
+        total_weight = 0
+        for ident, weight in items:
+            if not isinstance(ident, str) or not ident:
+                raise ValueError("weight id must be a non-empty string")
+            if ident in checked:
+                raise ValueError(f"duplicate weight id: {ident!r}")
+            if isinstance(weight, bool) or type(weight) is not int or weight < 1:
+                raise ValueError("weight must be a positive integer")
+            checked[ident] = weight
+            total_weight += weight
+        if isinstance(threshold, bool) or type(threshold) is not int or threshold < 1:
+            raise ValueError("threshold must be a positive integer")
+        if threshold > total_weight:
+            raise ValueError("threshold must not exceed the total weight")
+        object.__setattr__(self, "weights", MappingProxyType(checked))
+        object.__setattr__(self, "threshold", threshold)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ConsensusPolicy):
+            return NotImplemented
+        return (
+            self.threshold == other.threshold
+            and dict(self.weights) == dict(other.weights)
+        )
+
+    def __hash__(self) -> int:
+        return hash((tuple(sorted(self.weights.items())), self.threshold))
+
+    def __repr__(self) -> str:
+        return (
+            f"ConsensusPolicy(weights={dict(self.weights)!r}, "
+            f"threshold={self.threshold!r})"
+        )
+
+
+@dataclass(frozen=True)
+class WeightedConsensus:
+    """The outcome of :func:`locate_weighted`.
+
+    ``total_weight`` is the sum of every verifier's declared weight,
+    ``support_weight`` the sum over observations whose disk covers the
+    queried point, ``rejected`` is the lexicographically sorted tuple of
+    the non-supporting verifier ids, and ``accepted`` says whether
+    ``support_weight`` reaches the policy threshold.
+    """
+
+    total_weight: int
+    support_weight: int
     rejected: tuple[str, ...]
     accepted: bool
 
@@ -24633,6 +24714,91 @@ def locate(
         support=support,
         rejected=tuple(rejected),
         accepted=support >= quorum,
+    )
+
+
+def locate_weighted(
+    observations: object,
+    point: object,
+    policy: object,
+    *,
+    tolerance: object = 0.0,
+) -> "WeightedConsensus":
+    """Run a weight-based 2D location consensus over ``observations``.
+
+    Like :func:`locate`, each :class:`Observation` contributes the closed
+    disk ``math.hypot(point[0] - x, point[1] - y) <= upper_bound + tolerance``
+    (the boundary counts as support) and the decision's ``accepted`` flag is
+    ignored. Instead of counting verifiers, the votes are summed with the
+    positive integer weights declared in ``policy``: ``total_weight`` is the
+    sum of every weight, ``support_weight`` the sum over supporting
+    observations, and the result is accepted when ``support_weight`` reaches
+    ``policy.threshold``. The count-based quorum of :func:`locate` is
+    deliberately not reused here.
+
+    ``policy`` must be a :class:`ConsensusPolicy` whose weight ids match the
+    observations' ids exactly. The other contracts are those of
+    :func:`locate` (iterable of :class:`Observation` with unique non-empty
+    string ids, finite non-bool coordinates, finite non-negative
+    ``upper_bound``; ``point`` a tuple of exactly two finite non-bool
+    numbers; ``tolerance`` a finite non-bool non-negative number), except
+    there is no minimum observation count — the policy weights bound the set.
+    Every contract violation raises :class:`ValueError`.
+
+    Contradictory disks surface through the result's ``rejected`` ids
+    (sorted lexicographically), never as an exception. The result is
+    independent of input order and the function does not mutate its inputs.
+    """
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError("tolerance must be a finite non-negative number")
+    slack = float(tolerance)
+    if not math.isfinite(slack) or slack < 0:
+        raise ValueError("tolerance must be a finite non-negative number")
+
+    if not isinstance(point, tuple) or len(point) != 2:
+        raise ValueError("point must be a tuple of exactly two finite numbers")
+    px = _finite_non_bool(point[0])
+    py = _finite_non_bool(point[1])
+
+    if not isinstance(policy, ConsensusPolicy):
+        raise ValueError("policy must be a ConsensusPolicy")
+
+    try:
+        raw_observations = list(observations)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("observations must be an iterable of Observation") from error
+
+    supported: dict[str, bool] = {}
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in supported:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        supported[ident] = math.hypot(px - ox, py - oy) <= bound + slack
+
+    weights = policy.weights
+    if set(supported) != set(weights):
+        raise ValueError("policy weight ids must match the observation ids")
+
+    total_weight = sum(weights.values())
+    support_weight = sum(weight for ident, weight in weights.items() if supported[ident])
+    rejected = tuple(sorted(ident for ident, covers in supported.items() if not covers))
+    return WeightedConsensus(
+        total_weight=total_weight,
+        support_weight=support_weight,
+        rejected=rejected,
+        accepted=support_weight >= policy.threshold,
     )
 
 
