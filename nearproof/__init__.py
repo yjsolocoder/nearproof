@@ -53,7 +53,7 @@ StreamCommitReceiptSpanReceipt /
 StreamReceiptBatchCommitReceipt / StreamReceiptFrontier /
 TrustRevocation /
 TrustRevocationList / Verifier /
-VerifierTrust / WeightedConsensus / assess / attest_observation /
+VerifierTrust / WeightedCertifiedConsensusEvidence / WeightedConsensus / assess / attest_observation /
 attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
 audit_b / audit_bound /
 audit_bound_policy / audit_bound_series /
@@ -79,9 +79,11 @@ audit_stream_commit_receipt_bundle /
 audit_stream_commit_receipt_span /
 audit_stream_commit_receipt_span_receipt /
 audit_stream_receipt / audit_stream_receipt_batch_commit_receipt /
+audit_weighted_cert_evidence /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
-locate_cert_evidence / locate_weighted / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
+locate_cert_evidence / locate_weighted / locate_weighted_cert_evidence /
+make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
 revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
 seal_bound_series /
 seal_evidence_revocation_list_bundle /
@@ -214,6 +216,7 @@ __all__ = [
     "TrustRevocationList",
     "Verifier",
     "VerifierTrust",
+    "WeightedCertifiedConsensusEvidence",
     "WeightedConsensus",
     "assess",
     "attest_observation",
@@ -260,6 +263,7 @@ __all__ = [
     "audit_stream_commit_receipt_span_receipt",
     "audit_stream_receipt",
     "audit_stream_receipt_batch_commit_receipt",
+    "audit_weighted_cert_evidence",
     "cert",
     "locate",
     "locate_attested",
@@ -267,6 +271,7 @@ __all__ = [
     "locate_cert",
     "locate_cert_evidence",
     "locate_weighted",
+    "locate_weighted_cert_evidence",
     "make_crl",
     "make_evidence_revocation_list",
     "prove_crl",
@@ -351,6 +356,8 @@ _BOUND_SERIES_CHAIN_PREFIX = b"NPBS1"
 _BOUND_SERIES_MAC_PREFIX = b"NPBS2"
 # Domain separation prefix for the certified-consensus-evidence MAC.
 _CERT_EVIDENCE_PREFIX = b"NPCCE1"
+# Domain separation prefix for the weighted-certified-consensus-evidence MAC.
+_WEIGHTED_CERT_EVIDENCE_PREFIX = b"NPWCE1"
 # Domain separation prefix for the CRL-snapshot proof MAC.
 _CRL_PROOF_PREFIX = b"NPCCE2"
 # Domain separation prefix for the rollback-protection CRL-state MAC.
@@ -26831,6 +26838,30 @@ def locate_cert(
                         f" the records: {pair[0]!r}"
                     )
 
+    verified = _verify_bound_records_against_trusts(
+        parsed_records, trust_map, revoked_pairs, px, py, context
+    )
+
+    return locate(verified, point, quorum=3, tolerance=0.0)
+
+
+def _verify_bound_records_against_trusts(
+    parsed_records: "list[BoundAttestedObservation]",
+    trust_map: "dict[str, VerifierTrust]",
+    revoked_pairs: "set[tuple[str, bytes]]",
+    px: float,
+    py: float,
+    context: str,
+) -> "list[Observation]":
+    """Certify parsed bound observations against root-verified trust records.
+
+    Shared by :func:`locate_cert` and the weighted certified-consensus path:
+    each record id must be unique and have exactly one trust, a trust whose
+    ``(id, mac)`` pair is revoked is refused, the record MAC is recomputed
+    with that trust's ``key`` in constant time, and the certified
+    ``id``/``x``/``y`` and the queried point/context binding must match.
+    Returns one :class:`Observation` per record, in input order.
+    """
     verified: list[Observation] = []
     seen_ids: set[str] = set()
     for item in parsed_records:
@@ -26869,8 +26900,7 @@ def locate_cert(
         verified.append(
             Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
         )
-
-    return locate(verified, point, quorum=3, tolerance=0.0)
+    return verified
 
 
 _CERT_EVIDENCE_FIELDS = ("version", "body", "mac")
@@ -27186,7 +27216,12 @@ def _require_cert_evidence_hex_array(value: object, name: str) -> list:
     return [_parse_cert_evidence_hex(entry, name) for entry in value]
 
 
-def _parse_evidence_hex_items(raw_items: list, kind: type, name: str) -> list:
+def _parse_evidence_hex_items(
+    raw_items: list,
+    kind: type,
+    name: str,
+    evidence_name: str = "certified consensus evidence",
+) -> list:
     """Decode each hex body item through the record's own byte contract."""
     parsed = []
     for raw in raw_items:
@@ -27194,7 +27229,7 @@ def _parse_evidence_hex_items(raw_items: list, kind: type, name: str) -> list:
             parsed.append(kind.from_bytes(raw))
         except ValueError as error:
             raise ValueError(
-                f"certified consensus evidence {name} must contain only"
+                f"{evidence_name} {name} must contain only"
                 f" canonical {kind.__name__} encodings"
             ) from error
     return parsed
@@ -27266,6 +27301,57 @@ def _build_cert_evidence_body(
     return _encode_payload(body)
 
 
+def _materialize_bound_records(records: object) -> "list[BoundAttestedObservation]":
+    """Materialise a records iterable under the locate_cert mixing rules.
+
+    Each item must be a :class:`BoundAttestedObservation` or its canonical
+    :meth:`BoundAttestedObservation.to_bytes` encoding (mixing allowed);
+    anything else raises :class:`ValueError`, as does a non-iterable input.
+    """
+    try:
+        raw_records = list(records)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "records must be an iterable of BoundAttestedObservation or bytes"
+        ) from error
+    parsed_records: list[BoundAttestedObservation] = []
+    for item in raw_records:
+        if isinstance(item, bytes):
+            item = BoundAttestedObservation.from_bytes(item)
+        if not isinstance(item, BoundAttestedObservation):
+            raise ValueError(
+                "records must contain only BoundAttestedObservation"
+                " instances or bytes"
+            )
+        parsed_records.append(item)
+    return parsed_records
+
+
+def _materialize_trusts(trusts: object) -> "list[VerifierTrust]":
+    """Materialise a trusts iterable under the locate_cert mixing rules.
+
+    Each item must be a :class:`VerifierTrust` or its canonical
+    :meth:`VerifierTrust.to_bytes` encoding (mixing allowed); anything else
+    raises :class:`ValueError`, as does a non-iterable input.
+    """
+    try:
+        raw_trusts = list(trusts)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "trusts must be an iterable of VerifierTrust or bytes"
+        ) from error
+    parsed_trusts: list[VerifierTrust] = []
+    for entry in raw_trusts:
+        if isinstance(entry, bytes):
+            entry = VerifierTrust.from_bytes(entry)
+        if not isinstance(entry, VerifierTrust):
+            raise ValueError(
+                "trusts must contain only VerifierTrust instances or bytes"
+            )
+        parsed_trusts.append(entry)
+    return parsed_trusts
+
+
 def locate_cert_evidence(
     records: object,
     point: object,
@@ -27293,38 +27379,8 @@ def locate_cert_evidence(
     # Materialise the iterables under the same mixing rules as locate_cert
     # before running it, so a one-shot iterable can be re-used to build the
     # body and so the body carries exactly the participating records.
-    try:
-        raw_records = list(records)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "records must be an iterable of BoundAttestedObservation or bytes"
-        ) from error
-    parsed_records: list[BoundAttestedObservation] = []
-    for item in raw_records:
-        if isinstance(item, bytes):
-            item = BoundAttestedObservation.from_bytes(item)
-        if not isinstance(item, BoundAttestedObservation):
-            raise ValueError(
-                "records must contain only BoundAttestedObservation"
-                " instances or bytes"
-            )
-        parsed_records.append(item)
-
-    try:
-        raw_trusts = list(trusts)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "trusts must be an iterable of VerifierTrust or bytes"
-        ) from error
-    parsed_trusts: list[VerifierTrust] = []
-    for entry in raw_trusts:
-        if isinstance(entry, bytes):
-            entry = VerifierTrust.from_bytes(entry)
-        if not isinstance(entry, VerifierTrust):
-            raise ValueError(
-                "trusts must contain only VerifierTrust instances or bytes"
-            )
-        parsed_trusts.append(entry)
+    parsed_records = _materialize_bound_records(records)
+    parsed_trusts = _materialize_trusts(trusts)
 
     consensus = locate_cert(parsed_records, point, context, parsed_trusts, root)
 
@@ -27400,6 +27456,699 @@ def audit_cert_evidence(
         raise ValueError(
             "certified consensus evidence consensus does not match the"
             " recomputed result"
+        )
+    return consensus
+
+
+_WEIGHTED_CERT_EVIDENCE_FIELDS = ("version", "body", "mac")
+_WEIGHTED_CERT_EVIDENCE_BODY_FIELDS = (
+    "point",
+    "context",
+    "records",
+    "trusts",
+    "weights",
+    "threshold",
+    "consensus",
+)
+_WEIGHTED_CONSENSUS_FIELDS = (
+    "total_weight",
+    "support_weight",
+    "rejected",
+    "accepted",
+)
+
+
+def _weighted_cert_evidence_mac(root: bytes, body: bytes) -> bytes:
+    """HMAC-SHA256 over ``b"NPWCE1"`` plus the body bytes, directly concatenated.
+
+    The body bytes are exactly the compact UTF-8 JSON array that sits in the
+    ``body`` field of the outer document; the prefix carries no separator or
+    length prefix.
+    """
+    return hmac.new(
+        root, _WEIGHTED_CERT_EVIDENCE_PREFIX + body, hashlib.sha256
+    ).digest()
+
+
+@dataclass(frozen=True)
+class WeightedCertifiedConsensusEvidence:
+    """A root-MAC'd snapshot of one weighted :func:`locate_cert`-style run.
+
+    ``version`` is always ``1``; ``body`` is ``bytes`` holding the compact
+    UTF-8 JSON array ``[point, context, records, trusts, weights, threshold,
+    consensus]``; ``mac`` is exactly 32 bytes —
+    ``HMAC-SHA256(root, b"NPWCE1" + body)``, the prefix and the body
+    concatenated directly with no separator or length prefix. ``body`` and
+    ``mac`` that are not ``bytes`` (or a ``mac`` of the wrong length) raise
+    :class:`ValueError` at construction time. Instances are frozen,
+    constructed positionally in field order and compare equal by their
+    fields. No root material is stored.
+
+    Inside the body: ``point`` is a bare two-element JSON array of finite
+    non-bool numbers; ``context`` a non-empty string; ``records`` and
+    ``trusts`` are arrays of canonical lowercase hex strings, one per
+    participating :class:`BoundAttestedObservation` and
+    :class:`VerifierTrust`, corresponding uniquely by id (the records are
+    sorted by id, and each trust is placed at the index of the record with
+    the same id); ``weights`` is an object mapping each participating id to
+    its positive integer weight with the ids sorted lexicographically;
+    ``threshold`` the positive integer acceptance threshold; ``consensus``
+    an array in :class:`WeightedConsensus` field order
+    ``[total_weight, support_weight, rejected, accepted]`` with ``rejected``
+    a lexicographically sorted array of ids. The body bytes themselves are
+    opaque to the constructor — :func:`locate_weighted_cert_evidence`
+    produces conforming ones and :meth:`from_bytes` enforces the whole
+    contract.
+    """
+
+    version: int
+    body: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError(
+                "weighted certified consensus evidence version must be 1"
+            )
+        if not isinstance(self.body, bytes):
+            raise ValueError(
+                "weighted certified consensus evidence body must be bytes"
+            )
+        if not isinstance(self.mac, bytes):
+            raise ValueError(
+                "weighted certified consensus evidence mac must be bytes"
+            )
+        if len(self.mac) != 32:
+            raise ValueError(
+                "weighted certified consensus evidence mac must be exactly"
+                " 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: outer keys ``version, body, mac`` in
+        that order, ``body`` and ``mac`` as lowercase hex, no whitespace.
+
+        The opaque ``body`` must itself be canonical compact JSON: decoding
+        it and re-encoding with the canonical encoder must reproduce the
+        stored bytes exactly. A body that is not JSON or whose canonical
+        re-encoding differs (whitespace, pretty-printing, framing or a
+        non-canonical spelling) raises :class:`ValueError`; the instance is
+        frozen, so the stored bytes are never replaced by the re-encoding.
+        """
+        try:
+            decoded_body = json.loads(self.body)
+        except ValueError as error:
+            raise ValueError(
+                "weighted certified consensus evidence body must be compact"
+                " JSON"
+            ) from error
+        try:
+            canonical_body = _encode_payload(decoded_body)
+        except ValueError as error:
+            raise ValueError(
+                "weighted certified consensus evidence body encoding is not"
+                " canonical"
+            ) from error
+        if canonical_body != self.body:
+            raise ValueError(
+                "weighted certified consensus evidence body encoding is not"
+                " canonical"
+            )
+        return _encode_payload(
+            {
+                "version": self.version,
+                "body": self.body.hex(),
+                "mac": self.mac.hex(),
+            }
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "WeightedCertifiedConsensusEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the full field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: an outer object with exactly the keys
+        ``version, body, mac`` once each in that order, ``version == 1``,
+        ``body`` and ``mac`` lowercase hex strings (``mac`` decoding to
+        exactly 32 bytes), a body decoding to exactly the array
+        ``[point, context, records, trusts, weights, threshold,
+        consensus]`` with ``point`` a two-element finite-non-bool-number
+        array, ``context`` a non-empty string, ``records``/``trusts``
+        arrays of canonical lowercase hex strings equal in length and
+        unique one-to-one by the ids parsed out of those encodings (records
+        id-sorted, each trust aligned with the record of the same id),
+        ``weights`` an object whose keys are the participating ids in
+        lexicographic order, each mapping to a positive integer,
+        ``threshold`` a positive integer not exceeding the total weight,
+        and a ``consensus`` array in
+        ``[total_weight, support_weight, rejected, accepted]`` order with
+        non-bool integers, a lexicographically sorted array of non-empty
+        unique id strings for ``rejected``, and a bool ``accepted``. The
+        body itself must be canonical compact JSON, so its own re-encoding
+        must match byte for byte. After parsing and validation the record
+        is re-encoded with :meth:`to_bytes` and the result must equal the
+        input byte for byte, so formatted JSON, whitespace and any
+        non-canonical spelling are rejected as well. Neither the outer MAC
+        nor anything in the body is verified here — use
+        :func:`audit_weighted_cert_evidence` with the root key for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError(
+                "weighted certified consensus evidence data must be bytes"
+            )
+        try:
+            obj = json.loads(data, cls=_OrderedWeightedCertEvidenceObject)
+        except ValueError as error:
+            raise ValueError(
+                "weighted certified consensus evidence is not valid JSON:"
+                f" {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _WEIGHTED_CERT_EVIDENCE_FIELDS
+        ):
+            raise ValueError(
+                "weighted certified consensus evidence must be a JSON object"
+                " with exactly the version, body and mac fields in field"
+                " order"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError(
+                "weighted certified consensus evidence version must be 1"
+            )
+        body = _parse_weighted_cert_evidence_hex(obj["body"], "body")
+        mac = _parse_weighted_cert_evidence_hex(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "weighted certified consensus evidence mac must decode to"
+                " exactly 32 bytes"
+            )
+        _parse_weighted_cert_evidence_body(body)
+        record = cls(version=version, body=body, mac=mac)
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError(
+                "weighted certified consensus evidence encoding is not"
+                " canonical"
+            )
+        return record
+
+
+def _parse_weighted_cert_evidence_hex(value: object, name: str) -> bytes:
+    # Same lowercase, round-tripping hex rule as the other records, but both
+    # shape and value failures are ValueErrors for this record.
+    if not isinstance(value, str):
+        raise ValueError(
+            "weighted certified consensus evidence"
+            f" {name} must be a lowercase hex string"
+        )
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            "weighted certified consensus evidence"
+            f" {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        # Rejects uppercase digits, separators and odd-length input that
+        # bytes.fromhex would otherwise tolerate.
+        raise ValueError(
+            "weighted certified consensus evidence"
+            f" {name} must be a lowercase hex string"
+        )
+    return raw
+
+
+class _OrderedWeightedCertEvidenceObject(json.JSONDecoder):
+    """JSON decoder rejecting duplicate/out-of-order keys at both layers.
+
+    The outer object must carry exactly ``version, body, mac``; the body
+    array carries the weights object and, indirectly via hex strings, the
+    records/trusts whose own key order their ``from_bytes`` checks, so the
+    only object key set enforced at this layer is the outer one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys == list(_WEIGHTED_CERT_EVIDENCE_FIELDS):
+            return dict(pairs)
+        raise ValueError(
+            "weighted certified consensus evidence JSON keys must be exactly"
+            " version, body and mac in field order"
+        )
+
+
+class _OrderedWeightedCertEvidenceBodyObject(json.JSONDecoder):
+    """Body-layer decoder that rejects duplicate keys in the weights object.
+
+    The body is an array whose only nested JSON object is ``weights``; a
+    plain ``json.loads`` silently keeps the last value of a duplicated key,
+    so reject any repeated key within a nested object before the weights
+    contract (exact id set, lexicographic order) is checked.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if len(keys) != len(set(keys)):
+            raise ValueError(
+                "weighted certified consensus evidence body objects must not"
+                " contain duplicate keys"
+            )
+        return dict(pairs)
+
+
+def _parse_weighted_cert_evidence_body(body: bytes) -> list:
+    """Parse and validate the body array, returning the decoded list.
+
+    The body is the inner compact-JSON layer: it must itself be the
+    canonical encoding of the decoded structure (a re-encoding must match
+    byte for byte), and every embedded record/trust hex string must decode
+    through that record's own byte contract.
+    """
+    try:
+        decoded = json.loads(body, cls=_OrderedWeightedCertEvidenceBodyObject)
+    except ValueError as error:
+        raise ValueError(
+            "weighted certified consensus evidence body must be compact JSON"
+        ) from error
+    if not isinstance(decoded, list) or len(decoded) != len(
+        _WEIGHTED_CERT_EVIDENCE_BODY_FIELDS
+    ):
+        raise ValueError(
+            "weighted certified consensus evidence body must be an array of"
+            " exactly point, context, records, trusts, weights, threshold"
+            " and consensus"
+        )
+    (
+        raw_point,
+        raw_context,
+        raw_records,
+        raw_trusts,
+        raw_weights,
+        raw_threshold,
+        raw_consensus,
+    ) = decoded
+    if (
+        not isinstance(raw_point, list)
+        or len(raw_point) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in raw_point
+        )
+    ):
+        raise ValueError(
+            "weighted certified consensus evidence point must be an array of"
+            " exactly two finite non-bool numbers"
+        )
+    if not isinstance(raw_context, str) or not raw_context:
+        raise ValueError(
+            "weighted certified consensus evidence context must be a"
+            " non-empty string"
+        )
+    record_blobs = _require_weighted_cert_evidence_hex_array(
+        raw_records, "records"
+    )
+    trust_blobs = _require_weighted_cert_evidence_hex_array(
+        raw_trusts, "trusts"
+    )
+    parsed_records = _parse_evidence_hex_items(
+        record_blobs,
+        BoundAttestedObservation,
+        "records",
+        "weighted certified consensus evidence",
+    )
+    parsed_trusts = _parse_evidence_hex_items(
+        trust_blobs,
+        VerifierTrust,
+        "trusts",
+        "weighted certified consensus evidence",
+    )
+    record_ids = [item.id for item in parsed_records]
+    trust_ids = [item.id for item in parsed_trusts]
+    if len(set(record_ids)) != len(record_ids):
+        raise ValueError(
+            "weighted certified consensus evidence records must have unique"
+            " ids"
+        )
+    if len(set(trust_ids)) != len(trust_ids):
+        raise ValueError(
+            "weighted certified consensus evidence trusts must have unique"
+            " ids"
+        )
+    if sorted(record_ids) != record_ids:
+        # The canonical producer orders the records by id and aligns the
+        # trusts at the same index order.
+        raise ValueError(
+            "weighted certified consensus evidence records must be sorted by"
+            " id"
+        )
+    if trust_ids != record_ids:
+        # The two arrays correspond one-to-one by id at every index: an
+        # unknown, missing or reordered trust is a contract breach rather
+        # than a silent ignore.
+        raise ValueError(
+            "weighted certified consensus evidence records and trusts must"
+            " correspond one-to-one by id in the same order"
+        )
+    weights = _parse_weighted_cert_evidence_weights(raw_weights, record_ids)
+    total_weight = sum(weights.values())
+    if type(raw_threshold) is not int or raw_threshold < 1:
+        raise ValueError(
+            "weighted certified consensus evidence threshold must be a"
+            " positive integer"
+        )
+    if raw_threshold > total_weight:
+        raise ValueError(
+            "weighted certified consensus evidence threshold must not exceed"
+            " the total weight"
+        )
+    _parse_weighted_cert_evidence_consensus(raw_consensus)
+    if _encode_payload(decoded) != body:
+        # The inner layer is canonical compact JSON too: no whitespace,
+        # pretty-printing, framing or non-canonical number/string spellings.
+        raise ValueError(
+            "weighted certified consensus evidence body encoding is not"
+            " canonical"
+        )
+    return decoded
+
+
+def _require_weighted_cert_evidence_hex_array(value: object, name: str) -> list:
+    if not isinstance(value, list):
+        raise ValueError(
+            "weighted certified consensus evidence"
+            f" {name} must be an array of lowercase hex strings"
+        )
+    return [
+        _parse_weighted_cert_evidence_hex(entry, name) for entry in value
+    ]
+
+
+def _parse_weighted_cert_evidence_weights(
+    value: object, ids: list[str]
+) -> dict[str, int]:
+    """Validate the body weights object against the participating ids.
+
+    The keys must be exactly the participating ids, in lexicographic order
+    with no duplicates, and every weight a positive non-bool integer.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(
+            "weighted certified consensus evidence weights must be an object"
+            " mapping id to positive integer weight"
+        )
+    ordered_ids = sorted(ids)
+    if list(value) != ordered_ids:
+        # json.loads rejects duplicate keys only via an object_pairs_hook;
+        # the plain parse keeps the last value, so this check plus the
+        # lexicographic-order requirement also closes that hole (a missing,
+        # extra, duplicated or out-of-order key cannot match the id list).
+        raise ValueError(
+            "weighted certified consensus evidence weights must map exactly"
+            " the participating ids in lexicographic order"
+        )
+    weights: dict[str, int] = {}
+    for ident, weight in value.items():
+        if not isinstance(ident, str) or not ident:
+            raise ValueError(
+                "weighted certified consensus evidence weight id must be a"
+                " non-empty string"
+            )
+        if type(weight) is not int or weight < 1:
+            raise ValueError(
+                "weighted certified consensus evidence weight must be a"
+                " positive integer"
+            )
+        weights[ident] = weight
+    return weights
+
+
+def _parse_weighted_cert_evidence_consensus(value: object) -> None:
+    if not isinstance(value, list) or len(value) != len(
+        _WEIGHTED_CONSENSUS_FIELDS
+    ):
+        raise ValueError(
+            "weighted certified consensus evidence consensus must be an array"
+            " of exactly total_weight, support_weight, rejected and accepted"
+        )
+    raw_total, raw_support, raw_rejected, raw_accepted = value
+    for field_name, number in (
+        ("total_weight", raw_total),
+        ("support_weight", raw_support),
+    ):
+        if type(number) is not int:
+            raise ValueError(
+                "weighted certified consensus evidence consensus"
+                f" {field_name} must be a non-bool integer"
+            )
+    if not isinstance(raw_rejected, list) or any(
+        not isinstance(ident, str) or not ident for ident in raw_rejected
+    ):
+        raise ValueError(
+            "weighted certified consensus evidence consensus rejected must be"
+            " an array of non-empty strings"
+        )
+    if list(raw_rejected) != sorted(raw_rejected):
+        raise ValueError(
+            "weighted certified consensus evidence consensus rejected must be"
+            " sorted lexicographically"
+        )
+    if len(set(raw_rejected)) != len(raw_rejected):
+        raise ValueError(
+            "weighted certified consensus evidence consensus rejected must"
+            " contain no duplicates"
+        )
+    if type(raw_accepted) is not bool:
+        raise ValueError(
+            "weighted certified consensus evidence consensus accepted must be"
+            " a bool"
+        )
+
+
+def _build_weighted_cert_evidence_body(
+    point: tuple[float, float],
+    context: str,
+    records: "list[BoundAttestedObservation]",
+    trusts: "dict[str, VerifierTrust]",
+    policy: ConsensusPolicy,
+    consensus: "WeightedConsensus",
+) -> bytes:
+    """Assemble the canonical body bytes for one weighted cert run.
+
+    Records are sorted by id and the trusts are placed in the same id order,
+    so the two arrays correspond one-to-one at each index; both are encoded
+    through their own canonical byte encodings and carried as lowercase hex
+    strings. The weights object carries the same ids in lexicographic order.
+    """
+    ordered_records = sorted(records, key=lambda item: item.id)
+    body = [
+        [point[0], point[1]],
+        context,
+        [item.to_bytes().hex() for item in ordered_records],
+        [trusts[item.id].to_bytes().hex() for item in ordered_records],
+        {ident: policy.weights[ident] for ident in sorted(policy.weights)},
+        policy.threshold,
+        [
+            consensus.total_weight,
+            consensus.support_weight,
+            list(consensus.rejected),
+            consensus.accepted,
+        ],
+    ]
+    return _encode_payload(body)
+
+
+def _run_weighted_cert(
+    records: object,
+    point: object,
+    context: object,
+    trusts: object,
+    policy: object,
+    root: bytes,
+) -> "tuple[WeightedConsensus, list[BoundAttestedObservation], dict[str, VerifierTrust]]":
+    """Certify the inputs and tally the verified records by weight.
+
+    Shared core of :func:`locate_weighted_cert_evidence` and
+    :func:`audit_weighted_cert_evidence`: validates the query and policy
+    contracts, materialises the mixed object/bytes iterables, rechecks
+    every trust root MAC and every record MAC (with the id/x/y and query
+    bindings), then runs the :func:`locate_weighted` tally. Returns the
+    weighted consensus alongside the parsed records and trust map so the
+    producer can freeze them into a body.
+    """
+    if not isinstance(point, tuple) or len(point) != 2:
+        raise ValueError("point must be a tuple of exactly two finite numbers")
+    px = _finite_non_bool(point[0])
+    py = _finite_non_bool(point[1])
+    if not isinstance(context, str) or not context:
+        raise ValueError("context must be a non-empty string")
+    if not isinstance(policy, ConsensusPolicy):
+        raise ValueError("policy must be a ConsensusPolicy")
+
+    parsed_records = _materialize_bound_records(records)
+    parsed_trusts = _materialize_trusts(trusts)
+
+    trust_map: dict[str, VerifierTrust] = {}
+    for entry in parsed_trusts:
+        ident = entry.id
+        if ident in trust_map:
+            raise ValueError(f"duplicate trust id: {ident!r}")
+        if not hmac.compare_digest(
+            _trust_mac(root, _trust_payload(entry)), entry.mac
+        ):
+            raise ValueError(f"verifier trust mac does not match: {ident!r}")
+        trust_map[ident] = entry
+
+    verified = _verify_bound_records_against_trusts(
+        parsed_records, trust_map, set(), px, py, context
+    )
+
+    consensus = locate_weighted(verified, point, policy)
+    return consensus, parsed_records, trust_map
+
+
+def locate_weighted_cert_evidence(
+    records: object,
+    point: object,
+    context: object,
+    trusts: object,
+    policy: object,
+    root: object,
+) -> WeightedCertifiedConsensusEvidence:
+    """Certify bound observations under root and tally them by weight.
+
+    The records, trusts, point, context and ``root`` arguments follow the
+    same mixing and certification rules as :func:`locate_cert`: records is
+    an iterable of :class:`BoundAttestedObservation` instances and/or their
+    canonical bytes (mixing allowed), trusts an iterable of
+    :class:`VerifierTrust` instances and/or bytes, and every trust root MAC
+    is rechecked under ``root``, every record MAC under its trust key, with
+    the certified id/x/y and the queried point/context binding enforced.
+    ``root`` must be non-empty ``bytes`` (a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`).
+
+    Unlike :func:`locate_cert` there is no fixed three-verifier quorum: the
+    verified observations are tallied exactly as in
+    :func:`locate_weighted` — the closed-disk boundary counts as support,
+    ``decision.accepted`` is ignored, ``rejected`` is lexicographically
+    sorted, a single verifier may participate, and the result is accepted
+    only when the supporting weight reaches ``policy.threshold``.
+    ``policy`` must be a :class:`ConsensusPolicy` whose weight ids match the
+    observations' ids exactly. On success the :class:`WeightedConsensus` is
+    returned wrapped in a :class:`WeightedCertifiedConsensusEvidence` whose
+    body carries the queried point and context, the participating records
+    and trusts (records sorted by id, trusts aligned one-to-one by id, both
+    as canonical lowercase hex strings), the weights (ids lexicographically
+    ordered), the threshold and the weighted consensus; the MAC is
+    ``HMAC-SHA256(root, b"NPWCE1" + body)``. The result is independent of
+    input order and the function is pure.
+    """
+    root = _require_root(root)
+    consensus, parsed_records, trust_map = _run_weighted_cert(
+        records, point, context, trusts, policy, root
+    )
+
+    body = _build_weighted_cert_evidence_body(
+        point,  # type: ignore[arg-type]
+        context,  # type: ignore[arg-type]
+        parsed_records,
+        trust_map,
+        policy,  # type: ignore[arg-type]
+        consensus,
+    )
+    return WeightedCertifiedConsensusEvidence(
+        version=1,
+        body=body,
+        mac=_weighted_cert_evidence_mac(root, body),
+    )
+
+
+def audit_weighted_cert_evidence(
+    x: "WeightedCertifiedConsensusEvidence | bytes",
+    root: object,
+) -> "WeightedConsensus":
+    """Authenticate a :class:`WeightedCertifiedConsensusEvidence` and rerun it.
+
+    Accepts the evidence itself or its canonical
+    :meth:`WeightedCertifiedConsensusEvidence.to_bytes` encoding; anything
+    else, or any encoding that does not satisfy the record contract, raises
+    :class:`ValueError`. ``root`` must be non-empty ``bytes`` (a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`).
+    The outer MAC is recomputed as
+    ``HMAC-SHA256(root, b"NPWCE1" + body)`` and compared in constant time;
+    a mismatch raises :class:`ValueError`. The body is then parsed and the
+    certification is rerun over exactly the records, trusts, point and
+    context it carries (every record and trust MAC rechecked), the policy
+    rebuilt from the carried weights and threshold, and the weighted tally
+    recomputed; the result must equal the carried :class:`WeightedConsensus`
+    field by field — including the lexicographically sorted ``rejected``
+    tuple — or :class:`ValueError` is raised. On success the rerun
+    :class:`WeightedConsensus` is returned.
+    """
+    root = _require_root(root)
+    if isinstance(x, bytes):
+        evidence = WeightedCertifiedConsensusEvidence.from_bytes(x)
+    elif isinstance(x, WeightedCertifiedConsensusEvidence):
+        evidence = x
+    else:
+        raise ValueError(
+            "weighted certified consensus evidence must be a"
+            " WeightedCertifiedConsensusEvidence instance or bytes"
+        )
+    if not hmac.compare_digest(
+        _weighted_cert_evidence_mac(root, evidence.body), evidence.mac
+    ):
+        raise ValueError(
+            "weighted certified consensus evidence mac does not match"
+        )
+    parsed = _parse_weighted_cert_evidence_body(evidence.body)
+    (
+        raw_point,
+        raw_context,
+        raw_records,
+        raw_trusts,
+        raw_weights,
+        raw_threshold,
+        raw_consensus,
+    ) = parsed
+    record_blobs = [
+        _parse_weighted_cert_evidence_hex(entry, "records")
+        for entry in raw_records
+    ]
+    trust_blobs = [
+        _parse_weighted_cert_evidence_hex(entry, "trusts")
+        for entry in raw_trusts
+    ]
+    point = (raw_point[0], raw_point[1])
+    # Rebuilding the policy through ConsensusPolicy re-enforces every
+    # weight and threshold rule against the authenticated body rather than
+    # trusting the already-parsed values.
+    policy = ConsensusPolicy(dict(raw_weights), raw_threshold)
+    consensus, _records, _trusts = _run_weighted_cert(
+        record_blobs, point, raw_context, trust_blobs, policy, root
+    )
+    carried = WeightedConsensus(
+        total_weight=raw_consensus[0],
+        support_weight=raw_consensus[1],
+        rejected=tuple(raw_consensus[2]),
+        accepted=raw_consensus[3],
+    )
+    if carried != consensus:
+        raise ValueError(
+            "weighted certified consensus evidence consensus does not match"
+            " the recomputed result"
         )
     return consensus
 

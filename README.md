@@ -173,6 +173,11 @@ python3 -m nearproof
   - `from_bytes(data)` — 双层均按紧凑 UTF-8 JSON 校验并重编码逐字节比对；非 bytes 或任一层不合契约一律抛 `ValueError`（不验 MAC）
 - `locate_cert_evidence(records, point, context, trusts, root) -> CertifiedConsensusEvidence` — 跑一次 `locate_cert`（无撤销选项）并把结果与参与项封进证据；参与记录按 id 排序、信任按 id 同序对齐，均为规范字节编码的小写十六进制（见下）
 - `audit_cert_evidence(x, root) -> Consensus` — 收证据对象或字节；恒时验证 `HMAC-SHA256(root, b"NPCCE1" + body)`，再用 body 内的参与项重跑 `locate_cert`，重算 `Consensus` 与 body 所载逐字段相等，否则抛 `ValueError`；成功返回重算的 `Consensus`
+- `WeightedCertifiedConsensusEvidence(version, body, mac)` — 根密钥 MAC 的冻结**加权**共识证据（`version=1`；`body` 为 bytes，`mac` 恰 32 字节 bytes，否则 `ValueError`；见下）；按字段序位置构造、冻结且按字段相等
+  - `to_bytes()` — 外层键序固定 `version, body, mac`，`body`/`mac` 为小写十六进制，双层紧凑 UTF-8 JSON 无空白；`body` 规范重编码须与原字节逐字节相等，否则抛 `ValueError` 且不改写
+  - `from_bytes(data)` — 非 bytes 或任一层不合契约（含权重键缺失/多余/重复/乱序、非法权重或 threshold）一律抛 `ValueError`（不验 MAC）
+- `locate_weighted_cert_evidence(records, point, context, trusts, policy, root) -> WeightedCertifiedConsensusEvidence` — 按 `locate_cert` 验签证书与绑定观察（根 MAC、观测 MAC、id/坐标/查询绑定），再按 `locate_weighted` 用 `ConsensusPolicy` 计票（闭圆盘边界计入、`accepted` 不参与、单个验证者可参与、支持权重达 threshold 才接受）；参与记录按 id 排序、信任按 id 同序对齐，权重按 id 字典序放入 body（见下）
+- `audit_weighted_cert_evidence(x, root) -> WeightedConsensus` — 收证据对象或字节；恒时验证 `HMAC-SHA256(root, b"NPWCE1" + body)`，再按 body 重跑认证与加权判定，重算 `WeightedConsensus` 与 body 所载逐字段相等；`root` 非 bytes 抛 `TypeError`，空 bytes 及其他错误（坏编码、篡改、错误 root、重复/缺失 id、信任与观测不匹配、policy 与 id 不一致、非法权重或 threshold、点或 context 不符）一律抛 `ValueError`；成功返回重算的 `WeightedConsensus`
 - `CrlProof(version, body, mac)` — 根密钥 MAC 的冻结 CRL 快照证明（`version=1`；`body` 为 bytes，`mac` 恰 32 字节 bytes，否则 `ValueError`；按字段序位置构造、冻结且按字段相等）
   - `to_bytes()` — 外层键序固定 `version, body, mac`，`body`/`mac` 为小写十六进制，双层紧凑 UTF-8 JSON 无空白；与 `CertifiedConsensusEvidence` 一样，`body` 规范重编码须与原字节逐字节相等，否则抛 `ValueError` 且不改写
   - `from_bytes(data)` — 非 bytes 或任一层不合契约一律抛 `ValueError`（不验 MAC）；外层须恰为 `version, body, mac`；body 解码为数组 `[point, context, records, trusts, crl, now, min, consensus]`：`point` 为两个有限非布尔数的数组、`context` 为非空字符串、`records`/`trusts` 为规范小写 hex 数组（参与项 id 升序、按 id 一一对应）、`crl` 为规范 `TrustRevocationList` 字节的小写 hex、`now` 为有限非布尔数、`min` 为非布尔整数、`consensus` 为 `[total, support, rejected, accepted]`（`rejected` 按字典序）
@@ -974,6 +979,35 @@ evidence = locate_cert_evidence(records, (0.0, 0.0), context, trusts, root)
 blob = evidence.to_bytes()                 # 可持久化或分发
 consensus = audit_cert_evidence(blob, root)
 consensus.accepted                         # True
+```
+
+### 根认证的加权共识证据 `WeightedCertifiedConsensusEvidence`、`locate_weighted_cert_evidence` 与 `audit_weighted_cert_evidence`
+
+`WeightedCertifiedConsensusEvidence(version, body, mac)` 是根密钥 MAC 的冻结**加权共识证据**：`locate_weighted` 按 `ConsensusPolicy` 对 `Observation` 加权，而本证据先按 `locate_cert` 的信任链认证 `BoundAttestedObservation` 与 `VerifierTrust`（不再受 `locate_cert` 固定三人共识约束——单个验证者即可参与），审计后返回与 `locate_weighted` 相同的 `WeightedConsensus`，既有行为不变。字段契约、冻结/相等/位置构造语义与 `CertifiedConsensusEvidence` 相同（`version=1`；`body` 为 `bytes`；`mac` 恰 32 字节 `bytes`；构造时违约抛 `ValueError`）。
+
+**双层紧凑 JSON**。外层与共识证据相同：键序固定 `version, body, mac`，`body`/`mac` 为小写十六进制，无空白、无长度前缀。`body` 解码后必须恰为数组 `[point, context, records, trusts, weights, threshold, consensus]`：
+
+- `point`/`context`/`records`/`trusts` 规则同共识证据：`point` 为两个有限非布尔数的数组、`context` 非空字符串，两数组为规范小写 hex 且记录按 id 升序、信任同索引按 id 一一对应；
+- `weights` 为一个 JSON 对象，键恰为全部参与 id、按字典序排列、无重复，每个值为正整数权重；
+- `threshold` 为不超过总权重的正整数；
+- `consensus` 按 `WeightedConsensus` 字段序为数组 `[total_weight, support_weight, rejected, accepted]`，前两项为非布尔整数，`rejected` 为字典序、不重复的非空字符串数组，`accepted` 为布尔值。
+
+内层规范重编码逐字节比对、`to_bytes()` 不改写非规范 `body`、`from_bytes()` 只收 `bytes` 且不验 MAC 等规则均与 `CertifiedConsensusEvidence` 一致；权重对象的重复键、乱序键、缺失/多余 id，以及非规范数字（如 `1.0` 写进整数字段）一律在解码时抛 `ValueError`。
+
+`locate_weighted_cert_evidence(records, point, context, trusts, policy, root)` 的记录、信任、点、context 与 root 参数沿用 `locate_cert` 的混输与认证规则（对象或规范字节、生成器均可）：每张信任的 root MAC 以 `root` 恒时重算，每条观测以其信任密钥恒时重算 MAC，并强制认证 id/x/y 与查询点、context 绑定（坏编码、重复或缺失 id、错误 root、信任与观测不匹配、点或 context 不符均抛 `ValueError`；`root` 非 bytes 抛 `TypeError`）。认证后的观测随即按 `locate_weighted` 计票：闭圆盘边界算支持，`decision.accepted` 不参与，拒绝 id 按字典序排列，支持权重达到 `policy.threshold` 才 accepted；`policy` 必须是 `ConsensusPolicy`，其权重 id 与观测 id 必须严格一致（非法权重或 threshold、id 不一致抛 `ValueError`）。成功后以排序记录、对齐信任、字典序权重、threshold 与 `WeightedConsensus` 组成 `body`，计算 `mac = HMAC-SHA256(root, b"NPWCE1" + body)`——直拼无分隔符、无长度前缀，证据不保存 root；结果与输入顺序无关，函数纯计算。
+
+`audit_weighted_cert_evidence(x, root) -> WeightedConsensus` 收证据对象或其规范字节（其他类型或坏编码抛 `ValueError`）；`root` 必须是非空 `bytes`——仅 root 不是 bytes 时按 `locate_cert` 的既有规则抛 `TypeError`，空 bytes 抛 `ValueError`。先恒时复核外层 MAC，不符抛 `ValueError`；MAC 通过后解码 `body`，由所载权重与 threshold 重建 `ConsensusPolicy`（非法权重或 threshold、重复/缺失 id、policy 与 id 不一致在此拒绝），再用所载记录、信任、点与 context **重跑认证与加权判定**（每张证书 MAC、每条观测 MAC 全部重新恒时核验），重算的 `WeightedConsensus` 必须与 body 所载逐字段相等（含字典序 `rejected` 元组），否则抛 `ValueError`。即使持有者知道 root，篡改点、context、参与项、权重、threshold 或共识后重新签名，重算不一致仍会被拒。成功返回重算的 `WeightedConsensus`。
+
+```python
+from nearproof import ConsensusPolicy
+from nearproof import locate_weighted_cert_evidence, audit_weighted_cert_evidence
+
+policy = ConsensusPolicy({"a": 1, "b": 2, "c": 4}, threshold=5)
+evidence = locate_weighted_cert_evidence(records, (0.0, 0.0), context,
+                                         trusts, policy, root)
+consensus = audit_weighted_cert_evidence(evidence.to_bytes(), root)
+consensus.support_weight                    # 7
+consensus.accepted                          # True
 ```
 
 ### CRL 快照证明 `CrlProof`、`prove_crl` 与 `audit_proof`
