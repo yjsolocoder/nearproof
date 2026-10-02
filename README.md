@@ -180,6 +180,8 @@ python3 -m nearproof
   - `from_bytes(data)` — 双层均按紧凑 UTF-8 JSON 校验并重编码逐字节比对；非 bytes 或任一层不合契约一律抛 `ValueError`（不验 MAC）
 - `locate_cert_evidence(records, point, context, trusts, root) -> CertifiedConsensusEvidence` — 跑一次 `locate_cert`（无撤销选项）并把结果与参与项封进证据；参与记录按 id 排序、信任按 id 同序对齐，均为规范字节编码的小写十六进制（见下）
 - `audit_cert_evidence(x, root) -> Consensus` — 收证据对象或字节；恒时验证 `HMAC-SHA256(root, b"NPCCE1" + body)`，再用 body 内的参与项重跑 `locate_cert`，重算 `Consensus` 与 body 所载逐字段相等，否则抛 `ValueError`；成功返回重算的 `Consensus`
+- `audit_cert_evidence_policy(x, root, *, now=None, max_age=None, trust_revocations=None, observation_revocations=None, observation_revocation_list=None, min=0) -> Consensus` — 先完整跑 `audit_cert_evidence`（其全部 MAC/格式/重算检查与 `TypeError`/`ValueError` 划分不变）；四个策略参数均缺省时与之**逐项一致**、不读时钟（`now`/`min` 被忽略）。任一启用则 `now` 必填且 `now`/`max_age` 为有限非布尔数、`max_age` 非负，按每条观察 `issued_at` 检查闭区间 `0 <= now - issued_at <= max_age`；信任撤销收 `TrustRevocation`/其字节的可迭代对象或单个 `TrustRevocationList`（对象或字节，按 `min` 查 `sequence`），用证据内对应证书重验，错误密钥/篡改/重复对/未来时间/未知证书（legacy 路径）抛 `ValueError`，命中永久拒绝；观察撤销收 `ObservationRevocation`/字节集合及可选 `ObservationRevocationList`（对象或字节，两类来源可叠加），用证据内同 id 信任密钥重验，命中仅拒绝 `issued_at <= revoked_at` 的同 id 观察、严格晚于者保留。仅 root 非 bytes 抛 `TypeError`；纯函数
+- `audit_weighted_cert_evidence_policy(x, root, *, now=None, max_age=None, trust_revocations=None, observation_revocations=None, observation_revocation_list=None, min=0) -> WeightedConsensus` — 加权版本的 `audit_cert_evidence_policy`：基线复核为 `audit_weighted_cert_evidence`（`NPWCE1` 外层 MAC 与加权重算），其余时效/信任撤销/观察撤销规则与异常划分完全相同；成功返回重算的 `WeightedConsensus`
 - `CrlProof(version, body, mac)` — 根密钥 MAC 的冻结 CRL 快照证明（`version=1`；`body` 为 bytes，`mac` 恰 32 字节 bytes，否则 `ValueError`；按字段序位置构造、冻结且按字段相等）
   - `to_bytes()` — 外层键序固定 `version, body, mac`，`body`/`mac` 为小写十六进制，双层紧凑 UTF-8 JSON 无空白；与 `CertifiedConsensusEvidence` 一样，`body` 规范重编码须与原字节逐字节相等，否则抛 `ValueError` 且不改写
   - `from_bytes(data)` — 非 bytes 或任一层不合契约一律抛 `ValueError`（不验 MAC）；外层须恰为 `version, body, mac`；body 解码为数组 `[point, context, records, trusts, crl, now, min, consensus]`：`point` 为两个有限非布尔数的数组、`context` 为非空字符串、`records`/`trusts` 为规范小写 hex 数组（参与项 id 升序、按 id 一一对应）、`crl` 为规范 `TrustRevocationList` 字节的小写 hex、`now` 为有限非布尔数、`min` 为非布尔整数、`consensus` 为 `[total, support, rejected, accepted]`（`rejected` 按字典序）
@@ -1007,6 +1009,50 @@ evidence = locate_cert_evidence(records, (0.0, 0.0), context, trusts, root)
 blob = evidence.to_bytes()                 # 可持久化或分发
 consensus = audit_cert_evidence(blob, root)
 consensus.accepted                         # True
+```
+
+### 冻结共识证据的时效与撤销复核 `audit_cert_evidence_policy`
+
+冻结证据只证明“生成那一刻”的密码学事实；长期保存后还需回答“它现在还有效吗”。`audit_cert_evidence_policy(x, root, *, now=None, max_age=None, trust_revocations=None, observation_revocations=None, observation_revocation_list=None, min=0)` 在 `audit_cert_evidence` 的全部密码学、规范编码与共识重算检查**完全不变**的基础上，增加可选的时效与撤销判定。证据格式、签名前缀（`NPCCE1`）、构造函数与旧入口均保持不变，不增加任何落盘格式——策略输入都是既有撤销记录类型。
+
+- **未启用任何策略参数**（四个参数全为默认）时不做额外检查：调用与 `audit_cert_evidence` **逐字段一致**、返回同样的 `Consensus`，`now`/`min` 被完全忽略且不读取任何时钟。
+- 基线复核**始终先跑**：外层 MAC、body 契约、`locate_cert` 重算与所载共识一致性任一失败，先于一切策略检查抛 `ValueError`；`root` 非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError` 的划分也与旧入口一致。
+- 启用 `max_age` 或任一撤销参数时 **`now` 必填**：`now` 与 `max_age` 必须是有限非布尔数（布尔、字符串、`NaN`/`Infinity` 均拒），且 `max_age` 非负。对证据内**每条**观察的 `issued_at` 检查闭区间 `0 <= now - issued_at <= max_age`——未来时间（负年龄）与超龄都抛 `ValueError`，两个边界（含相等）均有效。
+- **信任撤销**（`trust_revocations`）可以是逐批 `TrustRevocation` 对象和/或其规范字节的可迭代对象，也可以是单个 `TrustRevocationList` 快照（对象或规范字节）。legacy 形式逐条用同一 `root` 重算 `NPVR1` MAC 并恒时比较，重复 `(id, target)` 对、错误密钥、任何篡改均抛 `ValueError`，且每条合规签名的撤销必须命中证据实际携带的某张证书（未知 id、同 id 的另一张证书、未使用证书都抛 `ValueError`）；快照形式用 `audit_crl` 整体认证（列表层 `NPVRL1` 与每条 entry 的 `NPVR1` 双层 MAC、`issued_at <= now`、`sequence >= min`），快照是全局的，只有命中参与证书的条目生效、无关条目不报错。命中信任撤销即**永久拒绝**整份证据——被 root 撤销的证书永远不能支撑该证据。
+- **观察撤销**有两类可叠加来源：`observation_revocations` 是 `ObservationRevocation` 对象和/或规范字节的集合，逐条用证据内**同 id 验证者信任证书携带的密钥**重算 MAC（无需另传 key map），重复 id、未知 id、错误密钥、篡改、`revoked_at > now`（未来撤销）均抛 `ValueError`；`observation_revocation_list` 是单个 `ObservationRevocationList`（对象或字节），用 `audit_observation_crl` 在 `root` 与证据内信任密钥下整体认证（列表层 `NPORL1` 与每条 entry MAC、`issued_at`/`revoked_at` 未来时间、`sequence >= min`），故列表中出现证据未知 id 也会被拒。两来源命中同一 id 时取**更晚**的 `revoked_at`。观察撤销只拒绝 `issued_at <= revoked_at` 的同 id 观察；`issued_at` **严格晚于**撤销时间的观察保留并照常参与几何聚合与时效检查。
+- 除 root 类型错误抛 `TypeError` 外，其余违约（参数形状、格式、MAC、重复、未来时间、未知证书、共识重算不一致等）一律抛 `ValueError`。入口是纯函数：不读取也不修改任何验证者状态。
+
+`audit_weighted_cert_evidence_policy(x, root, *, ...)` 是加权版本：参数、策略规则与异常划分完全相同，只是基线复核换成 `audit_weighted_cert_evidence`（外层前缀 `NPWCE1`，按 body 内权重/threshold 完整重跑加权计票），成功时返回重算的 `WeightedConsensus`。
+
+```python
+from nearproof import (
+    audit_cert_evidence_policy, make_crl, make_observation_crl,
+    revoke_trust, revoke_observation,
+)
+
+# 时效：证据内观察都必须在 [now - max_age, now] 内签发
+audit_cert_evidence_policy(blob, root, now=100.0, max_age=10.0)
+
+# 信任撤销快照（全局清单，只有命中参与证书才生效；这里清单只撤销
+# 其他证书，故复核通过）+ 序号下限
+other_trust = cert("d", 50.0, 50.0, b"\xdd" * 32, root)
+audit_cert_evidence_policy(
+    blob, root, now=100.0,
+    trust_revocations=make_crl([revoke_trust(other_trust, root)], seq=7,
+                               time=99.0, root=root),
+    min=7,
+)
+
+# 观察撤销：逐批集合与签名快照两类来源可叠加；issued_at 严格晚于
+# revoked_at 的观察保留
+audit_cert_evidence_policy(
+    blob, root, now=100.0,
+    observation_revocations=[revoke_observation("a", 50.0, key_a)],
+    observation_revocation_list=make_observation_crl(
+        [revoke_observation("b", 40.0, key_b)], sequence=3, issued_at=99.0,
+        root=root,
+    ),
+)
 ```
 
 ### CRL 快照证明 `CrlProof`、`prove_crl` 与 `audit_proof`
