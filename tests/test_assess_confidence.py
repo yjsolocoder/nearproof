@@ -199,6 +199,64 @@ class MadZeroTest(unittest.TestCase):
         self.assertEqual(decision.upper_bound, 5.0)
 
 
+class HugeDistanceOverflowTest(unittest.TestCase):
+    """Even-count medians of huge finite distances must not overflow."""
+
+    def test_six_max_scale_distances_mad_zero(self):
+        samples = [make_measurement(i, 1e308) for i in range(6)]
+        decision = assess_confidence(samples, limit=1e308, min_samples=5)
+        self.assertEqual(decision.sample_count, 6)
+        self.assertEqual(decision.inlier_count, 6)
+        self.assertEqual(decision.center, 1e308)
+        self.assertEqual(decision.mad, 0.0)
+        self.assertEqual(decision.lower_bound, 1e308)
+        self.assertEqual(decision.upper_bound, 1e308)
+        self.assertTrue(decision.accepted)
+        for value in (
+            decision.center,
+            decision.mad,
+            decision.lower_bound,
+            decision.upper_bound,
+        ):
+            self.assertTrue(math.isfinite(value), value)
+
+    def test_six_max_scale_distances_rejected_below_limit(self):
+        samples = [make_measurement(i, 1e308) for i in range(6)]
+        decision = assess_confidence(samples, limit=9e307, min_samples=5)
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.upper_bound, 1e308)
+
+    def test_split_huge_distances_statistics(self):
+        samples = [
+            make_measurement(i, d)
+            for i, d in enumerate(
+                [1e308, 1e308, 1e308, 1.2e308, 1.2e308, 1.2e308]
+            )
+        ]
+        decision = assess_confidence(samples, limit=1.2e308, min_samples=5)
+        self.assertEqual(decision.inlier_count, 6)
+        self.assertAlmostEqual(decision.center / 1.1e308, 1.0, places=12)
+        self.assertAlmostEqual(decision.mad / 1e307, 1.0, places=12)
+        self.assertEqual(decision.lower_bound, 1e308)
+        self.assertEqual(decision.upper_bound, 1.2e308)
+        self.assertTrue(decision.accepted)
+        self.assertTrue(math.isfinite(decision.center))
+        self.assertTrue(math.isfinite(decision.mad))
+
+    def test_huge_distances_order_and_iterator_independent(self):
+        distances = [1e308, 1e308, 1e308, 1.2e308, 1.2e308, 1.2e308]
+        samples = [make_measurement(i, d) for i, d in enumerate(distances)]
+        forward = assess_confidence(samples, limit=1.2e308, min_samples=5)
+        backward = assess_confidence(
+            list(reversed(samples)), limit=1.2e308, min_samples=5
+        )
+        as_iterator = assess_confidence(
+            iter(samples), limit=1.2e308, min_samples=5
+        )
+        self.assertEqual(forward, backward)
+        self.assertEqual(forward, as_iterator)
+
+
 class BoundaryRankTest(unittest.TestCase):
     def test_hundred_inliers_95_percent_ranks_three_and_ninety_eight(self):
         # distances 1..100 plus 10000: median 51, MAD 25, interval

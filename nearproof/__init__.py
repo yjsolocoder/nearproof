@@ -110,7 +110,6 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from statistics import median
 from types import MappingProxyType
 from typing import Callable, Optional
 
@@ -21008,6 +21007,26 @@ def _assess_distances(measurements: list) -> "list[float]":
     return distances
 
 
+def _median(values: "list[float]") -> float:
+    """Median of finite numbers without intermediate overflow.
+
+    Same result as ``statistics.median`` — the middle value for an odd
+    count, the average of the two middle values for an even one — but the
+    even-count average is computed as ``low + (high - low) / 2`` when both
+    share a sign (and ``(low + high) / 2`` otherwise, which cannot
+    overflow), so the median of finite values never comes out infinite.
+    """
+    ordered = sorted(values)
+    count = len(ordered)
+    middle = count // 2
+    if count % 2:
+        return ordered[middle]
+    low, high = ordered[middle - 1], ordered[middle]
+    if (low < 0) == (high < 0):
+        return low + (high - low) / 2.0
+    return (low + high) / 2.0
+
+
 def _assess_inliers(distances: "list[float]") -> "tuple[float, float, list[float]]":
     """The assess median/MAD rule: ``(center, mad, inlier_distances)``.
 
@@ -21016,8 +21035,8 @@ def _assess_inliers(distances: "list[float]") -> "tuple[float, float, list[float
     ``[center - 3*mad, center + 3*mad]``, otherwise the distances exactly
     equal to ``center``.
     """
-    center = median(distances)
-    mad = median(abs(distance - center) for distance in distances)
+    center = _median(distances)
+    mad = _median([abs(distance - center) for distance in distances])
     if mad > 0:
         low, high = center - 3.0 * mad, center + 3.0 * mad
         inliers = [

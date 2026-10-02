@@ -246,6 +246,48 @@ class AssessValidationTest(unittest.TestCase):
                 assess(self.five, 100.0, min_samples=bad)
 
 
+class AssessHugeDistanceOverflowTest(unittest.TestCase):
+    """Even-count medians of huge finite distances must not overflow."""
+
+    def test_six_max_scale_distances_accepted(self):
+        samples = [make_measurement(i, 1e308) for i in range(6)]
+        decision = assess(samples, limit=1e308, min_samples=5)
+        self.assertEqual(decision.sample_count, 6)
+        self.assertEqual(decision.upper_bound, 1e308)
+        self.assertTrue(math.isfinite(decision.upper_bound))
+        self.assertTrue(decision.accepted)
+
+    def test_six_max_scale_distances_rejected_below_limit(self):
+        samples = [make_measurement(i, 1e308) for i in range(6)]
+        decision = assess(samples, limit=9e307, min_samples=5)
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.upper_bound, 1e308)
+
+    def test_split_huge_distances_accepted(self):
+        samples = [
+            make_measurement(i, d)
+            for i, d in enumerate(
+                [1e308, 1e308, 1e308, 1.2e308, 1.2e308, 1.2e308]
+            )
+        ]
+        decision = assess(samples, limit=1.2e308, min_samples=5)
+        self.assertEqual(decision.upper_bound, 1.2e308)
+        self.assertTrue(decision.accepted)
+
+    def test_huge_distances_order_and_iterator_independent(self):
+        distances = [1e308, 1e308, 1e308, 1.2e308, 1.2e308, 1.2e308]
+        samples = [make_measurement(i, d) for i, d in enumerate(distances)]
+        forward = assess(samples, limit=1.2e308, min_samples=5)
+        backward = assess(
+            list(reversed(samples)), limit=1.2e308, min_samples=5
+        )
+        as_iterator = assess(
+            iter(samples), limit=1.2e308, min_samples=5
+        )
+        self.assertEqual(forward, backward)
+        self.assertEqual(forward, as_iterator)
+
+
 class AssessEvidenceTest(unittest.TestCase):
     def setUp(self):
         self.verifier, self.records = make_evidence_list(6)
