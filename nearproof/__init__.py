@@ -26,7 +26,8 @@ EvidenceRevocationListBundleReceiptFrontier /
 EvidenceRevocationListState /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
 JournalBatchReceiptFrontier /
-Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
+Measurement / Observation / ObservationRevocation / ObservationRevocationList /
+Prover / RangeAuditor /
 RangeBatchReceipt /
 RangeDecision / RangeFrontier / RangeReceipt / RangeReceiptBatch /
 ReceiptStream / SPEED_OF_LIGHT_MPS / SpanBundleReceipt /
@@ -67,6 +68,7 @@ audit_map_history /
 audit_map_history_evidence / audit_map_history_journal_bundle /
 audit_map_history_journal_receipt /
 audit_map_update /
+audit_observation_crl /
 audit_proof / audit_range / audit_receipt /
 audit_batch_receipt / audit_bundle_receipt / audit_range_receipt_batch /
 audit_span_bundle_receipt_batch /
@@ -81,7 +83,7 @@ audit_stream_commit_receipt_span_receipt /
 audit_stream_receipt / audit_stream_receipt_batch_commit_receipt /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
-locate_cert_evidence / locate_weighted / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
+locate_cert_evidence / locate_weighted / make_crl / make_evidence_revocation_list / make_observation_crl / prove_crl / revoke_bound /
 revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
 seal_bound_series /
 seal_evidence_revocation_list_bundle /
@@ -169,6 +171,7 @@ __all__ = [
     "NoiseDecision",
     "Observation",
     "ObservationRevocation",
+    "ObservationRevocationList",
     "Prover",
     "RangeAuditor",
     "RangeBatchReceipt",
@@ -248,6 +251,7 @@ __all__ = [
     "audit_map_history_journal_receipt",
     "audit_map_history_journal_receipt_batch",
     "audit_map_update",
+    "audit_observation_crl",
     "audit_proof",
     "audit_range",
     "audit_range_receipt_batch",
@@ -279,6 +283,7 @@ __all__ = [
     "locate_weighted_cert_evidence",
     "make_crl",
     "make_evidence_revocation_list",
+    "make_observation_crl",
     "prove_crl",
     "prove_weighted_crl",
     "revoke_bound",
@@ -354,6 +359,8 @@ _TRUST_PREFIX = b"NPVT1"
 _TRUST_REVOCATION_PREFIX = b"NPVR1"
 # Domain separation prefix for the trust-revocation-list MAC.
 _TRUST_REVOCATION_LIST_PREFIX = b"NPVRL1"
+# Domain separation prefix for the observation-revocation-list MAC.
+_OBSERVATION_REVOCATION_LIST_PREFIX = b"NPORL1"
 # Domain separation prefix for the assess-evidence MAC.
 _ASSESS_EVIDENCE_PREFIX = b"NPAE1"
 # Domain separation prefixes for the bound-series evidence: the ordered
@@ -25865,6 +25872,16 @@ _TRUST_REVOCATION_LIST_FIELDS = (
     "mac",
 )
 
+# Same key set as the trust revocation list; the nested entries carry the
+# observation-revocation key set instead.
+_OBSERVATION_REVOCATION_LIST_FIELDS = (
+    "version",
+    "sequence",
+    "issued_at",
+    "entries",
+    "mac",
+)
+
 
 class _OrderedAttestedObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
@@ -25872,7 +25889,8 @@ class _OrderedAttestedObject(json.JSONDecoder):
     The outer attested-observation object, the bound attested-observation
     object, the nested decision object, the observation-revocation object,
     the verifier-trust object, the trust-revocation object and the outer
-    trust-revocation-list object must each contain exactly their own fields,
+    revocation-list objects (trust and observation, which share one key
+    set) must each contain exactly their own fields,
     once each, in field order (the nested entries of a revocation list carry
     the trust-revocation key set); the field sets are distinguishable by
     their key lists, so a single hook can check all of them.
@@ -26392,6 +26410,386 @@ def revoke_observation(
     return replace(record, mac=_revocation_mac(key, _revocation_payload(record)))
 
 
+def _observation_revocation_list_payload(
+    crl: "ObservationRevocationList",
+) -> dict:
+    """The JSON-ready revocation-list fields except ``mac``, in field order.
+
+    ``entries`` is encoded as a JSON array of objects, each carrying exactly
+    the :class:`ObservationRevocation` key set in its own field order.
+    """
+    return {
+        "version": crl.version,
+        "sequence": crl.sequence,
+        "issued_at": crl.issued_at,
+        "entries": [
+            {**_revocation_payload(entry), "mac": entry.mac.hex()}
+            for entry in crl.entries
+        ],
+    }
+
+
+def _observation_revocation_list_mac(root: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPORL1"`` plus the canonical encoding without ``mac``.
+
+    The prefix and the encoding are concatenated directly, with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        root,
+        _OBSERVATION_REVOCATION_LIST_PREFIX + _encode_payload(payload),
+        hashlib.sha256,
+    ).digest()
+
+
+@dataclass(frozen=True)
+class ObservationRevocationList:
+    """A root-MAC'd snapshot list of :class:`ObservationRevocation` entries.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer; ``issued_at`` a finite non-bool non-negative number, stored as
+    ``float``; ``entries`` a tuple of :class:`ObservationRevocation`
+    instances, sorted strictly ascending by ``id`` with no duplicates;
+    ``mac`` exactly 32 bytes —
+    ``HMAC-SHA256(root, b"NPORL1" + encoding)`` over the canonical encoding
+    of every field except ``mac`` itself (entries as an object array), the
+    prefix and the encoding concatenated directly with no length prefix. Any
+    contract violation raises :class:`ValueError` at construction time.
+    Instances are frozen, constructed positionally in field order and
+    compare equal by their fields. No root material is stored.
+    """
+
+    version: int
+    sequence: int
+    issued_at: float
+    entries: "tuple[ObservationRevocation, ...]"
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("observation revocation list version must be 1")
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise ValueError(
+                "observation revocation list sequence must be an integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "observation revocation list sequence must fit in an unsigned"
+                " 64-bit integer"
+            )
+        value = self.issued_at
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                "observation revocation list issued_at must be a finite"
+                " non-negative number"
+            )
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                "observation revocation list issued_at must be a finite"
+                " non-negative number"
+            )
+        # The canonical encoding always spells issued_at as a float.
+        object.__setattr__(self, "issued_at", float(value))
+        if not isinstance(self.entries, tuple):
+            raise ValueError(
+                "observation revocation list entries must be a tuple of"
+                " ObservationRevocation"
+            )
+        previous = None
+        for entry in self.entries:
+            if not isinstance(entry, ObservationRevocation):
+                raise ValueError(
+                    "observation revocation list entries must contain only"
+                    " ObservationRevocation instances"
+                )
+            if previous is not None and entry.id <= previous:
+                raise ValueError(
+                    "observation revocation list entries must be sorted by"
+                    " id with no duplicates"
+                )
+            previous = entry.id
+        if not isinstance(self.mac, bytes) or len(self.mac) != 32:
+            raise ValueError(
+                "observation revocation list mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``entries`` as
+        an array of objects with the observation-revocation keys in field
+        order, ``issued_at`` as a float, ``mac`` as lowercase hex, no
+        whitespace, no length prefix, no NaN/Infinity."""
+        payload = _observation_revocation_list_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ObservationRevocationList":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: exactly the list fields appearing once each
+        in field order (missing, extra, duplicated or out-of-order keys are
+        rejected, likewise inside every nested entry object), ``version ==
+        1``, a non-bool u64 ``sequence``, a finite non-bool non-negative
+        ``issued_at`` stored as ``float``, an ``entries`` array of objects
+        satisfying the :class:`ObservationRevocation` contract, sorted by
+        ``id`` with no duplicates, and ``mac`` a lowercase hex string
+        decoding to exactly 32 bytes. After parsing and field validation the
+        record is re-encoded with :meth:`to_bytes` and the result must equal
+        the input byte for byte, so formatted JSON, whitespace and any
+        non-canonical number or string spelling are rejected as well.
+        Neither the list MAC nor any entry MAC is verified here — use
+        :func:`audit_observation_crl` with the root and shared keys for
+        that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("observation revocation list data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedAttestedObject)
+        except ValueError as error:
+            raise ValueError(
+                f"observation revocation list is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _OBSERVATION_REVOCATION_LIST_FIELDS
+        ):
+            raise ValueError(
+                "observation revocation list must be a JSON object with"
+                " exactly the observation revocation list fields"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("observation revocation list version must be 1")
+        sequence = _parse_int_field(obj["sequence"], "sequence")
+        if not 0 <= sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "observation revocation list sequence must fit in an unsigned"
+                " 64-bit integer"
+            )
+        issued_at = obj["issued_at"]
+        if isinstance(issued_at, bool) or not isinstance(issued_at, (int, float)):
+            raise ValueError(
+                "observation revocation list issued_at must be a finite"
+                " non-negative number"
+            )
+        if not math.isfinite(issued_at) or issued_at < 0:
+            raise ValueError(
+                "observation revocation list issued_at must be a finite"
+                " non-negative number"
+            )
+        raw_entries = obj["entries"]
+        if not isinstance(raw_entries, list):
+            raise ValueError(
+                "observation revocation list entries must be an array of"
+                " objects"
+            )
+        entries: list[ObservationRevocation] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict) or list(raw_entry) != list(
+                _REVOCATION_FIELDS
+            ):
+                raise ValueError(
+                    "observation revocation list entries must be JSON objects"
+                    " with exactly the observation revocation fields"
+                )
+            raw_entry_mac = raw_entry["mac"]
+            if not isinstance(raw_entry_mac, str):
+                raise ValueError(
+                    "observation revocation mac must be a lowercase hex string"
+                )
+            try:
+                entry_mac = bytes.fromhex(raw_entry_mac)
+            except ValueError as error:
+                raise ValueError(
+                    "observation revocation mac must be a lowercase hex string"
+                ) from error
+            if entry_mac.hex() != raw_entry_mac:
+                # Rejects uppercase digits, separators and odd-length input
+                # that bytes.fromhex would otherwise tolerate.
+                raise ValueError(
+                    "observation revocation mac must be a lowercase hex string"
+                )
+            entries.append(
+                ObservationRevocation(
+                    version=raw_entry["version"],
+                    id=raw_entry["id"],
+                    revoked_at=raw_entry["revoked_at"],
+                    mac=entry_mac,
+                )
+            )
+        mac = _parse_hex_field(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "observation revocation list mac must decode to exactly 32"
+                " bytes"
+            )
+        record = cls(
+            version=version,
+            sequence=sequence,
+            issued_at=issued_at,
+            entries=tuple(entries),
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings (including an integer issued_at, which
+            # the float spelling would not reproduce).
+            raise ValueError(
+                "observation revocation list encoding is not canonical"
+            )
+        return record
+
+
+def make_observation_crl(
+    items: object,
+    sequence: object,
+    issued_at: object,
+    root: object,
+) -> ObservationRevocationList:
+    """Sign a snapshot list of observation revocations under the root key.
+
+    ``items`` is an iterable of :class:`ObservationRevocation` instances
+    (bytes encodings are not accepted here); it may be empty. The entries
+    are copied into a tuple sorted strictly ascending by ``id``, and a
+    duplicate id raises :class:`ValueError`, so the input order never
+    changes the canonical encoding. ``sequence`` must be a non-bool
+    unsigned 64-bit integer and ``issued_at`` a finite non-bool
+    non-negative number (stored as ``float``). ``root`` must be non-empty
+    ``bytes`` — a non-bytes value raises :class:`TypeError`, an empty
+    value :class:`ValueError`. The entries' own MACs are carried through
+    unchanged. The returned :class:`ObservationRevocationList` has
+    ``version`` set to ``1`` and
+    ``mac = HMAC-SHA256(root, b"NPORL1" + encoding)`` over the canonical
+    encoding of every field except ``mac`` itself, the prefix and the
+    encoding concatenated directly with no length prefix. Signing is pure
+    data: it reads and mutates no verifier state.
+    """
+    root = _require_root(root)
+    try:
+        raw_items = list(items)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "items must be an iterable of ObservationRevocation"
+        ) from error
+    entries: list[ObservationRevocation] = []
+    for entry in raw_items:
+        if not isinstance(entry, ObservationRevocation):
+            raise ValueError(
+                "items must contain only ObservationRevocation instances"
+            )
+        entries.append(entry)
+    entries.sort(key=lambda entry: entry.id)
+    record = ObservationRevocationList(
+        version=1,
+        sequence=sequence,  # type: ignore[arg-type]
+        issued_at=issued_at,  # type: ignore[arg-type]
+        entries=tuple(entries),
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record,
+        mac=_observation_revocation_list_mac(
+            root, _observation_revocation_list_payload(record)
+        ),
+    )
+
+
+def audit_observation_crl(
+    x: "ObservationRevocationList | bytes",
+    root: object,
+    keys: object,
+    *,
+    now: object,
+    min: object = 0,
+) -> None:
+    """Authenticate an :class:`ObservationRevocationList` snapshot and check
+    freshness.
+
+    Accepts the list itself or its canonical
+    :meth:`ObservationRevocationList.to_bytes` encoding; anything else
+    raises :class:`ValueError`. ``root`` must be non-empty ``bytes`` and
+    ``keys`` a non-empty mapping of observation id to the non-empty shared
+    key bytes of that verifier — a shape error on either raises
+    :class:`TypeError` (an empty ``root`` raises :class:`ValueError`).
+    ``now`` must be a finite non-bool number and ``min`` a non-bool
+    integer. The list MAC is recomputed with ``root`` as
+    ``HMAC-SHA256(root, b"NPORL1" + encoding)`` over the canonical
+    encoding of every field except the list ``mac``, and every entry's
+    MAC is recomputed with ``keys[id]`` exactly as :func:`locate_attested`
+    verifies a single revocation, each compared in constant time; a
+    mismatch on either layer, an entry id missing from ``keys``, or a
+    duplicated entry id raises :class:`ValueError`. The snapshot must also
+    be current: ``issued_at > now`` (a future-dated list), an entry with
+    ``revoked_at > now`` (a future-dated revocation), or ``sequence <
+    min`` raises :class:`ValueError`. The check is pure: it returns
+    ``None`` on success and touches no state.
+    """
+    root = _require_root(root)
+    if not isinstance(keys, Mapping) or not keys:
+        raise TypeError(
+            "keys must be a non-empty mapping of observation id to key"
+        )
+    key_map: dict[str, bytes] = {}
+    for ident, key in keys.items():
+        if not isinstance(ident, str) or not ident:
+            raise TypeError(
+                "keys must map non-empty string ids to non-empty keys"
+            )
+        if not isinstance(key, (bytes, bytearray)) or not key:
+            raise TypeError(
+                "keys must map non-empty string ids to non-empty keys"
+            )
+        key_map[ident] = bytes(key)
+    if isinstance(x, bytes):
+        crl = ObservationRevocationList.from_bytes(x)
+    elif isinstance(x, ObservationRevocationList):
+        crl = x
+    else:
+        raise ValueError(
+            "crl must be an ObservationRevocationList instance or bytes"
+        )
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValueError("now must be a finite number")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be a finite number")
+    if isinstance(min, bool) or type(min) is not int:
+        raise ValueError("min must be an integer")
+    if not hmac.compare_digest(
+        _observation_revocation_list_mac(
+            root, _observation_revocation_list_payload(crl)
+        ),
+        crl.mac,
+    ):
+        raise ValueError("observation revocation list mac does not match")
+    seen_ids: set[str] = set()
+    for entry in crl.entries:
+        ident = entry.id
+        if ident in seen_ids:
+            raise ValueError(f"duplicate revocation id: {ident!r}")
+        seen_ids.add(ident)
+        key = key_map.get(ident)
+        if key is None:
+            raise ValueError(f"unknown revocation id: {ident!r}")
+        if not hmac.compare_digest(
+            _revocation_mac(key, _revocation_payload(entry)), entry.mac
+        ):
+            raise ValueError(
+                f"observation revocation mac does not match: {ident!r}"
+            )
+        if float(entry.revoked_at) > current:
+            raise ValueError(
+                f"observation revocation is dated in the future: {ident!r}"
+            )
+    if crl.issued_at > current:
+        raise ValueError("observation revocation list is dated in the future")
+    if crl.sequence < min:
+        raise ValueError(
+            "observation revocation list sequence is below the minimum"
+        )
+
+
 def attest_observation(
     id: object,
     x: object,
@@ -26469,6 +26867,9 @@ def locate_attested(
     now: object = None,
     max_age: object = None,
     revocations: object = None,
+    revocation_list: object = None,
+    root: object = None,
+    min: object = 0,
 ) -> "Consensus":
     """Like :func:`locate`, but over MAC'd :class:`AttestedObservation` records.
 
@@ -26502,6 +26903,25 @@ def locate_attested(
     :class:`ValueError`; observations issued strictly after the revocation
     are kept and follow the usual freshness and geometry rules.
 
+    With ``revocation_list=None`` (the default) no snapshot check is
+    performed and ``root``/``min`` are ignored. Otherwise
+    ``revocation_list`` must be an :class:`ObservationRevocationList`
+    instance or its canonical
+    :meth:`ObservationRevocationList.to_bytes` encoding, ``root`` must be
+    non-empty ``bytes`` (a non-bytes value raises :class:`TypeError`, an
+    empty value :class:`ValueError`) and ``now`` must be given explicitly
+    as a finite non-bool number — the clock is never read when a snapshot
+    is supplied. The snapshot is audited with
+    :func:`audit_observation_crl` under ``root``, ``keys``, ``now`` and
+    ``min``: the list MAC and every entry MAC must verify, ``issued_at``
+    and every entry's ``revoked_at`` must not be in the future, every
+    entry id must be known, and ``sequence`` must be at least ``min`` —
+    any failure raises :class:`ValueError`. A snapshot entry revokes
+    exactly like a single revocation with the same id, and both sources
+    may be given together: an observation whose ``issued_at`` is at or
+    before the latest ``revoked_at`` for its id from either source raises
+    :class:`ValueError`.
+
     Verified records are then fed to :func:`locate` under its exact rules
     (``quorum`` and ``tolerance`` included) and its :class:`Consensus` is
     returned. The function is pure: it reads no verifier state and, aside
@@ -26526,10 +26946,15 @@ def locate_attested(
         if not math.isfinite(age_limit) or age_limit < 0:
             raise ValueError("max_age must be a finite non-negative number")
     current = 0.0
-    if check_age or revocations is not None:
+    if check_age or revocations is not None or revocation_list is not None:
         # The clock is read at most once per call, and only when a freshness
-        # or revocation check actually needs the current time.
+        # or revocation check actually needs the current time; a revocation
+        # snapshot always requires an explicit now and never reads it.
         if now is None:
+            if revocation_list is not None:
+                raise ValueError(
+                    "now must be given explicitly when revocation_list is used"
+                )
             current = time.time()
         elif isinstance(now, bool) or not isinstance(now, (int, float)):
             raise ValueError("now must be a finite number")
@@ -26572,6 +26997,23 @@ def locate_attested(
                     f"observation revocation is dated in the future: {ident!r}"
                 )
             revoked_at_by_id[ident] = revoked_at
+
+    if revocation_list is not None:
+        # Signed snapshot: audited wholesale under root/keys/now/min (both
+        # MAC layers, freshness and sequence) before any of its entries
+        # count. A snapshot may name any known id; its hits merge with the
+        # single revocations, the latest revoked_at per id winning.
+        audit_observation_crl(revocation_list, root, key_map, now=current, min=min)
+        snapshot = (
+            ObservationRevocationList.from_bytes(revocation_list)
+            if isinstance(revocation_list, bytes)
+            else revocation_list
+        )
+        for entry in snapshot.entries:
+            revoked_at = float(entry.revoked_at)
+            previous = revoked_at_by_id.get(entry.id)
+            if previous is None or revoked_at > previous:
+                revoked_at_by_id[entry.id] = revoked_at
 
     try:
         raw_observations = list(observations)  # type: ignore[arg-type]
@@ -26629,6 +27071,9 @@ def locate_bound_attested(
     now: object = None,
     max_age: object = None,
     revocations: object = None,
+    revocation_list: object = None,
+    root: object = None,
+    min: object = 0,
 ) -> "Consensus":
     """Like :func:`locate_attested`, but over point-bound
     :class:`BoundAttestedObservation` records.
@@ -26639,7 +27084,12 @@ def locate_bound_attested(
     ``revocations`` follow the exact same rules as in
     :func:`locate_attested`: each record's MAC is recomputed with
     ``keys[id]`` and compared in constant time, and freshness/revocation
-    checks are identical.
+    checks are identical. ``revocation_list``, ``root`` and ``min``
+    likewise follow :func:`locate_attested`: with
+    ``revocation_list=None`` (the default) they are ignored, and
+    otherwise the snapshot is audited with
+    :func:`audit_observation_crl` under an explicit ``now`` before its
+    entries merge with the single revocations.
 
     In addition, after its MAC verifies, every record must be bound to the
     query: its ``point`` must equal ``point`` coordinate by coordinate and
@@ -26675,10 +27125,15 @@ def locate_bound_attested(
         if not math.isfinite(age_limit) or age_limit < 0:
             raise ValueError("max_age must be a finite non-negative number")
     current = 0.0
-    if check_age or revocations is not None:
+    if check_age or revocations is not None or revocation_list is not None:
         # The clock is read at most once per call, and only when a freshness
-        # or revocation check actually needs the current time.
+        # or revocation check actually needs the current time; a revocation
+        # snapshot always requires an explicit now and never reads it.
         if now is None:
+            if revocation_list is not None:
+                raise ValueError(
+                    "now must be given explicitly when revocation_list is used"
+                )
             current = time.time()
         elif isinstance(now, bool) or not isinstance(now, (int, float)):
             raise ValueError("now must be a finite number")
@@ -26730,6 +27185,23 @@ def locate_bound_attested(
                     f"observation revocation is dated in the future: {ident!r}"
                 )
             revoked_at_by_id[ident] = revoked_at
+
+    if revocation_list is not None:
+        # Signed snapshot: audited wholesale under root/keys/now/min (both
+        # MAC layers, freshness and sequence) before any of its entries
+        # count. A snapshot may name any known id; its hits merge with the
+        # single revocations, the latest revoked_at per id winning.
+        audit_observation_crl(revocation_list, root, key_map, now=current, min=min)
+        snapshot = (
+            ObservationRevocationList.from_bytes(revocation_list)
+            if isinstance(revocation_list, bytes)
+            else revocation_list
+        )
+        for entry in snapshot.entries:
+            revoked_at = float(entry.revoked_at)
+            previous = revoked_at_by_id.get(entry.id)
+            if previous is None or revoked_at > previous:
+                revoked_at_by_id[entry.id] = revoked_at
 
     try:
         raw_observations = list(observations)  # type: ignore[arg-type]
