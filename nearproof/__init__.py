@@ -26057,6 +26057,46 @@ def _finite_non_bool(value: object) -> float:
     return number
 
 
+def _disk_covers(
+    px: float,
+    py: float,
+    ox: float,
+    oy: float,
+    bound: float,
+    slack: float,
+) -> bool:
+    """Closed-disk test ``hypot(px-ox, py-oy) <= bound + slack``, overflow-safe.
+
+    Every argument is finite and ``bound``/``slack`` non-negative, so the
+    true distance and radius are finite even though the coordinate
+    subtraction or ``bound + slack`` may exceed the float range. Comparing
+    raw ``math.hypot(...) <= bound + slack`` would turn into
+    ``inf <= inf`` (always true) once both sides overflow, accepting
+    points outside the disk. When any intermediate result could overflow,
+    the inequality is re-evaluated in a frame scaled by the largest
+    coordinate magnitude, where every operation stays finite.
+    """
+    radius = bound + slack
+    dx = px - ox
+    dy = py - oy
+    if math.isfinite(dx) and math.isfinite(dy) and math.isfinite(radius):
+        # math.hypot resists internal overflow; an infinite result against
+        # the finite radius correctly reports non-coverage.
+        return math.hypot(dx, dy) <= radius
+    # All coordinates coincide with the origin: distance zero, covered by
+    # every non-negative radius (this is also the only way scale is zero).
+    scale = max(abs(px), abs(py), abs(ox), abs(oy))
+    if scale == 0.0:
+        return True
+    # Divide before subtracting so the differences stay within [-2, 2];
+    # the radius terms only reach this path when they are near the float
+    # ceiling, so dividing by scale keeps them finite or yields infinity
+    # only when the true radius dwarfs the bounded scaled distance.
+    return math.hypot(px / scale - ox / scale, py / scale - oy / scale) <= (
+        bound / scale + slack / scale
+    )
+
+
 def locate(
     observations: object,
     point: object,
@@ -26132,7 +26172,7 @@ def locate(
         bound = _finite_non_bool(decision.upper_bound)
         if bound < 0:
             raise ValueError("decision upper_bound must be non-negative")
-        if math.hypot(px - ox, py - oy) > bound + slack:
+        if not _disk_covers(px, py, ox, oy, bound, slack):
             rejected.append(ident)
 
     rejected.sort()
@@ -26213,7 +26253,7 @@ def locate_weighted(
         bound = _finite_non_bool(decision.upper_bound)
         if bound < 0:
             raise ValueError("decision upper_bound must be non-negative")
-        supported[ident] = math.hypot(px - ox, py - oy) <= bound + slack
+        supported[ident] = _disk_covers(px, py, ox, oy, bound, slack)
 
     weights = policy.weights
     if set(supported) != set(weights):

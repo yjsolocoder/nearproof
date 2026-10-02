@@ -193,6 +193,112 @@ class WeightedGeometryTest(unittest.TestCase):
         self.assertEqual(result, WeightedConsensus(1, 1, (), True))
 
 
+# Near the float ceiling: distance 3e308 and radius 2e308 both exceed the
+# finite range, collapsing the naive comparison to inf <= inf.
+HUGE = 1.5e308
+NEAR = 1.0e308
+TOL = 1.0e308
+HUGE_WEIGHTS = {"a": 1, "b": 2, "c": 4}
+
+
+def _three_at(center_x, center_y, upper_bound):
+    return [
+        obs("a", center_x, center_y, upper_bound),
+        obs("b", center_x, center_y, upper_bound),
+        obs("c", center_x, center_y, upper_bound),
+    ]
+
+
+class WeightedHugeMagnitudeTest(unittest.TestCase):
+    def test_outside_when_both_sides_overflow_to_infinity(self):
+        result = locate_weighted(
+            _three_at(-HUGE, 0.0, NEAR),
+            (HUGE, 0.0),
+            ConsensusPolicy(HUGE_WEIGHTS, 1),
+            tolerance=TOL,
+        )
+        self.assertEqual(result.total_weight, 7)
+        self.assertEqual(result.support_weight, 0)
+        self.assertEqual(result.rejected, ("a", "b", "c"))
+        self.assertFalse(result.accepted)
+
+    def test_boundary_counts_when_distance_and_radius_overflow(self):
+        result = locate_weighted(
+            _three_at(-NEAR, 0.0, NEAR),
+            (NEAR, 0.0),
+            ConsensusPolicy(HUGE_WEIGHTS, 1),
+            tolerance=TOL,
+        )
+        self.assertEqual(result.support_weight, 7)
+        self.assertEqual(result.rejected, ())
+        self.assertTrue(result.accepted)
+
+    def test_covered_when_radius_overflows_but_distance_does_not(self):
+        result = locate_weighted(
+            _three_at(-NEAR, 0.0, HUGE),
+            (NEAR, 0.0),
+            ConsensusPolicy(HUGE_WEIGHTS, 1),
+            tolerance=TOL,
+        )
+        self.assertEqual(result.support_weight, 7)
+        self.assertTrue(result.accepted)
+
+    def test_relations_hold_under_axis_swap_and_sign_flip(self):
+        for center, point in (
+            ((-HUGE, 0.0), (HUGE, 0.0)),
+            ((0.0, -HUGE), (0.0, HUGE)),
+            ((HUGE, 0.0), (-HUGE, 0.0)),
+            ((0.0, HUGE), (0.0, -HUGE)),
+        ):
+            with self.subTest(kind="outside", center=center, point=point):
+                result = locate_weighted(
+                    _three_at(center[0], center[1], NEAR),
+                    point,
+                    ConsensusPolicy(HUGE_WEIGHTS, 1),
+                    tolerance=TOL,
+                )
+                self.assertEqual(result.support_weight, 0)
+                self.assertEqual(result.rejected, ("a", "b", "c"))
+                self.assertFalse(result.accepted)
+
+        for center, point in (
+            ((-NEAR, 0.0), (NEAR, 0.0)),
+            ((0.0, -NEAR), (0.0, NEAR)),
+            ((NEAR, 0.0), (-NEAR, 0.0)),
+            ((0.0, NEAR), (0.0, -NEAR)),
+        ):
+            with self.subTest(kind="boundary", center=center, point=point):
+                result = locate_weighted(
+                    _three_at(center[0], center[1], NEAR),
+                    point,
+                    ConsensusPolicy(HUGE_WEIGHTS, 1),
+                    tolerance=TOL,
+                )
+                self.assertEqual(result.support_weight, 7)
+                self.assertEqual(result.rejected, ())
+                self.assertTrue(result.accepted)
+
+    def test_euclidean_combines_both_axes(self):
+        # sqrt(2)*1.5e308 ~ 2.12e308 > radius 2e308 despite each axis delta
+        # alone being 1.5e308 < 2e308.
+        result = locate_weighted(
+            _three_at(0.0, 0.0, NEAR),
+            (HUGE, HUGE),
+            ConsensusPolicy(HUGE_WEIGHTS, 1),
+            tolerance=TOL,
+        )
+        self.assertEqual(result.support_weight, 0)
+        self.assertEqual(result.rejected, ("a", "b", "c"))
+        result = locate_weighted(
+            _three_at(0.0, 0.0, HUGE),
+            (HUGE, HUGE),
+            ConsensusPolicy(HUGE_WEIGHTS, 7),
+            tolerance=TOL,
+        )
+        self.assertEqual(result.support_weight, 7)
+        self.assertTrue(result.accepted)
+
+
 class WeightedOrderIndependenceTest(unittest.TestCase):
     def test_shuffled_input_gives_identical_result(self):
         made = policy(threshold=3)

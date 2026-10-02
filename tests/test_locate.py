@@ -150,6 +150,101 @@ class LocateGeometryTest(unittest.TestCase):
         self.assertEqual(consensus.support, 3)
 
 
+# Near the float ceiling: 1.5e308 + 1.5e308 == 3e308 and 2e308 both exceed
+# the finite range, so the naive hypot(dx) <= bound + tolerance comparison
+# collapses into inf <= inf and wrongly accepts outside points.
+HUGE = 1.5e308
+NEAR = 1.0e308
+TOL = 1.0e308
+
+
+def _three_at(center_x, center_y, upper_bound):
+    return [
+        obs("a", center_x, center_y, upper_bound),
+        obs("b", center_x, center_y, upper_bound),
+        obs("c", center_x, center_y, upper_bound),
+    ]
+
+
+class LocateHugeMagnitudeTest(unittest.TestCase):
+    def test_outside_when_both_sides_overflow_to_infinity(self):
+        # Observations at (-1.5e308, 0), candidate at (1.5e308, 0):
+        # distance 3e308 > radius 1e308 + 1e308 = 2e308; both overflow.
+        consensus = locate(_three_at(-HUGE, 0.0, NEAR), (HUGE, 0.0), tolerance=TOL)
+        self.assertEqual(consensus.support, 0)
+        self.assertEqual(consensus.rejected, ("a", "b", "c"))
+        self.assertFalse(consensus.accepted)
+
+    def test_boundary_counts_when_distance_and_radius_overflow(self):
+        # (-1e308, 0) -> (1e308, 0): distance 2e308 == radius 1e308+1e308.
+        consensus = locate(_three_at(-NEAR, 0.0, NEAR), (NEAR, 0.0), tolerance=TOL)
+        self.assertEqual(consensus.support, 3)
+        self.assertEqual(consensus.rejected, ())
+        self.assertTrue(consensus.accepted)
+
+    def test_covered_when_radius_overflows_but_distance_does_not(self):
+        # bound 1.5e308 + tolerance 1e308 = 2.5e308 > distance 2e308.
+        consensus = locate(_three_at(-NEAR, 0.0, HUGE), (NEAR, 0.0), tolerance=TOL)
+        self.assertEqual(consensus.support, 3)
+        self.assertTrue(consensus.accepted)
+
+    def test_covered_when_radius_overflows_but_point_coincides(self):
+        # Coordinates near max but candidate coincides: distance 0, covered
+        # by any non-negative radius even though bound + tolerance overflows.
+        consensus = locate(_three_at(HUGE, 0.0, NEAR), (HUGE, 0.0), tolerance=TOL)
+        self.assertEqual(consensus.support, 3)
+        self.assertTrue(consensus.accepted)
+
+    def test_relations_hold_under_axis_swap_and_sign_flip(self):
+        # Outside: distance 3e308 > radius 2e308.
+        outside_pairs = (
+            ((-HUGE, 0.0), (HUGE, 0.0)),
+            ((0.0, -HUGE), (0.0, HUGE)),
+            ((HUGE, 0.0), (-HUGE, 0.0)),
+            ((0.0, HUGE), (0.0, -HUGE)),
+        )
+        for center, point in outside_pairs:
+            with self.subTest(kind="outside", center=center, point=point):
+                consensus = locate(
+                    _three_at(center[0], center[1], NEAR), point, tolerance=TOL
+                )
+                self.assertEqual(consensus.support, 0)
+                self.assertEqual(consensus.rejected, ("a", "b", "c"))
+                self.assertFalse(consensus.accepted)
+
+        # Boundary: distance 2e308 == radius 2e308.
+        boundary_pairs = (
+            ((-NEAR, 0.0), (NEAR, 0.0)),
+            ((0.0, -NEAR), (0.0, NEAR)),
+            ((NEAR, 0.0), (-NEAR, 0.0)),
+            ((0.0, NEAR), (0.0, -NEAR)),
+        )
+        for center, point in boundary_pairs:
+            with self.subTest(kind="boundary", center=center, point=point):
+                consensus = locate(
+                    _three_at(center[0], center[1], NEAR), point, tolerance=TOL
+                )
+                self.assertEqual(consensus.support, 3)
+                self.assertEqual(consensus.rejected, ())
+                self.assertTrue(consensus.accepted)
+
+    def test_euclidean_combines_both_axes(self):
+        # Candidate (1.5e308, 1.5e308) from the origin: true distance
+        # sqrt(2)*1.5e308 ~ 2.12e308 > radius 2e308. An axis-wise check
+        # would see each |delta| = 1.5e308 < 2e308 and wrongly accept.
+        consensus = locate(
+            _three_at(0.0, 0.0, NEAR), (HUGE, HUGE), tolerance=TOL
+        )
+        self.assertEqual(consensus.support, 0)
+        self.assertEqual(consensus.rejected, ("a", "b", "c"))
+        # radius 1.5e308 + 1e308 ~ 2.5e308 > 2.12e308: genuinely covered.
+        consensus = locate(
+            _three_at(0.0, 0.0, HUGE), (HUGE, HUGE), tolerance=TOL
+        )
+        self.assertEqual(consensus.support, 3)
+        self.assertTrue(consensus.accepted)
+
+
 class LocateOrderIndependenceTest(unittest.TestCase):
     def test_shuffled_input_gives_identical_result(self):
         point = (3.0, 4.0)
