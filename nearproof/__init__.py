@@ -57,7 +57,7 @@ VerifierTrust / WeightedConsensus / assess / attest_observation /
 attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
 audit_b / audit_bound /
 audit_bound_policy / audit_bound_series /
-audit_cert_evidence / audit_crl / audit_delay_bound /
+audit_cert_evidence / audit_cert_evidence_policy / audit_crl / audit_delay_bound /
 audit_evidence_revocation_list /
 audit_evidence_revocation_list_bundle /
 audit_evidence_revocation_list_bundle_receipt /
@@ -235,6 +235,7 @@ __all__ = [
     "audit_bound_series",
     "audit_bundle_receipt",
     "audit_cert_evidence",
+    "audit_cert_evidence_policy",
     "audit_commit",
     "audit_crl",
     "audit_delay_bound",
@@ -269,6 +270,7 @@ __all__ = [
     "audit_stream_receipt",
     "audit_stream_receipt_batch_commit_receipt",
     "audit_weighted_cert_evidence",
+    "audit_weighted_cert_evidence_policy",
     "audit_weighted_crl_proof",
     "cert",
     "locate",
@@ -28887,6 +28889,457 @@ def audit_weighted_cert_evidence(
             "weighted certified consensus evidence consensus does not match"
             " the recomputed result"
         )
+    return consensus
+
+
+def _cert_policy_clock_and_age(
+    now: object, max_age: object, enabled: bool
+) -> "tuple[bool, float, float]":
+    """Validate ``now``/``max_age`` for the certified-evidence policy entries.
+
+    Returns ``(check_age, current, age_limit)``; with no policy enabled
+    (``enabled`` false) ``now`` is ignored entirely and no clock is read,
+    matching the field-for-field behaviour of the existing audits.
+    """
+    check_age = max_age is not None
+    age_limit = 0.0
+    if check_age:
+        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+            raise ValueError("max_age must be a finite non-negative number")
+        age_limit = float(max_age)
+        if not math.isfinite(age_limit) or age_limit < 0:
+            raise ValueError("max_age must be a finite non-negative number")
+    if not enabled:
+        return check_age, 0.0, age_limit
+    if now is None:
+        raise ValueError(
+            "now is required when max_age or revocations are set"
+        )
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValueError("now must be a finite number")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be a finite number")
+    return check_age, current, age_limit
+
+
+def _cert_policy_trust_revocations(
+    trust_revocations: object,
+    root: bytes,
+    current: float,
+    minimum: object,
+    used_pairs: "set[tuple[str, bytes]]",
+) -> "set[tuple[str, bytes]]":
+    """Authenticate trust revocations and return the hit ``(id, target)`` set.
+
+    Both the per-call iterable (:class:`TrustRevocation` objects and/or
+    canonical bytes) and the signed :class:`TrustRevocationList` snapshot
+    (object or canonical bytes) are accepted. Every per-call entry's root MAC
+    is recomputed and compared in constant time; a wrong root or any
+    tampering raises :class:`ValueError`. A snapshot is authenticated
+    wholesale with :func:`audit_crl` (both MAC layers, ``issued_at`` and
+    ``sequence >= min``). Every entry, in either form, must name a
+    certificate the evidence actually carries — matched on ``(id, target)``
+    — and per-call entries with a repeated pair are rejected as duplicates;
+    an unknown id, a different certificate with the same id or an unused
+    certificate raises :class:`ValueError`.
+    """
+    if isinstance(trust_revocations, (TrustRevocationList, bytes)):
+        audit_crl(trust_revocations, root, current, min=minimum)
+        snapshot = (
+            TrustRevocationList.from_bytes(trust_revocations)
+            if isinstance(trust_revocations, bytes)
+            else trust_revocations
+        )
+        revoked_pairs = {(entry.id, entry.target) for entry in snapshot.entries}
+        for pair in revoked_pairs:
+            if pair not in used_pairs:
+                raise ValueError(
+                    "trust revocation does not match a certificate used by the"
+                    f" evidence: {pair[0]!r}"
+                )
+        return revoked_pairs
+    revoked_pairs: set[tuple[str, bytes]] = set()
+    try:
+        raw_revocations = list(trust_revocations)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "trust_revocations must be an iterable of TrustRevocation or bytes,"
+            " or a TrustRevocationList instance or bytes"
+        ) from error
+    for entry in raw_revocations:
+        if isinstance(entry, bytes):
+            try:
+                entry = TrustRevocation.from_bytes(entry)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "trust_revocations bytes must be the canonical"
+                    " TrustRevocation encoding"
+                ) from error
+        if not isinstance(entry, TrustRevocation):
+            raise ValueError(
+                "trust_revocations must contain only TrustRevocation instances"
+                " or bytes, or be a TrustRevocationList snapshot"
+            )
+        pair = (entry.id, entry.target)
+        if pair in revoked_pairs:
+            raise ValueError(
+                "trust_revocations contain a duplicate (id, target) pair:"
+                f" {entry.id!r}"
+            )
+        revoked_pairs.add(pair)
+        if not hmac.compare_digest(
+            _trust_revocation_mac(root, _trust_revocation_payload(entry)),
+            entry.mac,
+        ):
+            raise ValueError(
+                f"trust revocation mac does not match: {entry.id!r}"
+            )
+    for pair in revoked_pairs:
+        # As under locate_cert's legacy form, a validly signed per-call
+        # revocation must hit exactly a certificate the evidence uses.
+        if pair not in used_pairs:
+            raise ValueError(
+                "trust revocation does not match a certificate used by the"
+                f" evidence: {pair[0]!r}"
+            )
+    return revoked_pairs
+
+
+def _cert_policy_observation_revocations(
+    observation_revocations: object,
+    observation_revocation_list: object,
+    trust_map: "dict[str, VerifierTrust]",
+    root: bytes,
+    current: float,
+    minimum: object,
+) -> "dict[str, float]":
+    """Authenticate observation revocations, returning the latest
+    ``revoked_at`` per verifier id.
+
+    The per-call iterable carries :class:`ObservationRevocation` objects
+    and/or their canonical bytes; every entry MAC is recomputed with the
+    participating trust certificate's embedded ``key`` and compared in
+    constant time. A duplicate id, an id naming no certificate in the
+    evidence, a wrong key, any tampering, or a future-dated
+    ``revoked_at`` raises :class:`ValueError`. The optional
+    :class:`ObservationRevocationList` snapshot (object or canonical bytes)
+    is authenticated wholesale with :func:`audit_observation_crl` under a
+    key map built from the evidence's trust certificates; the two sources
+    may overlap and the latest ``revoked_at`` wins, exactly as in
+    :func:`locate_attested`.
+    """
+    revoked_at_by_id: dict[str, float] = {}
+    if observation_revocations is not None:
+        try:
+            raw_revocations = list(observation_revocations)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise ValueError(
+                "observation_revocations must be an iterable of"
+                " ObservationRevocation or bytes"
+            ) from error
+        for entry in raw_revocations:
+            if isinstance(entry, bytes):
+                try:
+                    entry = ObservationRevocation.from_bytes(entry)
+                except ValueError as error:
+                    raise ValueError(
+                        "observation_revocations bytes must be the canonical"
+                        " ObservationRevocation encoding"
+                    ) from error
+            if not isinstance(entry, ObservationRevocation):
+                raise ValueError(
+                    "observation_revocations must contain only"
+                    " ObservationRevocation instances or bytes"
+                )
+            ident = entry.id
+            if ident in revoked_at_by_id:
+                raise ValueError(f"duplicate revocation id: {ident!r}")
+            trust = trust_map.get(ident)
+            if trust is None:
+                raise ValueError(f"unknown revocation id: {ident!r}")
+            if not hmac.compare_digest(
+                _revocation_mac(trust.key, _revocation_payload(entry)),
+                entry.mac,
+            ):
+                raise ValueError(
+                    f"observation revocation mac does not match: {ident!r}"
+                )
+            revoked_at = float(entry.revoked_at)
+            if revoked_at > current:
+                raise ValueError(
+                    f"observation revocation is dated in the future: {ident!r}"
+                )
+            revoked_at_by_id[ident] = revoked_at
+    if observation_revocation_list is not None:
+        if not isinstance(
+            observation_revocation_list, (ObservationRevocationList, bytes)
+        ):
+            raise ValueError(
+                "observation_revocation_list must be an"
+                " ObservationRevocationList instance or bytes"
+            )
+        key_map = {ident: trust.key for ident, trust in trust_map.items()}
+        audit_observation_crl(
+            observation_revocation_list, root, key_map, now=current, min=minimum
+        )
+        snapshot = (
+            ObservationRevocationList.from_bytes(observation_revocation_list)
+            if isinstance(observation_revocation_list, bytes)
+            else observation_revocation_list
+        )
+        for entry in snapshot.entries:
+            revoked_at = float(entry.revoked_at)
+            previous = revoked_at_by_id.get(entry.id)
+            if previous is None or revoked_at > previous:
+                revoked_at_by_id[entry.id] = revoked_at
+    return revoked_at_by_id
+
+
+def audit_cert_evidence_policy(
+    x: "CertifiedConsensusEvidence | bytes",
+    root: object,
+    *,
+    now: object = None,
+    max_age: object = None,
+    trust_revocations: object = None,
+    observation_revocations: object = None,
+    observation_revocation_list: object = None,
+    min: object = 0,
+) -> "Consensus":
+    """Authenticate a :class:`CertifiedConsensusEvidence` under an optional
+    freshness and revocation policy.
+
+    The cryptographic, canonical-encoding and consensus-recomputation checks
+    are exactly those of :func:`audit_cert_evidence`, which runs first; every
+    check it performs (and its :class:`TypeError`/:class:`ValueError` split —
+    only a non-bytes ``root`` raises :class:`TypeError`) applies unchanged.
+    With ``max_age`` and every revocation argument at their defaults no
+    policy is enforced: the call is item-for-item :func:`audit_cert_evidence`,
+    returns the same rerun :class:`Consensus`, and ``now``/``min`` are
+    ignored without reading a clock.
+
+    Once ``max_age`` or any revocation argument is enabled, ``now`` is
+    required and must be a finite non-bool number and ``max_age`` must be a
+    finite non-bool non-negative number, or :class:`ValueError` is raised.
+    ``min`` (a non-bool integer, default ``0``) is the sequence floor
+    enforced by the two snapshot-list forms and is ignored otherwise. Every
+    carried observation's ``issued_at`` must satisfy the closed interval
+    ``0 <= now - issued_at <= max_age``: future-dated or over-age
+    observations reject the evidence.
+
+    ``trust_revocations`` accepts either an iterable of
+    :class:`TrustRevocation` objects and/or their canonical
+    :meth:`TrustRevocation.to_bytes` encodings, or a
+    :class:`TrustRevocationList` snapshot (object or canonical bytes). Each
+    per-call revocation's root MAC is recomputed with the evidence ``root``
+    and compared in constant time; a wrong root, tampering, a duplicate
+    ``(id, target)`` pair, or an entry that does not name one of the
+    certificates the evidence carries raises :class:`ValueError`. A snapshot
+    is authenticated wholesale with :func:`audit_crl` under ``now`` and
+    ``min`` (list and entry MACs, ``issued_at <= now``,
+    ``sequence >= min``); every snapshot entry must likewise name a
+    certificate the evidence carries on ``(id, target)``. Any hit
+    permanently rejects the evidence — the target binds the exact
+    certificate MAC.
+
+    ``observation_revocations`` accepts an iterable of
+    :class:`ObservationRevocation` objects and/or canonical bytes. Each
+    entry's MAC is recomputed with the embedded shared key of the
+    certificate carrying the same id and compared in constant time; an
+    unknown id, a wrong key, tampering, a duplicate id or a future-dated
+    ``revoked_at`` raises :class:`ValueError`.
+    ``observation_revocation_list`` accepts one
+    :class:`ObservationRevocationList` object or canonical bytes,
+    authenticated wholesale with :func:`audit_observation_crl` (both MAC
+    layers, future dating and sequence floor). The two sources stack: for an
+    id named by either, an observation with
+    ``issued_at <= revoked_at`` is rejected, while one issued strictly later
+    survives.
+
+    Like :func:`audit_cert_evidence` this is a pure function: it reads and
+    mutates no verifier state.
+    """
+    consensus = audit_cert_evidence(x, root)
+    policy_enabled = (
+        max_age is not None
+        or trust_revocations is not None
+        or observation_revocations is not None
+        or observation_revocation_list is not None
+    )
+    check_age, current, age_limit = _cert_policy_clock_and_age(
+        now, max_age, policy_enabled
+    )
+    if not policy_enabled:
+        return consensus
+    root = _require_root(root)
+    evidence = (
+        CertifiedConsensusEvidence.from_bytes(x) if isinstance(x, bytes) else x
+    )
+    parsed = _parse_cert_evidence_body(evidence.body)
+    _raw_point, _raw_context, raw_records, raw_trusts, _raw_consensus = parsed
+    records = [
+        BoundAttestedObservation.from_bytes(
+            _parse_cert_evidence_hex(blob, "records")
+        )
+        for blob in raw_records
+    ]
+    trusts = [
+        VerifierTrust.from_bytes(_parse_cert_evidence_hex(blob, "trusts"))
+        for blob in raw_trusts
+    ]
+    trust_map = {entry.id: entry for entry in trusts}
+    used_pairs = {(entry.id, entry.mac) for entry in trusts}
+    revoked_pairs: set[tuple[str, bytes]] = set()
+    if trust_revocations is not None:
+        revoked_pairs = _cert_policy_trust_revocations(
+            trust_revocations, root, current, min, used_pairs
+        )
+    revoked_at_by_id = _cert_policy_observation_revocations(
+        observation_revocations,
+        observation_revocation_list,
+        trust_map,
+        root,
+        current,
+        min,
+    )
+    for item in records:
+        ident = item.id
+        trust = trust_map[ident]
+        if (ident, trust.mac) in revoked_pairs:
+            # A trust revocation is permanent: any evidence whose
+            # certificate was revoked is rejected regardless of timing.
+            raise ValueError(f"verifier trust has been revoked: {ident!r}")
+        issued_at = float(item.issued_at)
+        revoked_at = revoked_at_by_id.get(ident)
+        if revoked_at is not None and issued_at <= revoked_at:
+            raise ValueError(
+                "certified evidence observation not issued after its"
+                f" revocation: {ident!r}"
+            )
+        if check_age:
+            age = current - issued_at
+            if not 0.0 <= age <= age_limit:
+                raise ValueError(
+                    f"certified evidence observation outside the allowed age:"
+                    f" {ident!r}"
+                )
+    return consensus
+
+
+def audit_weighted_cert_evidence_policy(
+    x: "WeightedCertifiedConsensusEvidence | bytes",
+    root: object,
+    *,
+    now: object = None,
+    max_age: object = None,
+    trust_revocations: object = None,
+    observation_revocations: object = None,
+    observation_revocation_list: object = None,
+    min: object = 0,
+) -> "WeightedConsensus":
+    """Authenticate a :class:`WeightedCertifiedConsensusEvidence` under an
+    optional freshness and revocation policy.
+
+    This is the weighted counterpart of :func:`audit_cert_evidence_policy`:
+    the cryptographic, canonical-encoding and weighted-consensus
+    recomputation checks are exactly those of
+    :func:`audit_weighted_cert_evidence`, which runs first (only a
+    non-bytes ``root`` raises :class:`TypeError`; everything else is
+    :class:`ValueError`). With no policy argument enabled the call is
+    item-for-item the existing audit and returns the same rerun
+    :class:`WeightedConsensus` without reading a clock.
+
+    Once any policy argument is enabled ``now`` is required as a finite
+    non-bool number and ``max_age`` must be a finite non-bool non-negative
+    number; ``min`` (a non-bool integer, default ``0``) is the sequence
+    floor enforced by the two snapshot-list forms and is ignored
+    otherwise. The freshness interval,
+    :class:`TrustRevocation` / :class:`TrustRevocationList` handling and
+    :class:`ObservationRevocation` / :class:`ObservationRevocationList`
+    handling (per-verifier keys taken from the carried trust certificates,
+    iterable and snapshot sources stacking with the latest ``revoked_at``
+    winning) are exactly :func:`audit_cert_evidence_policy`'s: a trust
+    revocation permanently rejects the evidence, while an observation
+    revocation rejects only same-id observations with
+    ``issued_at <= revoked_at``; observations issued strictly after the
+    revocation are kept. The function is pure and touches no verifier
+    state.
+    """
+    consensus = audit_weighted_cert_evidence(x, root)
+    policy_enabled = (
+        max_age is not None
+        or trust_revocations is not None
+        or observation_revocations is not None
+        or observation_revocation_list is not None
+    )
+    check_age, current, age_limit = _cert_policy_clock_and_age(
+        now, max_age, policy_enabled
+    )
+    if not policy_enabled:
+        return consensus
+    root = _require_root(root)
+    evidence = (
+        WeightedCertifiedConsensusEvidence.from_bytes(x)
+        if isinstance(x, bytes)
+        else x
+    )
+    parsed = _parse_weighted_cert_evidence_body(evidence.body)
+    (
+        _raw_point,
+        _raw_context,
+        raw_records,
+        raw_trusts,
+        _raw_weights,
+        _raw_threshold,
+        _raw_consensus,
+    ) = parsed
+    records = [
+        BoundAttestedObservation.from_bytes(
+            _parse_weighted_cert_evidence_hex(blob, "records")
+        )
+        for blob in raw_records
+    ]
+    trusts = [
+        VerifierTrust.from_bytes(
+            _parse_weighted_cert_evidence_hex(blob, "trusts")
+        )
+        for blob in raw_trusts
+    ]
+    trust_map = {entry.id: entry for entry in trusts}
+    used_pairs = {(entry.id, entry.mac) for entry in trusts}
+    revoked_pairs: set[tuple[str, bytes]] = set()
+    if trust_revocations is not None:
+        revoked_pairs = _cert_policy_trust_revocations(
+            trust_revocations, root, current, min, used_pairs
+        )
+    revoked_at_by_id = _cert_policy_observation_revocations(
+        observation_revocations,
+        observation_revocation_list,
+        trust_map,
+        root,
+        current,
+        min,
+    )
+    for item in records:
+        ident = item.id
+        trust = trust_map[ident]
+        if (ident, trust.mac) in revoked_pairs:
+            raise ValueError(f"verifier trust has been revoked: {ident!r}")
+        issued_at = float(item.issued_at)
+        revoked_at = revoked_at_by_id.get(ident)
+        if revoked_at is not None and issued_at <= revoked_at:
+            raise ValueError(
+                "weighted certified evidence observation not issued after its"
+                f" revocation: {ident!r}"
+            )
+        if check_age:
+            age = current - issued_at
+            if not 0.0 <= age <= age_limit:
+                raise ValueError(
+                    "weighted certified evidence observation outside the"
+                    f" allowed age: {ident!r}"
+                )
     return consensus
 
 
