@@ -179,6 +179,7 @@ __all__ = [
     "RangeReceipt",
     "RangeReceiptBatch",
     "ReceiptStream",
+    "RegionDecision",
     "SPEED_OF_LIGHT_MPS",
     "SpanBundleReceipt",
     "SpanBundleReceiptAuditor",
@@ -273,6 +274,7 @@ __all__ = [
     "locate_bound_attested",
     "locate_cert",
     "locate_cert_evidence",
+    "locate_region",
     "locate_weighted",
     "locate_weighted_cert_evidence",
     "make_crl",
@@ -677,6 +679,25 @@ class WeightedConsensus:
     support_weight: int
     rejected: tuple[str, ...]
     accepted: bool
+
+
+@dataclass(frozen=True)
+class RegionDecision:
+    """The outcome of :func:`locate_region` over a set of :class:`Observation`.
+
+    ``feasible`` says whether the closed disks contributed by the
+    observations intersect at all. When they do, ``bounds`` is the
+    ``(min_x, min_y, max_x, max_y)`` tuple of the intersection's
+    axis-aligned extremes and ``witness`` the ``(x, y)`` point of the
+    intersection with the smallest ``x``, ties broken toward the smallest
+    ``y``; when the intersection degenerates to a single point, both
+    describe that point. When the disks do not intersect, ``bounds`` and
+    ``witness`` are both ``None``.
+    """
+
+    feasible: bool
+    bounds: "tuple[float, float, float, float] | None"
+    witness: "tuple[float, float] | None"
 
 
 _EVIDENCE_FIELDS = (
@@ -25658,6 +25679,151 @@ def locate_weighted(
         support_weight=support_weight,
         rejected=rejected,
         accepted=support_weight >= policy.threshold,
+    )
+
+
+def _circle_boundary_intersections(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+    eps: float,
+) -> list[tuple[float, float]]:
+    """The 0, 1, or 2 points where two circle boundaries meet.
+
+    Each circle is a ``(center_x, center_y, radius)`` triple and ``eps``
+    is the slack granted to the separability checks so exactly tangent
+    circles still count as meeting.
+    """
+    x0, y0, r0 = first
+    x1, y1, r1 = second
+    dx = x1 - x0
+    dy = y1 - y0
+    d = math.hypot(dx, dy)
+    if d == 0.0:
+        # Concentric circles share no isolated boundary points.
+        return []
+    if d > r0 + r1 + eps or d < abs(r0 - r1) - eps:
+        return []
+    a = (d * d + r0 * r0 - r1 * r1) / (2.0 * d)
+    h = math.sqrt(max(0.0, r0 * r0 - a * a))
+    mx = x0 + a * dx / d
+    my = y0 + a * dy / d
+    if h == 0.0:
+        return [(mx, my)]
+    ox = -dy * h / d
+    oy = dx * h / d
+    return [(mx + ox, my + oy), (mx - ox, my - oy)]
+
+
+def locate_region(
+    observations: object,
+    *,
+    tolerance: object = 0.0,
+) -> "RegionDecision":
+    """Infer the 2D region jointly covered by every observation's disk.
+
+    Each :class:`Observation` contributes the closed disk centered at
+    ``(x, y)`` with radius ``decision.upper_bound + tolerance`` (boundary
+    points count as covered) and the decision's ``accepted`` flag is
+    ignored, exactly as in :func:`locate`. The region is the intersection
+    of all disks: when it is non-empty, ``bounds`` reports its extremes as
+    ``(min_x, min_y, max_x, max_y)`` and ``witness`` is the intersection
+    point with the smallest ``x`` (ties broken toward the smallest ``y``);
+    when the intersection degenerates to a single point, both describe
+    that point. An empty intersection is reported as ``feasible=False``
+    with ``bounds`` and ``witness`` set to ``None`` — a geometric
+    contradiction is not an exception.
+
+    ``observations`` must be an iterable of at least three observations
+    with unique non-empty string ids, finite non-bool ``x``/``y``
+    coordinates and a :class:`RangeDecision` whose ``upper_bound`` is
+    finite and non-negative; ``tolerance`` must be a finite non-bool
+    non-negative number. Every contract violation raises
+    :class:`ValueError`.
+
+    The result is independent of input order, the function does not mutate
+    its inputs, and every reported coordinate is a finite non-bool float.
+    """
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError("tolerance must be a finite non-negative number")
+    slack = float(tolerance)
+    if not math.isfinite(slack) or slack < 0:
+        raise ValueError("tolerance must be a finite non-negative number")
+
+    try:
+        raw_observations = list(observations)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("observations must be an iterable of Observation") from error
+
+    if len(raw_observations) < 3:
+        raise ValueError(
+            f"need at least 3 observations, got {len(raw_observations)}"
+        )
+
+    disks: list[tuple[float, float, float]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        disks.append((ox, oy, bound + slack))
+
+    scale = 1.0
+    for cx, cy, radius in disks:
+        scale = max(scale, abs(cx) + abs(cy) + radius)
+    eps = 1e-12 * scale
+
+    def covers(px: float, py: float) -> bool:
+        return all(
+            math.hypot(px - cx, py - cy) <= radius + eps
+            for cx, cy, radius in disks
+        )
+
+    # The disk intersection is strictly convex, so each of its axis-aligned
+    # extremes is attained either at a disk's own axis-extreme point that
+    # lies in every disk or at a point where two circle boundaries meet;
+    # collecting both kinds of candidates suffices, and the intersection
+    # is non-empty exactly when at least one candidate survives.
+    candidates: list[tuple[float, float]] = []
+    for cx, cy, radius in disks:
+        candidates.append((cx - radius, cy))
+        candidates.append((cx + radius, cy))
+        candidates.append((cx, cy - radius))
+        candidates.append((cx, cy + radius))
+    for first in range(len(disks)):
+        for second in range(first + 1, len(disks)):
+            candidates.extend(
+                _circle_boundary_intersections(disks[first], disks[second], eps)
+            )
+
+    feasible_points = [point for point in candidates if covers(*point)]
+    if not feasible_points:
+        return RegionDecision(feasible=False, bounds=None, witness=None)
+
+    min_x = min(px for px, _py in feasible_points)
+    max_x = max(px for px, _py in feasible_points)
+    min_y = min(py for _px, py in feasible_points)
+    max_y = max(py for _px, py in feasible_points)
+    wx, wy = min(
+        (point for point in feasible_points if point[0] <= min_x + eps),
+        key=lambda point: (point[1], point[0]),
+    )
+    return RegionDecision(
+        feasible=True,
+        bounds=(min_x, min_y, max_x, max_y),
+        witness=(wx, wy),
     )
 
 
