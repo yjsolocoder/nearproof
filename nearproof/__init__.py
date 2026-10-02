@@ -26057,6 +26057,27 @@ def _finite_non_bool(value: object) -> float:
     return number
 
 
+def _disk_covers(
+    px: float, py: float, ox: float, oy: float, bound: float, slack: float
+) -> bool:
+    """Closed-disk test ``hypot(point - center) <= bound + slack``.
+
+    Every input is finite, but the coordinate differences, the hypotenuse
+    and the radius may individually overflow to ``inf`` for huge values.
+    A one-sided overflow is decided by the overflow alone: an infinite
+    distance exceeds any finite radius and an infinite radius covers any
+    finite distance. Only when both sides overflow is the comparison
+    redone at quarter scale — dividing by a power of two is exact and
+    keeps every intermediate finite — so the true disk relation decides.
+    """
+    distance = math.hypot(px - ox, py - oy)
+    radius = bound + slack
+    if math.isinf(distance) and math.isinf(radius):
+        distance = math.hypot(px / 4.0 - ox / 4.0, py / 4.0 - oy / 4.0)
+        radius = bound / 4.0 + slack / 4.0
+    return distance <= radius
+
+
 def locate(
     observations: object,
     point: object,
@@ -26071,7 +26092,10 @@ def locate(
     observation supports the point when
     ``math.hypot(point[0] - x, point[1] - y) <= upper_bound + tolerance``
     (the boundary counts as support). The decision's ``accepted`` flag is
-    deliberately ignored — only its bound participates.
+    deliberately ignored — only its bound participates. The comparison is
+    overflow-safe: finite inputs are always judged by the true disk
+    relation, even when the coordinate differences or the radius exceed
+    the float range as intermediate results.
 
     ``observations`` must be an iterable of at least three observations with
     unique non-empty string ids, finite non-bool ``x``/``y`` coordinates and
@@ -26132,7 +26156,7 @@ def locate(
         bound = _finite_non_bool(decision.upper_bound)
         if bound < 0:
             raise ValueError("decision upper_bound must be non-negative")
-        if math.hypot(px - ox, py - oy) > bound + slack:
+        if not _disk_covers(px, py, ox, oy, bound, slack):
             rejected.append(ident)
 
     rejected.sort()
@@ -26156,7 +26180,9 @@ def locate_weighted(
 
     Like :func:`locate`, each :class:`Observation` contributes the closed
     disk ``math.hypot(point[0] - x, point[1] - y) <= upper_bound + tolerance``
-    (the boundary counts as support) and the decision's ``accepted`` flag is
+    (the boundary counts as support, and the comparison is overflow-safe
+    for huge finite inputs exactly as in :func:`locate`) and the
+    decision's ``accepted`` flag is
     ignored. Instead of counting verifiers, the votes are summed with the
     positive integer weights declared in ``policy``: ``total_weight`` is the
     sum of every weight, ``support_weight`` the sum over supporting
@@ -26213,7 +26239,7 @@ def locate_weighted(
         bound = _finite_non_bool(decision.upper_bound)
         if bound < 0:
             raise ValueError("decision upper_bound must be non-negative")
-        supported[ident] = math.hypot(px - ox, py - oy) <= bound + slack
+        supported[ident] = _disk_covers(px, py, ox, oy, bound, slack)
 
     weights = policy.weights
     if set(supported) != set(weights):

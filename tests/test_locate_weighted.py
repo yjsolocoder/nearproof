@@ -193,6 +193,114 @@ class WeightedGeometryTest(unittest.TestCase):
         self.assertEqual(result, WeightedConsensus(1, 1, (), True))
 
 
+class WeightedOverflowGeometryTest(unittest.TestCase):
+    """Huge finite inputs must follow the true disk relation.
+
+    As in :func:`locate`, coordinates and bounds near 1e308 overflow the
+    naive distance and radius intermediates to ``inf``; the weighted
+    consensus must still reflect the actual Euclidean coverage.
+    """
+
+    def far_observations(self, x, y, bound):
+        return [obs(ident, x, y, bound) for ident in "abc"]
+
+    def test_overflowing_distance_and_radius_still_rejects(self):
+        # True distance 3e308 vs true radius 1e308 + 1e308: outside every
+        # disk even though both sides overflow to inf.
+        observations = self.far_observations(-1.5e308, 0.0, 1e308)
+        result = locate_weighted(
+            observations, (1.5e308, 0.0), policy(), tolerance=1e308
+        )
+        self.assertEqual(result.total_weight, 7)
+        self.assertEqual(result.support_weight, 0)
+        self.assertEqual(result.rejected, ("a", "b", "c"))
+        self.assertFalse(result.accepted)
+
+    def test_overflowing_boundary_counts_as_support(self):
+        # True distance 2e308, true radius 1e308 + 1e308: exactly on the
+        # closed boundary, so it supports despite both sides overflowing.
+        observations = self.far_observations(-1e308, 0.0, 1e308)
+        result = locate_weighted(
+            observations, (1e308, 0.0), policy(), tolerance=1e308
+        )
+        self.assertEqual(result.support_weight, 7)
+        self.assertEqual(result.rejected, ())
+        self.assertTrue(result.accepted)
+
+    def test_larger_overflowing_bound_supports(self):
+        # True distance 2e308 against true radius 1.5e308 + 1e308.
+        observations = self.far_observations(-1e308, 0.0, 1.5e308)
+        result = locate_weighted(
+            observations, (1e308, 0.0), policy(), tolerance=1e308
+        )
+        self.assertEqual(result.support_weight, 7)
+        self.assertEqual(result.rejected, ())
+        self.assertTrue(result.accepted)
+
+    def test_axes_swapped(self):
+        observations = self.far_observations(0.0, -1.5e308, 1e308)
+        result = locate_weighted(
+            observations, (0.0, 1.5e308), policy(), tolerance=1e308
+        )
+        self.assertEqual(result.support_weight, 0)
+        self.assertEqual(result.rejected, ("a", "b", "c"))
+        self.assertFalse(result.accepted)
+        boundary = self.far_observations(0.0, -1e308, 1e308)
+        edge = locate_weighted(
+            boundary, (0.0, 1e308), policy(), tolerance=1e308
+        )
+        self.assertEqual(edge.support_weight, 7)
+        self.assertTrue(edge.accepted)
+
+    def test_signs_flipped(self):
+        observations = self.far_observations(1.5e308, 0.0, 1e308)
+        result = locate_weighted(
+            observations, (-1.5e308, 0.0), policy(), tolerance=1e308
+        )
+        self.assertEqual(result.support_weight, 0)
+        self.assertEqual(result.rejected, ("a", "b", "c"))
+        self.assertFalse(result.accepted)
+        boundary = self.far_observations(1e308, 0.0, 1e308)
+        edge = locate_weighted(
+            boundary, (-1e308, 0.0), policy(), tolerance=1e308
+        )
+        self.assertEqual(edge.support_weight, 7)
+        self.assertTrue(edge.accepted)
+
+    def test_both_axes_participate_euclidean(self):
+        # Each axis differs by 2e308; the Euclidean distance 2*sqrt(2)e308
+        # exceeds the 2e308 radius even though each axis fits within it.
+        observations = self.far_observations(-1e308, -1e308, 1e308)
+        result = locate_weighted(
+            observations, (1e308, 1e308), policy(), tolerance=1e308
+        )
+        self.assertEqual(result.support_weight, 0)
+        self.assertEqual(result.rejected, ("a", "b", "c"))
+        self.assertFalse(result.accepted)
+        wider = self.far_observations(-1e308, -1e308, 1.5e308)
+        covered = locate_weighted(
+            wider, (1e308, 1e308), policy(), tolerance=1.5e308
+        )
+        self.assertEqual(covered.support_weight, 7)
+        self.assertTrue(covered.accepted)
+
+    def test_partial_support_weights_only_covering_ids(self):
+        # Only "a" (weight 1) sits on its boundary; "b" and "c" overflow
+        # outside their disks, so only a's weight counts.
+        observations = [
+            obs("a", -1e308, 0.0, 1e308),
+            obs("b", -1.5e308, 0.0, 1e308),
+            obs("c", -1.5e308, 0.0, 1e308),
+        ]
+        result = locate_weighted(
+            observations, (1e308, 0.0), policy(threshold=1), tolerance=1e308
+        )
+        self.assertEqual(result.total_weight, 7)
+        self.assertEqual(result.support_weight, 1)
+        self.assertEqual(result.rejected, ("b", "c"))
+        self.assertTrue(result.accepted)
+
+
 class WeightedOrderIndependenceTest(unittest.TestCase):
     def test_shuffled_input_gives_identical_result(self):
         made = policy(threshold=3)

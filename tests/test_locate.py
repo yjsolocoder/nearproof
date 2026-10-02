@@ -179,6 +179,95 @@ class LocateOrderIndependenceTest(unittest.TestCase):
         self.assertTrue(consensus.accepted)
 
 
+class LocateOverflowGeometryTest(unittest.TestCase):
+    """Huge finite inputs must follow the true disk relation.
+
+    With coordinates and bounds near 1e308 the coordinate differences,
+    the hypotenuse and ``upper_bound + tolerance`` all overflow to
+    ``inf`` under naive arithmetic; the consensus must still reflect the
+    actual Euclidean coverage rather than comparing ``inf`` to ``inf``.
+    """
+
+    def far_observations(self, x, y, bound):
+        return [obs(ident, x, y, bound) for ident in "abc"]
+
+    def test_overflowing_distance_and_radius_still_rejects(self):
+        # True distance 3e308 vs true radius 1e308 + 1e308: the candidate
+        # is outside every disk even though both sides overflow to inf.
+        observations = self.far_observations(-1.5e308, 0.0, 1e308)
+        consensus = locate(observations, (1.5e308, 0.0), tolerance=1e308)
+        self.assertEqual(consensus.total, 3)
+        self.assertEqual(consensus.support, 0)
+        self.assertEqual(consensus.rejected, ("a", "b", "c"))
+        self.assertFalse(consensus.accepted)
+
+    def test_overflowing_boundary_counts_as_support(self):
+        # True distance 2e308, true radius 1e308 + 1e308: exactly on the
+        # closed boundary, so it supports despite both sides overflowing.
+        observations = self.far_observations(-1e308, 0.0, 1e308)
+        consensus = locate(observations, (1e308, 0.0), tolerance=1e308)
+        self.assertEqual(consensus.support, 3)
+        self.assertEqual(consensus.rejected, ())
+        self.assertTrue(consensus.accepted)
+
+    def test_larger_overflowing_bound_supports(self):
+        # True distance 2e308 against true radius 1.5e308 + 1e308.
+        observations = self.far_observations(-1e308, 0.0, 1.5e308)
+        consensus = locate(observations, (1e308, 0.0), tolerance=1e308)
+        self.assertEqual(consensus.support, 3)
+        self.assertEqual(consensus.rejected, ())
+        self.assertTrue(consensus.accepted)
+
+    def test_axes_swapped(self):
+        observations = self.far_observations(0.0, -1.5e308, 1e308)
+        consensus = locate(observations, (0.0, 1.5e308), tolerance=1e308)
+        self.assertEqual(consensus.support, 0)
+        self.assertEqual(consensus.rejected, ("a", "b", "c"))
+        self.assertFalse(consensus.accepted)
+        boundary = self.far_observations(0.0, -1e308, 1e308)
+        edge = locate(boundary, (0.0, 1e308), tolerance=1e308)
+        self.assertEqual(edge.support, 3)
+        self.assertTrue(edge.accepted)
+
+    def test_signs_flipped(self):
+        observations = self.far_observations(1.5e308, 0.0, 1e308)
+        consensus = locate(observations, (-1.5e308, 0.0), tolerance=1e308)
+        self.assertEqual(consensus.support, 0)
+        self.assertEqual(consensus.rejected, ("a", "b", "c"))
+        self.assertFalse(consensus.accepted)
+        boundary = self.far_observations(1e308, 0.0, 1e308)
+        edge = locate(boundary, (-1e308, 0.0), tolerance=1e308)
+        self.assertEqual(edge.support, 3)
+        self.assertTrue(edge.accepted)
+
+    def test_both_axes_participate_euclidean(self):
+        # Each axis differs by 2e308, so a per-axis check would accept
+        # against a 2e308 radius, but the Euclidean distance 2*sqrt(2)e308
+        # exceeds it: the disk relation must not degenerate per axis.
+        observations = self.far_observations(-1e308, -1e308, 1e308)
+        consensus = locate(observations, (1e308, 1e308), tolerance=1e308)
+        self.assertEqual(consensus.support, 0)
+        self.assertEqual(consensus.rejected, ("a", "b", "c"))
+        self.assertFalse(consensus.accepted)
+        # Widening each radius to 3e308 covers the same diagonal point.
+        wider = self.far_observations(-1e308, -1e308, 1.5e308)
+        covered = locate(wider, (1e308, 1e308), tolerance=1.5e308)
+        self.assertEqual(covered.support, 3)
+        self.assertTrue(covered.accepted)
+
+    def test_one_sided_overflow_still_decided(self):
+        # Infinite radius with finite distance covers; infinite distance
+        # against a finite radius rejects.
+        near = self.far_observations(0.0, 0.0, 1e308)
+        self.assertEqual(
+            locate(near, (1.0, 1.0), tolerance=1e308).support, 3
+        )
+        far = self.far_observations(-1.5e308, 0.0, 1.0)
+        consensus = locate(far, (1.5e308, 0.0))
+        self.assertEqual(consensus.support, 0)
+        self.assertEqual(consensus.rejected, ("a", "b", "c"))
+
+
 class LocateValidationTest(unittest.TestCase):
     def test_too_few_observations(self):
         for count in (0, 1, 2):
