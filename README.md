@@ -161,6 +161,12 @@ python3 -m nearproof
   - `from_bytes(data)` — 只做契约与 canonical 复核（不验任何 MAC，签名由 `audit_observation_crl` 检查）：非 bytes、缺/多/重复/乱序键、entries 不是数组或未按 id 升序去重、某条 entry 不合 `ObservationRevocation` 契约、字段违约、编码非规范均抛 `ValueError`
 - `make_observation_crl(items, sequence, issued_at, root) -> ObservationRevocationList` — 用非空 root bytes 对一批 `ObservationRevocation`（可为空；不接受字节）签快照：先按 `id` 升序排序、重复 id 抛 `ValueError`，输入顺序不影响 canonical bytes；`mac = HMAC-SHA256(root, b"NPORL1" + 去mac规范JSON)`，直拼无长度前缀；`root` 非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError`
 - `audit_observation_crl(x, root, keys, *, now, min=0) -> None` — 收快照对象或规范字节；恒时复核双层 MAC（列表层 `NPORL1` 用 `root`、每条 entry 用 `keys[id]`），并检查 `issued_at <= now`、`sequence >= min`、各条目 `revoked_at <= now`；`root`/`keys` 形状错抛 `TypeError`，其余（含 MAC 不符、未知 id、未来时间、序号过低）一律抛 `ValueError`；成功返回 `None`
+- `ObservationRevocationListState(version, sequence, digest, mac)` — 防回滚的冻结观察撤销清单前沿检查点（`version=1`、`sequence` 为非布尔 u64 的已接受快照序号、`digest`/`mac` 各恰 32 字节；`digest=SHA256(清单规范 to_bytes 字节)`，把前沿绑定到那一份确定快照而非同序号的其他快照；`mac=HMAC-SHA256(root, b"NPORS1"+去mac规范编码)`，直拼无长度前缀；冻结且可哈希；任何违约抛 `ValueError`；见下）
+  - `to_bytes()` — 键序 `version, sequence, digest, mac`、无空白 UTF-8 JSON，bytes 字段小写十六进制
+  - `from_bytes(data)` — 只收 bytes：字段须各一次且顺序固定，重编码须逐字节相等；不合契约或非规范一律抛 `ValueError`（不验 MAC）
+- `ObservationRevocationListAuditor(root, *, checkpoint=None)` — 带状态、防回滚的观察撤销清单审计器；`root` 为非空 `bytes`（类型错抛 `TypeError`，空值抛 `ValueError`）；`checkpoint` 仅收 `None`、`ObservationRevocationListState` 或其规范字节（其他类型抛 `TypeError`，坏字节或 MAC 不符抛 `ValueError`），加载时恒时验前沿 `NPORS1` MAC，重启时须由调用方落盘传回保存的最新检查点
+  - 只读 `checkpoint` 属性导出当前 `ObservationRevocationListState | None`（未审计时为 `None`）
+  - `audit(snapshot, keys, *, now, min=0)` — 先按 `audit_observation_crl` 语义做双层 MAC、未知 id、未来时间与序号下限复核，再让较高序号在同一把锁内原子推进；同序同摘要返回自身且不推进，同序异摘要、回滚或越过 `2**64` 抛 `ValueError`；快照违约抛 `ValueError`，`keys`/关键字参数形状错抛 `TypeError`；失败不改状态，并发串行化
 - `VerifierTrust(version, id, x, y, key, mac)` — 根密钥 MAC 的冻结信任记录，把验证者 id 绑定到其坐标与共享密钥（`version=1`，`key`/`mac` 各恰 32 字节，不含根密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`key`/`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -1148,6 +1154,27 @@ snapshot = make_observation_crl(items, 7, 120.0, root)
 blob = snapshot.to_bytes()             # 可统一分发
 audit_observation_crl(blob, root, keys, now=130.0, min=7)   # 成功返回 None
 # locate_attested(observations, point, keys, revocation_list=blob, root=root, now=130.0)
+```
+
+### 防回滚前沿 `ObservationRevocationListState` / `ObservationRevocationListAuditor`
+
+仅做 `audit_observation_crl` 的无状态整体复核无法记住已接受的快照前沿：重启之后，或面对并发投递时，一份旧序号清单仍可能覆盖较新的状态。`ObservationRevocationListState` 与 `ObservationRevocationListAuditor` 补上承载该单调前沿的可恢复审计状态，形状与 CRL 侧 `CrlState` / `CrlProofAuditor`、证据侧 `EvidenceRevocationListState` / `EvidenceRevocationListAuditor` 对齐。
+
+`ObservationRevocationListState(version, sequence, digest, mac)` 是冻结且**可哈希**的前沿记录，实例按字段序位置构造、按字段相等。`version` 必须为 `1`；`sequence` 为已接受快照的非布尔 u64 序号；`digest` 与 `mac` 各为恰好 32 字节的 `bytes`。`digest = SHA256(清单规范 to_bytes 内容)`，即已接受 `ObservationRevocationList` 的 `to_bytes()` 字节的 SHA-256，把前沿绑定到**那一份确定的快照**，而不是同一序号的另一份清单。`mac = HMAC-SHA256(root, b"NPORS1" + 去mac字段序紧凑编码)`，域标签与编码直拼、无分隔或长度前缀，记录本身不含根密钥。构造时任何字段违约（含错型）一律抛 `ValueError`。编解码沿用清单的紧凑 JSON 惯例：`to_bytes()` 产出键序 `version, sequence, digest, mac`、bytes 字段小写 hex、无空白、无长度前缀的 UTF-8 JSON；`from_bytes(data)` **只收 bytes**（非 bytes 抛 `ValueError`），字段须各一次且顺序固定——缺/多/重复/乱序键、`version != 1`、u64 违约、非小写或非恰 32 字节 hex 及任何非规范拼写（重编码不逐字节相等）均抛 `ValueError`；**解析不验 MAC**。
+
+`ObservationRevocationListAuditor(root, *, checkpoint=None)` 用非空 `bytes` 根密钥维护这本账本（非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError`）。`checkpoint` 仅限关键字，收 `None`（缺省，空状态，此时只读 `checkpoint` 属性为 `None`）、一个 `ObservationRevocationListState` 对象或其规范字节：其他类型抛 `TypeError`；坏字节由 `from_bytes` 抛 `ValueError`；加载时用 `root` **恒时复核前沿 `NPORS1` MAC**，不符抛 `ValueError`。审计器自身不落盘，重启由调用方把先前 `checkpoint.to_bytes()` 导出的字节传回。
+
+`audit(snapshot, keys, *, now, min=0)` 依次收清单（对象或规范字节）、id 到非空密钥的映射、**必须显式**给出的有限 `now` 与非布尔 u64 序号下限 `min`（缺省 `0`）。**复核、门控与推进在同一把锁内原子完成**：锁内先按既有 `audit_observation_crl` 语义做双层 MAC（列表 `NPORL1` 用 `root`、各条目用 `keys[id]`）、未知 id、`issued_at`/`revoked_at <= now` 时效与 `sequence >= min` 下限的整体复核；通过后再按前沿门控——序号低于前沿（回滚）拒绝、序号相等且 `digest` 相同按**重放接受、返回 self 且不改状态**、序号相等而 `digest` 不同（同序号的另一份清单）拒绝、序号更高才推进并把新前沿 MAC 成 `ObservationRevocationListState`。快照本身的违约（非对象/字节、坏字节、签名、时间、序号下限）抛 `ValueError`；`keys` 不是映射、id 非字符串、key 非 bytes，或 `now`/`min` 形状错抛 `TypeError`（空 id/空 key、非有限 `now`、越界 `min` 仍为 `ValueError`）；同序异摘要、回滚或越过 `2**64` 抛 `ValueError`。任何失败都不改变检查点；并发审计按取锁顺序线性化，已接受前沿绝不丢失或回退。
+
+```python
+from nearproof import ObservationRevocationListAuditor
+
+auditor = ObservationRevocationListAuditor(root)
+auditor.audit(snapshot, keys, now=130.0)       # 高序号原子推进
+auditor.audit(snapshot, keys, now=130.0)       # 同序同摘要：重放，不推进
+saved = auditor.checkpoint.to_bytes()          # 落盘
+restarted = ObservationRevocationListAuditor(root, checkpoint=saved)
+# restarted.audit(old_snapshot, keys, now=...)  -> ValueError：旧清单不能覆盖新状态
 ```
 
 ## 限制
