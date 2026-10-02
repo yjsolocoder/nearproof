@@ -362,6 +362,63 @@ class OutlierAndOrderTest(unittest.TestCase):
         self.assertEqual(confident.accepted, decision.accepted)
 
 
+class LargeDistanceOverflowTest(unittest.TestCase):
+    """Large-but-finite distances must not overflow the median/MAD math."""
+
+    def test_even_count_large_distances(self):
+        # statistics.median would compute (1e308 + 1e308) / 2 == inf here.
+        samples = [make_measurement(i, 1e308) for i in range(1, 7)]
+        decision = assess_confidence(samples, limit=1e308, min_samples=5)
+        self.assertEqual(decision.sample_count, 6)
+        self.assertEqual(decision.inlier_count, 6)
+        self.assertEqual(decision.center, 1e308)
+        self.assertEqual(decision.mad, 0.0)
+        self.assertEqual(decision.lower_bound, 1e308)
+        self.assertEqual(decision.upper_bound, 1e308)
+        self.assertTrue(decision.accepted)
+
+    def test_even_count_large_distances_rejected_below_bound(self):
+        samples = [make_measurement(i, 1e308) for i in range(1, 7)]
+        decision = assess_confidence(samples, limit=9e307, min_samples=5)
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.upper_bound, 1e308)
+
+    def test_mixed_large_distances_statistics(self):
+        samples = [make_measurement(i, 1e308) for i in (1, 2, 3)]
+        samples += [make_measurement(i, 1.2e308) for i in (4, 5, 6)]
+        decision = assess_confidence(samples, limit=1.2e308)
+        self.assertEqual(decision.sample_count, 6)
+        self.assertEqual(decision.inlier_count, 6)
+        self.assertTrue(math.isclose(decision.center, 1.1e308, rel_tol=1e-12))
+        self.assertTrue(math.isclose(decision.mad, 1e307, rel_tol=1e-9))
+        # Default coverage 0.95 over six inliers brackets the extremes.
+        self.assertEqual(decision.lower_bound, 1e308)
+        self.assertEqual(decision.upper_bound, 1.2e308)
+        self.assertTrue(decision.accepted)
+        for value in (
+            decision.center,
+            decision.mad,
+            decision.lower_bound,
+            decision.upper_bound,
+        ):
+            self.assertTrue(math.isfinite(value), msg=value)
+
+    def test_large_distances_order_and_iterator_consistency(self):
+        distances = [1e308, 1e308, 1e308, 1.2e308, 1.2e308, 1.2e308]
+        samples = [make_measurement(i + 1, d) for i, d in enumerate(distances)]
+        expected = assess_confidence(samples, limit=1.2e308)
+        self.assertEqual(
+            assess_confidence(list(reversed(samples)), limit=1.2e308), expected
+        )
+        self.assertEqual(assess_confidence(iter(samples), limit=1.2e308), expected)
+
+    def test_large_distances_inputs_untouched(self):
+        samples = [make_measurement(i, 1e308) for i in range(1, 7)]
+        snapshot = list(samples)
+        assess_confidence(samples, limit=1e308)
+        self.assertEqual(samples, snapshot)
+
+
 class AssessConfidenceValidationTest(unittest.TestCase):
     def setUp(self):
         self.five = [make_measurement(i, 5.0) for i in range(1, 6)]
