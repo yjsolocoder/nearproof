@@ -185,6 +185,11 @@ python3 -m nearproof
 - `CrlProofAuditor(root, *, checkpoint=None)` — 带状态、防回滚的证明审计器；`root` 为非空 `bytes`（类型错抛 `TypeError`，空值抛 `ValueError`）；`checkpoint` 收 `CrlState` 或其规范字节并恒时验 MAC（`None` 为空状态），重启时须由调用方传回保存的最新检查点
   - `audit(proof) -> Consensus` — 先跑无状态 `audit_proof`，再在锁内取证明所载 CRL 的序号与规范字节哈希做门控：低序拒绝、同序仅同哈希重放、高序推进；比较与更新锁内原子，失败不改状态，并发绝不回退
   - 只读 `checkpoint` 属性导出当前 `CrlState | None`
+- `WeightedCrlProof(version, body, mac)` — 根密钥 MAC 的冻结**加权** CRL 快照证明（字段契约、冻结/相等/位置构造语义与 `CrlProof` 相同；`version=1`；`body` 为 bytes，`mac` 恰 32 字节 bytes，否则 `ValueError`）
+  - `to_bytes()` / `from_bytes(data)` — 外层同为 `version, body, mac` 紧凑 JSON；body 解码为十元素数组 `[point, context, records, trusts, crl, now, min, weights, threshold, consensus]`：除 `CrlProof` 的字段外，`weights` 为按参与项 id 升序排列的 id→正整数权重对象（与 records 同序、逐 id 对齐），`threshold` 为不超过总权重的正整数，`consensus` 为 `[total_weight, support_weight, rejected, accepted]`（`rejected` 按字典序）；非 bytes、缺项、重复、乱序、非规范一律抛 `ValueError`（不验 MAC）
+- `prove_weighted_crl(records, point, context, trusts, root, crl, policy, *, now, min=0) -> WeightedCrlProof` — 先以 `audit_crl` 整体认证快照（双层 MAC、`issued_at <= now`、`sequence >= min`），再按加权认证路径核验信任、记录、坐标、点与用途并对命中参与证书抛 `ValueError`，随后按 `ConsensusPolicy` 权重对闭圆盘（边界计入支持）计票；记录/信任/清单收对象或规范字节，权重 id 必须与记录 id 对齐；body 为上述十元素数组，`mac = HMAC-SHA256(root, b"NPWCP1" + body)`，直拼无定界/长度前缀；`root` 非 bytes 抛 `TypeError`，空 bytes 及其他违约抛 `ValueError`
+- `audit_weighted_crl_proof(x, root) -> WeightedConsensus` — 收 `WeightedCrlProof` 对象或规范字节；恒时验证 `NPWCP1` MAC，再按 body 重放 `audit_crl` 与加权认证计票（信任/记录/坐标/点/用途/policy/清单时效与序号全检），重算 `WeightedConsensus` 与 body 所载逐字段相等，否则抛 `ValueError`；`root` 类型错抛 `TypeError`（空 bytes 抛 `ValueError`），其余错误（含重放中冒出的 `TypeError`、错误 key/MAC/id/点/用途/policy/篡改）一律抛 `ValueError`
+- `WeightedCrlProofAuditor(root, *, checkpoint=None)` — 与 `CrlProofAuditor` 同形的带状态防回滚审计器，复用同一 `CrlState` 检查点记录（`NPCK1` MAC）：两类审计器的检查点可互换传入；`audit(proof) -> WeightedConsensus` 先跑 `audit_weighted_crl_proof`，再在锁内做低序拒绝、同序异摘要拒绝、同序同摘要重放（不推进）、高序原子推进；失败不改 checkpoint
 - `SPEED_OF_LIGHT_MPS` — 默认传播速度常量
 
 ### 重放防护
@@ -1061,6 +1066,40 @@ auditor = CrlProofAuditor(root, checkpoint=saved)
 auditor.audit(proof1)                     # 同序同哈希：重放，接受
 auditor.audit(proof_old)                  # 低序：ValueError，前沿不变
 auditor.audit(proof2)                     # sequence=2：推进
+```
+
+### 带撤销快照的加权位置证明 `WeightedCrlProof`
+
+`CrlProof` 把计数式 `locate_cert`（固定 quorum=3）的快照运行封成自证包；`WeightedCrlProof(version, body, mac)` 则是其**加权**对应物，把一次带签名撤销快照的加权多验证者位置证明（`locate_weighted` 语义的根认证版本）连同认证观察、权重策略与撤销清单整体封装，可脱离原运行长期保存、分发给任意持 root 方复核。字段契约、冻结/相等/位置构造、外层 `version, body, mac` 紧凑 JSON 与双层规范重编码规则均与 `CrlProof` 完全一致，唯一区别是 MAC 域前缀与 body 内容：`mac = HMAC-SHA256(root, b"NPWCP1" + body)`，`body` 为十元素数组
+
+```
+[point, context, records, trusts, crl, now, min, weights, threshold, consensus]
+```
+
+其中 `point`、`context`、`records`、`trusts`、`crl`、`now`、`min` 与 `CrlProof` 同名位规则相同（点为两个有限非布尔数的裸数组；用途为非空字符串；记录按 id 升序、信任按同 id 序一一对应；记录/信任/清单均为各自规范字节的小写 hex）；新增的 `weights` 是按参与项 id **升序排列**的 `id -> 正整数权重` JSON 对象，id 集合与顺序必须与 `records` 精确对齐，`threshold` 为不超过总权重的正整数；`consensus` 是 `WeightedConsensus` 的字段序数组 `[total_weight, support_weight, rejected, accepted]`，`rejected` 为字典序 id 数组。
+
+`prove_weighted_crl(records, point, context, trusts, root, crl, policy, *, now, min=0)` 完成生产：`records`/`trusts`/`crl` 均可传对象或其规范字节并自由混输（一次性迭代器先物化，结果与输入顺序无关）；`policy` 必须是 `ConsensusPolicy` 且权重 id 与记录 id 精确对齐；`now` 必填、仅限关键字，`min` 默认 `0`、仅限关键字。函数先以 `audit_crl` 整体认证清单（列表层与条目层双层 MAC、`issued_at` 不晚于 `now`、`sequence` 不低于 `min`），再核验每条信任的 root MAC、每条记录对其信任密钥的 MAC、信任与记录的 id/坐标一致、记录对候选点与用途串的绑定——清单**命中参与证书即抛 `ValueError`**（无关条目不影响，因为快照是全局清单）。全部通过后按权重对闭圆盘 `hypot(point-(x,y)) <= upper_bound` 计票（**边界计入支持**，`decision.accepted` 被忽略），支持权重达到 `policy.threshold` 即接受。`root` 非 `bytes` 抛 `TypeError`，空 bytes 与其他一切违约抛 `ValueError`；函数纯计算。
+
+`audit_weighted_crl_proof(x, root) -> WeightedConsensus` 收对象或规范字节：先恒时复核外层 `NPWCP1` MAC（错 root/错 MAC 抛 `ValueError`），再解析 body 并**完整重放**——对所载清单重跑 `audit_crl`（时效、序号、双层 MAC），对所载记录/信任/点/用途/权重/阈值重跑加权认证路径，重算的 `WeightedConsensus`（含字典序 `rejected` 元组）必须与 body 所载逐字段相等。错误 key、id、点、用途、policy、清单时效/序号或任何字节篡改均抛 `ValueError`；除 `root` 类型错误（`TypeError`，空 bytes 仍为 `ValueError`）外，重放中冒出的 `TypeError` 也一律包装为 `ValueError`。`to_bytes()`/`from_bytes()` 逐字节稳定，缺项、重复键、乱序、非规范编码同样全部拒绝，且 `from_bytes` 不验 MAC。
+
+`WeightedCrlProofAuditor(root, *, checkpoint=None)` 是与 `CrlProofAuditor` 同构的带状态防回滚审计器，并且**复用同一个 `CrlState` 检查点记录**（同一 `NPCK1` MAC 与同一 `SHA256(规范 CRL 字节)` 摘要）：两类审计器导出的检查点可以互换传入，序号前沿在计数证明与加权证明之间统一单调。`audit(proof)` 先跑无状态 `audit_weighted_crl_proof`，成功后在锁内门控：低序抛 `ValueError`；同序异摘要抛 `ValueError`；同序同摘要视为重放，返回 `WeightedConsensus` 但**不推进**；高序原子推进为新 MAC 的 `CrlState`。任何失败都不改动 checkpoint，并发审计不可能回退；重启时同样由调用方经 `checkpoint=` 传回保存的前沿。
+
+```python
+from nearproof import (
+    ConsensusPolicy, WeightedCrlProofAuditor, make_crl,
+    prove_weighted_crl, audit_weighted_crl_proof,
+)
+
+policy = ConsensusPolicy({"a": 1, "b": 2, "c": 4}, 6)
+crl = make_crl(revocations, 3, 100.0, root)
+proof = prove_weighted_crl(records, (0.0, 0.0), context, trusts, root, crl,
+                           policy, now=100.0, min=3)
+blob = proof.to_bytes()                  # 可持久化或分发给持 root 方复核
+consensus = audit_weighted_crl_proof(blob, root)
+consensus.accepted                       # True：支持权重达到阈值
+
+auditor = WeightedCrlProofAuditor(root)
+auditor.audit(proof)                     # 首次推进；checkpoint 与 CrlProofAuditor 互通
 ```
 
 ### 观察撤销 `ObservationRevocation` 与 `revoke_observation`
