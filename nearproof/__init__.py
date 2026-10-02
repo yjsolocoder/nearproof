@@ -217,6 +217,8 @@ __all__ = [
     "VerifierTrust",
     "WeightedCertifiedConsensusEvidence",
     "WeightedConsensus",
+    "WeightedCrlProof",
+    "WeightedCrlProofAuditor",
     "assess",
     "assess_confidence",
     "attest_observation",
@@ -264,6 +266,7 @@ __all__ = [
     "audit_stream_receipt",
     "audit_stream_receipt_batch_commit_receipt",
     "audit_weighted_cert_evidence",
+    "audit_weighted_crl_proof",
     "cert",
     "locate",
     "locate_attested",
@@ -275,6 +278,7 @@ __all__ = [
     "make_crl",
     "make_evidence_revocation_list",
     "prove_crl",
+    "prove_weighted_crl",
     "revoke_bound",
     "revoke_context",
     "revoke_evidence",
@@ -360,6 +364,8 @@ _CERT_EVIDENCE_PREFIX = b"NPCCE1"
 _WEIGHTED_CERT_EVIDENCE_PREFIX = b"NPWCE1"
 # Domain separation prefix for the CRL-snapshot proof MAC.
 _CRL_PROOF_PREFIX = b"NPCCE2"
+# Domain separation prefix for the weighted CRL-snapshot proof MAC.
+_WEIGHTED_CRL_PROOF_PREFIX = b"NPWCP1"
 # Domain separation prefix for the rollback-protection CRL-state MAC.
 _CRL_STATE_PREFIX = b"NPCK1"
 # Domain separation prefixes for the bit-challenge protocol: the transcript
@@ -29583,6 +29589,945 @@ class CrlProofAuditor:
                     raise ValueError(
                         "crl proof carries a different crl at the checkpoint"
                         " sequence"
+                    )
+                if sequence == current.sequence:
+                    # Identical snapshot: an accepted replay, nothing to
+                    # advance.
+                    return consensus
+            candidate = CrlState(
+                version=1,
+                sequence=sequence,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._state = replace(
+                candidate,
+                mac=_crl_state_mac(
+                    self._root, _crl_state_payload(candidate)
+                ),
+            )
+        return consensus
+
+
+_WEIGHTED_CRL_PROOF_FIELDS = ("version", "body", "mac")
+_WEIGHTED_CRL_PROOF_BODY_FIELDS = (
+    "point",
+    "context",
+    "records",
+    "trusts",
+    "crl",
+    "now",
+    "min",
+    "weights",
+    "threshold",
+    "consensus",
+)
+
+
+def _weighted_crl_proof_mac(root: bytes, body: bytes) -> bytes:
+    """HMAC-SHA256 over ``b"NPWCP1"`` plus the body bytes, directly concatenated.
+
+    The body bytes are exactly the compact UTF-8 JSON array that sits in the
+    ``body`` field of the outer document; the prefix carries no separator or
+    length prefix.
+    """
+    return hmac.new(
+        root, _WEIGHTED_CRL_PROOF_PREFIX + body, hashlib.sha256
+    ).digest()
+
+
+@dataclass(frozen=True)
+class WeightedCrlProof:
+    """A root-MAC'd snapshot of one weighted certified run against a CRL.
+
+    ``version`` is always ``1``; ``body`` is ``bytes`` holding the compact
+    UTF-8 JSON array ``[point, context, records, trusts, crl, now, min,
+    weights, threshold, consensus]``; ``mac`` is exactly 32 bytes —
+    ``HMAC-SHA256(root, b"NPWCP1" + body)``, the prefix and the body
+    concatenated directly with no separator or length prefix. ``body`` and
+    ``mac`` that are not ``bytes`` (or a ``mac`` of the wrong length) raise
+    :class:`ValueError` at construction time. Instances are frozen,
+    constructed positionally in field order and compare equal by their
+    fields. No root material is stored.
+
+    Inside the body: ``point`` is a bare two-element JSON array of finite
+    non-bool numbers; ``context`` a non-empty string; ``records`` and
+    ``trusts`` are arrays of canonical lowercase hex strings, one per
+    participating :class:`BoundAttestedObservation` and
+    :class:`VerifierTrust` (records sorted by id, each trust aligned with
+    the record of the same id); ``crl`` the canonical
+    :meth:`TrustRevocationList.to_bytes` encoding as a lowercase hex
+    string; ``now`` a finite non-bool number; ``min`` a non-bool integer;
+    ``weights`` an object mapping each participating verifier id to its
+    positive integer weight, with the ids in the same sorted order as the
+    records; ``threshold`` the positive integer supporting weight needed
+    for acceptance; ``consensus`` an array in :class:`WeightedConsensus`
+    field order ``[total_weight, support_weight, rejected, accepted]``
+    with ``rejected`` a lexicographically sorted array of ids. The body
+    bytes themselves are opaque to the constructor —
+    :func:`prove_weighted_crl` produces conforming ones and
+    :meth:`from_bytes` enforces the whole contract.
+    """
+
+    version: int
+    body: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("weighted crl proof version must be 1")
+        if not isinstance(self.body, bytes):
+            raise ValueError("weighted crl proof body must be bytes")
+        if not isinstance(self.mac, bytes) or len(self.mac) != 32:
+            raise ValueError("weighted crl proof mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: outer keys ``version, body, mac`` in
+        that order, ``body`` and ``mac`` as lowercase hex, no whitespace.
+
+        The opaque ``body`` must itself be canonical compact JSON: decoding
+        it and re-encoding with the canonical encoder must reproduce the
+        stored bytes exactly. A body that is not JSON or whose canonical
+        re-encoding differs raises :class:`ValueError`; the instance is
+        frozen, so the stored bytes are never replaced by the re-encoding.
+        """
+        try:
+            decoded_body = json.loads(self.body)
+        except ValueError as error:
+            raise ValueError(
+                "weighted crl proof body must be compact JSON"
+            ) from error
+        try:
+            canonical_body = _encode_payload(decoded_body)
+        except ValueError as error:
+            raise ValueError(
+                "weighted crl proof body encoding is not canonical"
+            ) from error
+        if canonical_body != self.body:
+            raise ValueError(
+                "weighted crl proof body encoding is not canonical"
+            )
+        return _encode_payload(
+            {
+                "version": self.version,
+                "body": self.body.hex(),
+                "mac": self.mac.hex(),
+            }
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "WeightedCrlProof":
+        """Decode :meth:`to_bytes` output, enforcing the full field contract.
+
+        Raises :class:`ValueError` for anything that is not ``bytes`` or does
+        not satisfy the contract: an outer object with exactly the keys
+        ``version, body, mac`` once each in that order, ``version == 1``,
+        ``body`` and ``mac`` lowercase hex strings (``mac`` decoding to
+        exactly 32 bytes), a body decoding to exactly the array ``[point,
+        context, records, trusts, crl, now, min, weights, threshold,
+        consensus]`` with ``point`` a two-element finite-non-bool-number
+        array, ``context`` a non-empty string, ``records``/``trusts``
+        arrays of canonical lowercase hex strings equal in length and
+        unique one-to-one by the ids parsed out of those encodings
+        (records id-sorted, each trust aligned with the record of the same
+        id), ``crl`` a lowercase hex string decoding to a canonical
+        :class:`TrustRevocationList` encoding, ``now`` a finite non-bool
+        number, ``min`` a non-bool integer, ``weights`` an object mapping
+        exactly those ids — in the same sorted order — to positive integer
+        weights, ``threshold`` a positive integer not exceeding the total
+        weight, and a ``consensus`` array in ``[total_weight,
+        support_weight, rejected, accepted]`` order with non-bool integers,
+        a lexicographically sorted array of non-empty unique id strings for
+        ``rejected``, and a bool ``accepted``. The body itself must be
+        canonical compact JSON, so its own re-encoding must match byte for
+        byte. After parsing and validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for byte.
+        Neither the outer MAC nor anything in the body is verified here —
+        use :func:`audit_weighted_crl_proof` with the root key for that.
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("weighted crl proof data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedWeightedCrlProofObject)
+        except ValueError as error:
+            raise ValueError(
+                f"weighted crl proof is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _WEIGHTED_CRL_PROOF_FIELDS
+        ):
+            raise ValueError(
+                "weighted crl proof must be a JSON object with exactly the"
+                " version, body and mac fields in field order"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("weighted crl proof version must be 1")
+        body = _parse_weighted_crl_proof_hex(obj["body"], "body")
+        mac = _parse_weighted_crl_proof_hex(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "weighted crl proof mac must decode to exactly 32 bytes"
+            )
+        _parse_weighted_crl_proof_body(body)
+        record = cls(version=version, body=body, mac=mac)
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError(
+                "weighted crl proof encoding is not canonical"
+            )
+        return record
+
+
+def _parse_weighted_crl_proof_hex(value: object, name: str) -> bytes:
+    # Same lowercase, round-tripping hex rule as the other records; both
+    # shape and value failures are ValueErrors for this record.
+    if not isinstance(value, str):
+        raise ValueError(
+            f"weighted crl proof {name} must be a lowercase hex string"
+        )
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"weighted crl proof {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        # Rejects uppercase digits, separators and odd-length input that
+        # bytes.fromhex would otherwise tolerate.
+        raise ValueError(
+            f"weighted crl proof {name} must be a lowercase hex string"
+        )
+    return raw
+
+
+class _OrderedWeightedCrlProofObject(json.JSONDecoder):
+    """JSON decoder rejecting duplicate/out-of-order keys at the outer layer.
+
+    The outer object must carry exactly ``version, body, mac``; the body
+    array carries objects only indirectly (the hex strings inside it decode
+    to records/trusts/a CRL whose own key order their ``from_bytes`` checks,
+    and the weights object's id order the body parser checks), so the only
+    object key set to enforce at this layer is the outer one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys == list(_WEIGHTED_CRL_PROOF_FIELDS):
+            return dict(pairs)
+        raise ValueError(
+            "weighted crl proof JSON keys must be exactly version, body and"
+            " mac in field order"
+        )
+
+
+def _require_weighted_crl_proof_hex_array(value: object, name: str) -> list:
+    if not isinstance(value, list):
+        raise ValueError(
+            f"weighted crl proof {name} must be an array of lowercase hex"
+            " strings"
+        )
+    return [_parse_weighted_crl_proof_hex(entry, name) for entry in value]
+
+
+def _parse_weighted_crl_proof_hex_item(raw: bytes, kind: type, name: str) -> object:
+    """Decode one hex body item through the record's own byte contract."""
+    try:
+        return kind.from_bytes(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"weighted crl proof {name} must contain only canonical"
+            f" {kind.__name__} encodings"
+        ) from error
+
+
+def _parse_weighted_crl_proof_consensus(value: object) -> None:
+    if not isinstance(value, list) or len(value) != len(_WEIGHTED_CONSENSUS_FIELDS):
+        raise ValueError(
+            "weighted crl proof consensus must be an array of exactly"
+            " total_weight, support_weight, rejected and accepted"
+        )
+    raw_total, raw_support, raw_rejected, raw_accepted = value
+    for field_name, number in (
+        ("total_weight", raw_total),
+        ("support_weight", raw_support),
+    ):
+        if type(number) is not int:
+            raise ValueError(
+                f"weighted crl proof consensus {field_name} must be a"
+                " non-bool integer"
+            )
+    if not isinstance(raw_rejected, list) or any(
+        not isinstance(ident, str) or not ident for ident in raw_rejected
+    ):
+        raise ValueError(
+            "weighted crl proof consensus rejected must be an array of"
+            " non-empty strings"
+        )
+    if list(raw_rejected) != sorted(raw_rejected):
+        raise ValueError(
+            "weighted crl proof consensus rejected must be sorted"
+            " lexicographically"
+        )
+    if len(set(raw_rejected)) != len(raw_rejected):
+        raise ValueError(
+            "weighted crl proof consensus rejected must contain no duplicates"
+        )
+    if type(raw_accepted) is not bool:
+        raise ValueError(
+            "weighted crl proof consensus accepted must be a bool"
+        )
+
+
+def _parse_weighted_crl_proof_body(body: bytes) -> list:
+    """Parse and validate the body array, returning the decoded list.
+
+    The body is the inner compact-JSON layer: it must itself be the
+    canonical encoding of the decoded structure (a re-encoding must match
+    byte for byte), and every embedded record/trust/CRL hex string must
+    decode through that record's own byte contract.
+    """
+    try:
+        decoded = json.loads(body)
+    except ValueError as error:
+        raise ValueError(
+            "weighted crl proof body must be compact JSON"
+        ) from error
+    if not isinstance(decoded, list) or len(decoded) != len(
+        _WEIGHTED_CRL_PROOF_BODY_FIELDS
+    ):
+        raise ValueError(
+            "weighted crl proof body must be an array of exactly point,"
+            " context, records, trusts, crl, now, min, weights, threshold"
+            " and consensus"
+        )
+    (
+        raw_point,
+        raw_context,
+        raw_records,
+        raw_trusts,
+        raw_crl,
+        raw_now,
+        raw_min,
+        raw_weights,
+        raw_threshold,
+        raw_consensus,
+    ) = decoded
+    if (
+        not isinstance(raw_point, list)
+        or len(raw_point) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in raw_point
+        )
+    ):
+        raise ValueError(
+            "weighted crl proof point must be an array of exactly two finite"
+            " non-bool numbers"
+        )
+    if not isinstance(raw_context, str) or not raw_context:
+        raise ValueError(
+            "weighted crl proof context must be a non-empty string"
+        )
+    record_blobs = _require_weighted_crl_proof_hex_array(raw_records, "records")
+    trust_blobs = _require_weighted_crl_proof_hex_array(raw_trusts, "trusts")
+    parsed_records = [
+        _parse_weighted_crl_proof_hex_item(raw, BoundAttestedObservation, "records")
+        for raw in record_blobs
+    ]
+    parsed_trusts = [
+        _parse_weighted_crl_proof_hex_item(raw, VerifierTrust, "trusts")
+        for raw in trust_blobs
+    ]
+    record_ids = [item.id for item in parsed_records]
+    trust_ids = [item.id for item in parsed_trusts]
+    if len(set(record_ids)) != len(record_ids):
+        raise ValueError("weighted crl proof records must have unique ids")
+    if len(set(trust_ids)) != len(trust_ids):
+        raise ValueError("weighted crl proof trusts must have unique ids")
+    if sorted(record_ids) != record_ids:
+        # The canonical producer orders the records by id and aligns the
+        # trusts at the same index order.
+        raise ValueError("weighted crl proof records must be sorted by id")
+    if trust_ids != record_ids:
+        # The two arrays correspond one-to-one by id at every index.
+        raise ValueError(
+            "weighted crl proof records and trusts must correspond"
+            " one-to-one by id in the same order"
+        )
+    crl_blob = _parse_weighted_crl_proof_hex(raw_crl, "crl")
+    try:
+        TrustRevocationList.from_bytes(crl_blob)
+    except ValueError as error:
+        raise ValueError(
+            "weighted crl proof crl must be a canonical TrustRevocationList"
+            " encoding"
+        ) from error
+    if isinstance(raw_now, bool) or not isinstance(raw_now, (int, float)):
+        raise ValueError("weighted crl proof now must be a finite non-bool number")
+    if not math.isfinite(raw_now):
+        raise ValueError("weighted crl proof now must be a finite non-bool number")
+    if type(raw_min) is not int:
+        raise ValueError("weighted crl proof min must be a non-bool integer")
+    if not isinstance(raw_weights, dict) or any(
+        not isinstance(ident, str) or not ident for ident in raw_weights
+    ):
+        raise ValueError(
+            "weighted crl proof weights must be an object mapping each"
+            " verifier id to a positive integer weight"
+        )
+    if list(raw_weights) != record_ids:
+        # The weights object carries exactly the participating ids in the
+        # same sorted order as the records: an unknown, missing, reordered
+        # or duplicated id (the last also breaks the canonical re-encoding)
+        # is a contract breach.
+        raise ValueError(
+            "weighted crl proof weights ids must match the record ids in"
+            " the same sorted order"
+        )
+    for weight in raw_weights.values():
+        if type(weight) is not int or weight < 1:
+            raise ValueError(
+                "weighted crl proof weights must map each id to a positive"
+                " integer weight"
+            )
+    if type(raw_threshold) is not int or raw_threshold < 1:
+        raise ValueError(
+            "weighted crl proof threshold must be a positive integer"
+        )
+    if raw_threshold > sum(raw_weights.values()):
+        raise ValueError(
+            "weighted crl proof threshold must not exceed the total weight"
+        )
+    _parse_weighted_crl_proof_consensus(raw_consensus)
+    if _encode_payload(decoded) != body:
+        # The inner layer is canonical compact JSON too: no whitespace,
+        # pretty-printing, framing or non-canonical number/string spellings.
+        raise ValueError(
+            "weighted crl proof body encoding is not canonical"
+        )
+    return decoded
+
+
+def _build_weighted_crl_proof_body(
+    point: tuple[float, float],
+    context: str,
+    records: "list[BoundAttestedObservation]",
+    trusts: "dict[str, VerifierTrust]",
+    crl: "TrustRevocationList",
+    now: float,
+    minimum: int,
+    policy: ConsensusPolicy,
+    consensus: "WeightedConsensus",
+) -> bytes:
+    """Assemble the canonical body bytes for one weighted snapshot run.
+
+    Records are sorted by id and the trusts are placed in the same id order,
+    so the two arrays correspond one-to-one at each index; both, and the CRL
+    snapshot, are encoded through their own canonical byte encodings and
+    carried as lowercase hex strings. The weights object carries the same
+    ids in the same sorted order.
+    """
+    ordered_records = sorted(records, key=lambda item: item.id)
+    ordered_ids = [item.id for item in ordered_records]
+    body = [
+        [point[0], point[1]],
+        context,
+        [item.to_bytes().hex() for item in ordered_records],
+        [trusts[item.id].to_bytes().hex() for item in ordered_records],
+        crl.to_bytes().hex(),
+        now,
+        minimum,
+        {ident: policy.weights[ident] for ident in ordered_ids},
+        policy.threshold,
+        [
+            consensus.total_weight,
+            consensus.support_weight,
+            list(consensus.rejected),
+            consensus.accepted,
+        ],
+    ]
+    return _encode_payload(body)
+
+
+def _locate_weighted_cert_crl(
+    records: object,
+    point: object,
+    context: object,
+    trusts: object,
+    root: bytes,
+    snapshot: "TrustRevocationList",
+    now: float,
+    minimum: int,
+    policy: object,
+) -> "tuple[WeightedConsensus, list[BoundAttestedObservation], dict[str, VerifierTrust]]":
+    """Verify root-certified records against a CRL snapshot and tally weighted.
+
+    The verification half is the snapshot path of :func:`locate_cert`
+    without its fixed quorum of three — a single verifier may participate —
+    and the tally half is :func:`locate_weighted` with ``tolerance`` fixed
+    at ``0.0``: every trust root MAC and every record MAC is recomputed and
+    compared in constant time, the trust ``id``/``x``/``y`` and the record
+    point/context bindings are checked, and a CRL entry whose ``(id,
+    target)`` hits a participating certificate permanently revokes it. The
+    snapshot is global, so entries naming other certificates are ignored;
+    its list and entry MACs, freshness (``issued_at <= now``) and sequence
+    floor (``sequence >= min``) are authenticated with :func:`audit_crl`.
+    Returns the :class:`WeightedConsensus` together with the parsed records
+    and the id-keyed trust map so callers can freeze the exact inputs into
+    a proof body.
+    """
+    if not isinstance(point, tuple) or len(point) != 2:
+        raise ValueError("point must be a tuple of exactly two finite numbers")
+    px = _finite_non_bool(point[0])
+    py = _finite_non_bool(point[1])
+    if not isinstance(context, str) or not context:
+        raise ValueError("context must be a non-empty string")
+
+    audit_crl(snapshot, root, now, min=minimum)
+    revoked_pairs = {
+        (entry.id, entry.target) for entry in snapshot.entries
+    }
+
+    try:
+        raw_trusts = list(trusts)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "trusts must be an iterable of VerifierTrust or bytes"
+        ) from error
+    trust_map: dict[str, VerifierTrust] = {}
+    for entry in raw_trusts:
+        if isinstance(entry, bytes):
+            entry = VerifierTrust.from_bytes(entry)
+        if not isinstance(entry, VerifierTrust):
+            raise ValueError(
+                "trusts must contain only VerifierTrust instances or bytes"
+            )
+        ident = entry.id
+        if ident in trust_map:
+            raise ValueError(f"duplicate trust id: {ident!r}")
+        if not hmac.compare_digest(
+            _trust_mac(root, _trust_payload(entry)), entry.mac
+        ):
+            raise ValueError(f"verifier trust mac does not match: {ident!r}")
+        trust_map[ident] = entry
+
+    try:
+        raw_records = list(records)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "records must be an iterable of BoundAttestedObservation or bytes"
+        ) from error
+    observations: list[Observation] = []
+    parsed_records: list[BoundAttestedObservation] = []
+    seen_ids: set[str] = set()
+    for item in raw_records:
+        if isinstance(item, bytes):
+            item = BoundAttestedObservation.from_bytes(item)
+        if not isinstance(item, BoundAttestedObservation):
+            raise ValueError(
+                "records must contain only BoundAttestedObservation"
+                " instances or bytes"
+            )
+        ident = item.id
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        trust = trust_map.get(ident)
+        if trust is None:
+            raise ValueError(f"missing verifier trust for id: {ident!r}")
+        if (ident, trust.mac) in revoked_pairs:
+            # Permanent revocation: a certificate whose root MAC is the
+            # target of a snapshot entry can never support a record.
+            raise ValueError(f"verifier trust has been revoked: {ident!r}")
+        if not hmac.compare_digest(
+            _bound_attested_mac(trust.key, _bound_attested_payload(item)),
+            item.mac,
+        ):
+            raise ValueError(
+                f"bound attested observation mac does not match: {ident!r}"
+            )
+        # Only after both MACs verify do the trust bindings count: the
+        # certified id/x/y must equal the record's, or it is a contract
+        # breach.
+        if trust.x != item.x or trust.y != item.y:
+            raise ValueError(
+                f"verifier trust does not match the observation: {ident!r}"
+            )
+        # The signed record must match the query coordinate by coordinate
+        # and carry exactly the queried use context.
+        if item.point[0] != px or item.point[1] != py or item.context != context:
+            raise ValueError(
+                "bound attested observation is not bound to the queried"
+                f" point and context: {ident!r}"
+            )
+        parsed_records.append(item)
+        observations.append(
+            Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
+        )
+
+    consensus = locate_weighted(observations, point, policy)
+    return consensus, parsed_records, trust_map
+
+
+def prove_weighted_crl(
+    records: object,
+    point: object,
+    context: object,
+    trusts: object,
+    root: object,
+    crl: object,
+    policy: object,
+    *,
+    now: object,
+    min: object = 0,
+) -> WeightedCrlProof:
+    """Run a weighted root-certified consensus against a CRL and package it.
+
+    The positional arguments are the certified observations, the candidate
+    point, the use-context string, the verifier trusts, the root key, the
+    revocation snapshot and the :class:`ConsensusPolicy`. ``records`` and
+    ``trusts`` accept :class:`BoundAttestedObservation`/
+    :class:`VerifierTrust` instances and their canonical byte encodings,
+    mixed freely; ``crl`` accepts a :class:`TrustRevocationList` or its
+    canonical :meth:`TrustRevocationList.to_bytes` encoding. ``now`` is
+    keyword-only and required and ``min`` (a non-bool integer, default
+    ``0``) keyword-only. The snapshot is authenticated wholesale with
+    :func:`audit_crl` (both MAC layers, ``issued_at <= now`` and
+    ``sequence >= min``) and only its hits apply: a participating
+    certificate named by an entry raises :class:`ValueError`, while an
+    entry for an unrelated certificate is ignored. The trust MACs, record
+    MACs, coordinates, point/context bindings and the policy weight ids
+    (which must match the record ids exactly) are checked exactly as in
+    :func:`locate_weighted_cert_evidence`. A non-bytes ``root`` raises
+    :class:`TypeError`; every other contract violation raises
+    :class:`ValueError`.
+
+    On success the verified :class:`WeightedConsensus` is frozen into a
+    :class:`WeightedCrlProof` whose body is the compact JSON array
+    ``[point, context, records, trusts, crl, now, min, weights, threshold,
+    consensus]`` with the participating records sorted by id, the trusts
+    aligned one-to-one by id, records, trusts and CRL carried as canonical
+    lowercase hex strings, the policy weights as an object with the same
+    ids in the same sorted order, and the consensus as a
+    ``[total_weight, support_weight, rejected, accepted]`` array with
+    ``rejected`` lexicographically sorted; the MAC is
+    ``HMAC-SHA256(root, b"NPWCP1" + body)``. The function is pure.
+    """
+    root = _require_root(root)
+
+    # Materialise the iterables under the same mixing rules as the other
+    # cert entries before the run, so a one-shot iterable can be re-used to
+    # build the body and so the body carries exactly the participants.
+    try:
+        raw_records = list(records)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "records must be an iterable of BoundAttestedObservation or bytes"
+        ) from error
+    parsed_records: list[BoundAttestedObservation] = []
+    for item in raw_records:
+        if isinstance(item, bytes):
+            item = BoundAttestedObservation.from_bytes(item)
+        if not isinstance(item, BoundAttestedObservation):
+            raise ValueError(
+                "records must contain only BoundAttestedObservation"
+                " instances or bytes"
+            )
+        parsed_records.append(item)
+
+    try:
+        raw_trusts = list(trusts)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "trusts must be an iterable of VerifierTrust or bytes"
+        ) from error
+    parsed_trusts: list[VerifierTrust] = []
+    for entry in raw_trusts:
+        if isinstance(entry, bytes):
+            entry = VerifierTrust.from_bytes(entry)
+        if not isinstance(entry, VerifierTrust):
+            raise ValueError(
+                "trusts must contain only VerifierTrust instances or bytes"
+            )
+        parsed_trusts.append(entry)
+
+    if isinstance(crl, bytes):
+        snapshot = TrustRevocationList.from_bytes(crl)
+    elif isinstance(crl, TrustRevocationList):
+        snapshot = crl
+    else:
+        raise ValueError(
+            "crl must be a TrustRevocationList instance or bytes"
+        )
+
+    if not isinstance(policy, ConsensusPolicy):
+        raise ValueError("policy must be a ConsensusPolicy")
+
+    # The replay helper owns the now/min contract through audit_crl, but the
+    # body must carry canonical values too, so enforce the same rules here.
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValueError("now must be a finite number")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be a finite number")
+    if isinstance(min, bool) or type(min) is not int:
+        raise ValueError("min must be an integer")
+
+    consensus, checked_records, trust_map = _locate_weighted_cert_crl(
+        parsed_records,
+        point,
+        context,
+        parsed_trusts,
+        root,
+        snapshot,
+        current,
+        min,
+        policy,
+    )
+    body = _build_weighted_crl_proof_body(
+        point,  # type: ignore[arg-type]
+        context,  # type: ignore[arg-type]
+        checked_records,
+        trust_map,
+        snapshot,
+        current,
+        min,
+        policy,
+        consensus,
+    )
+    return WeightedCrlProof(
+        version=1,
+        body=body,
+        mac=_weighted_crl_proof_mac(root, body),
+    )
+
+
+def audit_weighted_crl_proof(
+    x: "WeightedCrlProof | bytes", root: object
+) -> "WeightedConsensus":
+    """Authenticate a :class:`WeightedCrlProof` and rerun its snapshot proof.
+
+    Accepts the proof itself or its canonical
+    :meth:`WeightedCrlProof.to_bytes` encoding; anything else, or any
+    encoding that does not satisfy the record contract, raises
+    :class:`ValueError`. ``root`` must be non-empty ``bytes`` — a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`;
+    every other failure (including any :class:`TypeError` raised while
+    replaying the body) is reported as :class:`ValueError`.
+
+    The outer MAC is recomputed as
+    ``HMAC-SHA256(root, b"NPWCP1" + body)`` and compared in constant time;
+    a mismatch raises :class:`ValueError`. The body is then parsed and the
+    snapshot is replayed exactly as :func:`prove_weighted_crl` produced it:
+    :func:`audit_crl` reruns over the carried CRL under the carried
+    ``now``/``min`` and ``root`` (both MAC layers, freshness and sequence
+    floor included), and the weighted certified consensus is rerun over
+    exactly the records, trusts, point, context, CRL snapshot, weights and
+    threshold the body carries (every record and trust MAC rechecked, the
+    snapshot hits applied, and the closed disks tallied with the declared
+    weights); the recomputed :class:`WeightedConsensus` must equal the one
+    carried in the body field by field — including the lexicographically
+    sorted ``rejected`` tuple — or :class:`ValueError` is raised. On
+    success the rerun :class:`WeightedConsensus` is returned.
+    """
+    root = _require_root(root)
+    try:
+        return _audit_weighted_crl_proof(x, root)
+    except TypeError as error:
+        # The only shape error reported as TypeError is the root type, which
+        # was checked above; every replay failure is a ValueError.
+        raise ValueError(f"weighted crl proof is invalid: {error}") from error
+
+
+def _audit_weighted_crl_proof(x: object, root: bytes) -> "WeightedConsensus":
+    """Inner replay for :func:`audit_weighted_crl_proof`; root is validated."""
+    if isinstance(x, bytes):
+        proof = WeightedCrlProof.from_bytes(x)
+    elif isinstance(x, WeightedCrlProof):
+        proof = x
+    else:
+        raise ValueError(
+            "weighted crl proof must be a WeightedCrlProof instance or bytes"
+        )
+    if not hmac.compare_digest(
+        _weighted_crl_proof_mac(root, proof.body), proof.mac
+    ):
+        raise ValueError("weighted crl proof mac does not match")
+    parsed = _parse_weighted_crl_proof_body(proof.body)
+    (
+        raw_point,
+        raw_context,
+        raw_records,
+        raw_trusts,
+        raw_crl,
+        raw_now,
+        raw_min,
+        raw_weights,
+        raw_threshold,
+        raw_consensus,
+    ) = parsed
+    record_blobs = [
+        _parse_weighted_crl_proof_hex(entry, "records") for entry in raw_records
+    ]
+    trust_blobs = [
+        _parse_weighted_crl_proof_hex(entry, "trusts") for entry in raw_trusts
+    ]
+    crl_blob = _parse_weighted_crl_proof_hex(raw_crl, "crl")
+    snapshot = TrustRevocationList.from_bytes(crl_blob)
+    policy = ConsensusPolicy(raw_weights, raw_threshold)
+    point = (raw_point[0], raw_point[1])
+    # Replay the snapshot exactly as prove_weighted_crl ran it: audit_crl
+    # first (it also runs inside the weighted snapshot path), then the
+    # verified weighted tally over exactly the carried inputs.
+    consensus, _records, _trusts = _locate_weighted_cert_crl(
+        record_blobs,
+        point,
+        raw_context,
+        trust_blobs,
+        root,
+        snapshot,
+        raw_now,
+        raw_min,
+        policy,
+    )
+    carried = WeightedConsensus(
+        total_weight=raw_consensus[0],
+        support_weight=raw_consensus[1],
+        rejected=tuple(raw_consensus[2]),
+        accepted=raw_consensus[3],
+    )
+    if carried != consensus:
+        raise ValueError(
+            "weighted crl proof consensus does not match the recomputed"
+            " result"
+        )
+    return consensus
+
+
+def _weighted_crl_proof_snapshot(proof: WeightedCrlProof) -> "tuple[int, bytes]":
+    """Return ``(sequence, crl_bytes)`` from an already audited weighted proof.
+
+    The ``crl`` body element is the canonical
+    :meth:`TrustRevocationList.to_bytes` encoding as lowercase hex. Callers
+    must only reach this after :func:`audit_weighted_crl_proof` succeeded,
+    which has already enforced the body and CRL contracts.
+    """
+    parsed = json.loads(proof.body)
+    crl_blob = _parse_weighted_crl_proof_hex(parsed[4], "crl")
+    snapshot = TrustRevocationList.from_bytes(crl_blob)
+    return snapshot.sequence, crl_blob
+
+
+class WeightedCrlProofAuditor:
+    """Stateful :class:`WeightedCrlProof` auditor that refuses CRL rollback.
+
+    ``root`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    root the CRL snapshots, proofs and checkpoints are MAC'd with.
+    ``checkpoint`` is keyword-only and reuses the exact
+    :class:`CrlState` checkpoint of :class:`CrlProofAuditor`: ``None``
+    (the default) starts from the empty state; otherwise it must be a
+    :class:`CrlState` or its canonical :meth:`CrlState.to_bytes` encoding,
+    and its MAC is recomputed with ``root`` and compared in constant time
+    (a malformed encoding or MAC mismatch raises :class:`ValueError`).
+    Across a restart the caller must pass the value previously exported at
+    :attr:`checkpoint`; nothing is persisted by the auditor itself.
+
+    Each :meth:`audit` first runs the stateless
+    :func:`audit_weighted_crl_proof`; only after it succeeds is the carried
+    CRL snapshot examined. Its sequence and ``SHA256`` over its canonical
+    CRL bytes are compared against the checkpoint under a lock: a lower
+    sequence is rejected, an equal sequence is accepted solely as a replay
+    of the identical CRL digest (a different digest at the same sequence
+    is rejected and does not advance), and a higher sequence advances the
+    checkpoint atomically. A rejected proof never changes the checkpoint
+    and concurrent audits can never move it backwards. Every failure other
+    than a non-bytes ``root`` raises :class:`ValueError`.
+    """
+
+    def __init__(self, root: object, *, checkpoint: object = None) -> None:
+        self._root = _require_root(root)
+        self._lock = threading.Lock()
+        self._state: "Optional[CrlState]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, CrlState):
+            state = checkpoint
+        elif isinstance(checkpoint, bytes):
+            state = CrlState.from_bytes(checkpoint)
+        else:
+            raise ValueError(
+                "checkpoint must be a CrlState instance, its canonical bytes,"
+                " or None"
+            )
+        if not hmac.compare_digest(
+            _crl_state_mac(self._root, _crl_state_payload(state)), state.mac
+        ):
+            raise ValueError("checkpoint mac does not match the root")
+        self._state = state
+
+    @property
+    def checkpoint(self) -> "Optional[CrlState]":
+        """The current frontier :class:`CrlState`, or ``None`` before the
+        first successfully audited proof. The returned object is frozen and
+        the property read-only; persist its :meth:`CrlState.to_bytes` output
+        and pass it back to a new auditor to survive a restart."""
+        return self._state
+
+    def audit(self, proof: "WeightedCrlProof | bytes") -> "WeightedConsensus":
+        """Audit ``proof`` and enforce monotone CRL progress.
+
+        Accepts a :class:`WeightedCrlProof` or its canonical
+        :meth:`WeightedCrlProof.to_bytes` encoding, exactly like
+        :func:`audit_weighted_crl_proof`, which runs first and whose result
+        is returned on success: every cryptographic, canonicity and replay
+        failure it raises is a :class:`ValueError` and leaves the
+        checkpoint untouched. After that succeeds, the carried CRL is gated
+        against the checkpoint under the lock — lower sequence rejected,
+        equal sequence accepted only with the identical CRL digest (without
+        advancing), higher sequence advancing it — and the new checkpoint
+        is MAC'd as ``HMAC-SHA256(root, b"NPCK1" + encoding)``.
+        """
+        # Parse before locking: a malformed argument is rejected without
+        # touching the checkpoint or serializing against another audit.
+        if isinstance(proof, bytes):
+            record = WeightedCrlProof.from_bytes(proof)
+        elif isinstance(proof, WeightedCrlProof):
+            record = proof
+        else:
+            raise ValueError(
+                "weighted crl proof must be a WeightedCrlProof instance or"
+                " bytes"
+            )
+        # audit_weighted_crl_proof is pure and owns the cryptographic/value
+        # contract, so run it outside the lock; only compare-and-update is
+        # serialized.
+        consensus = audit_weighted_crl_proof(record, self._root)
+        sequence, crl_blob = _weighted_crl_proof_snapshot(record)
+        digest = hashlib.sha256(crl_blob).digest()
+        with self._lock:
+            current = self._state
+            if current is not None:
+                if sequence < current.sequence:
+                    raise ValueError(
+                        "weighted crl proof sequence is below the audited"
+                        " checkpoint"
+                    )
+                if sequence == current.sequence and not hmac.compare_digest(
+                    digest, current.digest
+                ):
+                    raise ValueError(
+                        "weighted crl proof carries a different crl at the"
+                        " checkpoint sequence"
                     )
                 if sequence == current.sequence:
                     # Identical snapshot: an accepted replay, nothing to
