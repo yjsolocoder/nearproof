@@ -29,7 +29,7 @@ JournalBatchReceiptFrontier /
 Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
 RangeBatchReceipt /
 RangeDecision / RangeFrontier / RangeReceipt / RangeReceiptBatch /
-ReceiptStream / SPEED_OF_LIGHT_MPS / SpanBundleReceipt /
+ReceiptStream / RegionDecision / SPEED_OF_LIGHT_MPS / SpanBundleReceipt /
 SpanBundleReceiptAuditor / SpanBundleReceiptBatch /
 SpanBundleReceiptBatchReceipt /
 SpanBundleReceiptBatchReceiptAuditor /
@@ -81,7 +81,7 @@ audit_stream_commit_receipt_span_receipt /
 audit_stream_receipt / audit_stream_receipt_batch_commit_receipt /
 cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
-locate_cert_evidence / locate_weighted / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
+locate_cert_evidence / locate_region / locate_weighted / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
 revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
 seal_bound_series /
 seal_evidence_revocation_list_bundle /
@@ -179,6 +179,7 @@ __all__ = [
     "RangeReceipt",
     "RangeReceiptBatch",
     "ReceiptStream",
+    "RegionDecision",
     "SPEED_OF_LIGHT_MPS",
     "SpanBundleReceipt",
     "SpanBundleReceiptAuditor",
@@ -273,6 +274,7 @@ __all__ = [
     "locate_bound_attested",
     "locate_cert",
     "locate_cert_evidence",
+    "locate_region",
     "locate_weighted",
     "locate_weighted_cert_evidence",
     "make_crl",
@@ -677,6 +679,27 @@ class WeightedConsensus:
     support_weight: int
     rejected: tuple[str, ...]
     accepted: bool
+
+
+@dataclass(frozen=True)
+class RegionDecision:
+    """The outcome of :func:`locate_region` over a set of :class:`Observation`.
+
+    ``feasible`` says whether the closed disks contributed by the
+    observations share at least one common point. When they do, ``bounds``
+    is the ``(min_x, min_y, max_x, max_y)`` bounding box of the
+    intersection and ``witness`` the ``(x, y)`` point of the intersection
+    with the smallest ``x`` (ties broken by the smallest ``y``); when the
+    intersection degenerates to a single point, every bound and the
+    witness are that point. When the disks contradict each other,
+    ``feasible`` is ``False`` and both ``bounds`` and ``witness`` are
+    ``None`` — an empty intersection is reported through the result, never
+    as an exception.
+    """
+
+    feasible: bool
+    bounds: Optional[tuple[float, float, float, float]]
+    witness: Optional[tuple[float, float]]
 
 
 _EVIDENCE_FIELDS = (
@@ -25658,6 +25681,135 @@ def locate_weighted(
         support_weight=support_weight,
         rejected=rejected,
         accepted=support_weight >= policy.threshold,
+    )
+
+
+def locate_region(
+    observations: object,
+    *,
+    tolerance: object = 0.0,
+) -> "RegionDecision":
+    """Infer the 2D region jointly covered by every observation's disk.
+
+    Each :class:`Observation` contributes the closed disk centered at
+    ``(x, y)`` with radius ``decision.upper_bound + tolerance`` (the
+    boundary counts as covered) and the decision's ``accepted`` flag is
+    ignored, exactly as in :func:`locate`. The region is the intersection
+    of all the disks: when it is non-empty the result carries its
+    ``(min_x, min_y, max_x, max_y)`` bounds and a ``witness`` — the point
+    of the intersection with the smallest ``x``, ties broken by the
+    smallest ``y``; when the intersection degenerates to a single point,
+    every bound and the witness are that point. When the disks contradict
+    each other the result is simply ``RegionDecision(False, None, None)``
+    — geometric contradiction is reported through the result, never as an
+    exception.
+
+    ``observations`` must be an iterable of at least three observations
+    with unique non-empty string ids, finite non-bool ``x``/``y``
+    coordinates and a :class:`RangeDecision` whose ``upper_bound`` is
+    finite and non-negative. ``tolerance`` must be a finite non-bool
+    non-negative number and is added to every radius. Every contract
+    violation raises :class:`ValueError`.
+
+    The result is independent of input order, the inputs are not mutated,
+    and the computation is a pure function of its arguments.
+    """
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError("tolerance must be a finite non-negative number")
+    slack = float(tolerance)
+    if not math.isfinite(slack) or slack < 0:
+        raise ValueError("tolerance must be a finite non-negative number")
+
+    try:
+        raw_observations = list(observations)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("observations must be an iterable of Observation") from error
+
+    if len(raw_observations) < 3:
+        raise ValueError(
+            f"need at least 3 observations, got {len(raw_observations)}"
+        )
+
+    disks: list[tuple[float, float, float]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        disks.append((ox, oy, bound + slack))
+
+    # The intersection of closed disks is convex, so each of its axis
+    # extrema — and its leftmost point, the witness — is attained either
+    # at one disk's own axis-extreme point or at a vertex where two circle
+    # boundaries cross. Enumerating those candidates and keeping the ones
+    # covered by every disk therefore yields the exact extrema.
+    candidates: list[tuple[float, float]] = []
+    for ox, oy, radius in disks:
+        candidates.append((ox - radius, oy))
+        candidates.append((ox + radius, oy))
+        candidates.append((ox, oy - radius))
+        candidates.append((ox, oy + radius))
+    for first in range(len(disks)):
+        x1, y1, r1 = disks[first]
+        for second in range(first + 1, len(disks)):
+            x2, y2, r2 = disks[second]
+            dx = x2 - x1
+            dy = y2 - y1
+            distance = math.hypot(dx, dy)
+            if distance == 0.0:
+                # Concentric circles share no boundary vertices.
+                continue
+            along = (r1 * r1 - r2 * r2 + distance * distance) / (2.0 * distance)
+            height_sq = r1 * r1 - along * along
+            if height_sq < -1e-9 * (r1 * r1 + 1.0):
+                # Genuinely disjoint or nested circles: no vertex.
+                continue
+            height = math.sqrt(height_sq) if height_sq > 0.0 else 0.0
+            mx = x1 + along * dx / distance
+            my = y1 + along * dy / distance
+            ux = -dy / distance * height
+            uy = dx / distance * height
+            candidates.append((mx + ux, my + uy))
+            candidates.append((mx - ux, my - uy))
+
+    covered: list[tuple[float, float]] = []
+    for px, py in candidates:
+        if not (math.isfinite(px) and math.isfinite(py)):
+            # A radius overflowing to infinity imposes no constraint and
+            # contributes no finite extreme point.
+            continue
+        for ox, oy, radius in disks:
+            margin = 1e-9 * (1.0 + radius + abs(ox) + abs(oy))
+            if math.hypot(px - ox, py - oy) > radius + margin:
+                break
+        else:
+            covered.append((px, py))
+
+    if not covered:
+        return RegionDecision(feasible=False, bounds=None, witness=None)
+
+    min_x = min(px for px, _ in covered)
+    min_y = min(py for _, py in covered)
+    max_x = max(px for px, _ in covered)
+    max_y = max(py for _, py in covered)
+    witness = min(covered)
+    return RegionDecision(
+        feasible=True,
+        bounds=(min_x, min_y, max_x, max_y),
+        witness=witness,
     )
 
 

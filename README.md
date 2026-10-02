@@ -34,6 +34,7 @@ python3 -m nearproof
 - `Consensus(total, support, rejected, accepted)` — `locate` 的冻结共识结果：`rejected` 为不支持的验证者 id 按字典序排列的字符串元组
 - `ConsensusPolicy(weights, threshold)` — `locate_weighted` 的冻结权重策略：`weights` 为 id 到正整数权重的只读映射（构造时复制），`threshold` 为不超过总权重的正整数；按字段相等、可哈希
 - `WeightedConsensus(total_weight, support_weight, rejected, accepted)` — `locate_weighted` 的冻结共识结果：前两项分别为全部与支持者的权重和，`rejected` 为不支持者 id 按字典序排列的字符串元组，`accepted` 当且仅当 `support_weight >= threshold`
+- `RegionDecision(feasible, bounds, witness)` — `locate_region` 的冻结区域结果：`feasible` 表示全部测距圆盘的交集非空；非空时 `bounds` 为 `(min_x, min_y, max_x, max_y)`、`witness` 为交集中 x 最小（同 x 取 y 最小）的点，交集退化为单点时界值与 witness 都是该点；为空时 `bounds`/`witness` 均为 `None`
 - `Evidence(version, round_index, nonce, response, start, end, speed, elapsed, distance, result, mac)` — 一轮已接受验证的防篡改记录（`version=1`、`result="accepted"`，不含密钥）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，bytes 字段为小写十六进制
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：JSON 对象的键必须恰好是十一个字段且各出现一次、顺序与字段顺序一致（重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
@@ -142,6 +143,7 @@ python3 -m nearproof
 - `revoke_context(context, revoked_at, key) -> ContextRevocation` — 用非空 key 对一个 32 字节 context 签发批量撤销记录（见下）
 - `locate(observations, point, *, quorum=3, tolerance=0.0) -> Consensus` — 二维多验证者位置共识（见下）
 - `locate_weighted(observations, point, policy, *, tolerance=0.0) -> WeightedConsensus` — 与 `locate` 同几何，但按 `ConsensusPolicy` 的声明权重汇总支持票而非按验证者条数（见下）
+- `locate_region(observations, *, tolerance=0.0) -> RegionDecision` — 多验证者共同可达区域推断：求全部测距圆盘的交集，给出其二维界值与见证点（见下）
 - `AttestedObservation(version, id, x, y, decision, issued_at, mac)` — 带 HMAC 签名与时间戳的冻结观察（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 为嵌套对象且键同样依字段顺序，`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：外层与嵌套 `decision` 对象的键都必须恰好是各自字段、各出现一次且依字段顺序（缺、多、重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
@@ -856,6 +858,30 @@ consensus.total_weight      # 7
 consensus.support_weight    # 3
 consensus.rejected          # ('charlie',)
 consensus.accepted          # False（按条数 quorum=2 本会接受）
+```
+
+### 共同可达区域推断 `locate_region`
+
+`locate_region(observations, *, tolerance=0.0)` 不再针对单个候选点计票，而是直接推断全部验证者共同可达的二维区域：每个 `Observation` 仍以 `(x, y)` 为圆心、`decision.upper_bound + tolerance` 为半径贡献一个**闭圆盘**（边界算覆盖，`decision.accepted` 不参与），目标区域是所有圆盘的交集。
+
+- 观察与 `tolerance` 的契约同 `locate`：可迭代、至少三个 `Observation`、id 为非空且互不重复的字符串、坐标为非布尔有限数、`decision` 为 `RangeDecision` 且 `upper_bound` 有限非负；`tolerance` 仅限关键字、非布尔有限非负，统一加到每个半径上。任何违约抛 `ValueError`。
+- 交集非空时返回 `RegionDecision(True, bounds, witness)`：`bounds` 按 `(min_x, min_y, max_x, max_y)` 排列，`witness` 是交集中 x 最小、同取最小 x 时 y 最小的点；交集退化为单点时，四项界值与 witness 都对应这个点。圆盘相切、多个圆盘共同决定同一极值、零半径点圆盘、整数与浮点等价值输入都按同一口径得到确定结果。
+- 交集为空时返回 `RegionDecision(False, None, None)`——几何矛盾只体现在结果里，不抛异常。
+
+结果与输入顺序无关，不修改传入对象，是不读取也不修改任何状态的纯计算；`bounds` 与 `witness` 均为有限非布尔浮点数。
+
+```python
+from nearproof import Observation, RangeDecision, locate_region
+
+observations = [
+    Observation("alpha", 0.0, 0.0, RangeDecision(5, 5.0, True)),
+    Observation("bravo", 8.0, 0.0, RangeDecision(5, 5.0, False)),  # accepted 被忽略
+    Observation("charlie", 4.0, 0.0, RangeDecision(5, 10.0, True)),
+]
+region = locate_region(observations)
+region.feasible    # True
+region.bounds      # (3.0, -3.0, 5.0, 3.0)
+region.witness     # (3.0, 0.0)
 ```
 
 ### 带签名的观察 `AttestedObservation` 与 `locate_attested`
