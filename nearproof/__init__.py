@@ -26,7 +26,9 @@ EvidenceRevocationListBundleReceiptFrontier /
 EvidenceRevocationListState /
 JournalBatchReceipt / JournalBatchReceiptAuditor /
 JournalBatchReceiptFrontier /
-Measurement / Observation / ObservationRevocation / Prover / RangeAuditor /
+Measurement / Observation / ObservationRevocation /
+ObservationRevocationList / ObservationRevocationListAuditor /
+ObservationRevocationListState / Prover / RangeAuditor /
 RangeBatchReceipt /
 RangeDecision / RangeFrontier / RangeReceipt / RangeReceiptBatch /
 ReceiptStream / SPEED_OF_LIGHT_MPS / SpanBundleReceipt /
@@ -170,6 +172,8 @@ __all__ = [
     "Observation",
     "ObservationRevocation",
     "ObservationRevocationList",
+    "ObservationRevocationListAuditor",
+    "ObservationRevocationListState",
     "Prover",
     "RangeAuditor",
     "RangeBatchReceipt",
@@ -361,6 +365,9 @@ _TRUST_REVOCATION_PREFIX = b"NPVR1"
 _TRUST_REVOCATION_LIST_PREFIX = b"NPVRL1"
 # Domain separation prefix for the observation-revocation-list MAC.
 _OBSERVATION_REVOCATION_LIST_PREFIX = b"NPORL1"
+# Domain separation prefix for the rollback-protection
+# observation-revocation-list frontier-state MAC.
+_OBSERVATION_REVOCATION_LIST_STATE_PREFIX = b"NPORS1"
 # Domain separation prefix for the assess-evidence MAC.
 _ASSESS_EVIDENCE_PREFIX = b"NPAE1"
 # Domain separation prefixes for the bound-series evidence: the ordered
@@ -25880,6 +25887,13 @@ _OBSERVATION_REVOCATION_LIST_FIELDS = (
     "mac",
 )
 
+_OBSERVATION_REVOCATION_LIST_STATE_FIELDS = (
+    "version",
+    "sequence",
+    "digest",
+    "mac",
+)
+
 
 class _OrderedAttestedObject(json.JSONDecoder):
     """JSON decoder that rejects duplicate and out-of-field-order object keys.
@@ -26769,6 +26783,393 @@ def audit_observation_crl(
         raise ValueError(
             "observation revocation list sequence is below the minimum"
         )
+
+
+def _observation_revocation_list_state_payload(
+    state: "ObservationRevocationListState",
+) -> dict:
+    """The JSON-ready observation-revocation-list-state fields except ``mac``."""
+    return {
+        "version": state.version,
+        "sequence": state.sequence,
+        "digest": state.digest.hex(),
+    }
+
+
+def _observation_revocation_list_state_mac(root: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPORS1"`` plus the canonical encoding without ``mac``.
+
+    The prefix and the encoding are concatenated directly with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        root,
+        _OBSERVATION_REVOCATION_LIST_STATE_PREFIX + _encode_payload(payload),
+        hashlib.sha256,
+    ).digest()
+
+
+def _parse_observation_revocation_list_state_hex(value: object, name: str) -> bytes:
+    # Same lowercase, round-tripping hex rule as the other records.
+    if not isinstance(value, str):
+        raise ValueError(
+            f"observation revocation list state {name} must be a lowercase hex"
+            " string"
+        )
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"observation revocation list state {name} must be a lowercase hex"
+            " string"
+        ) from error
+    if raw.hex() != value:
+        # Rejects uppercase digits, separators and odd-length input that
+        # bytes.fromhex would otherwise tolerate.
+        raise ValueError(
+            f"observation revocation list state {name} must be a lowercase hex"
+            " string"
+        )
+    return raw
+
+
+class _OrderedObservationRevocationListStateObject(json.JSONDecoder):
+    """JSON decoder rejecting duplicate/out-of-order state object keys."""
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys == list(_OBSERVATION_REVOCATION_LIST_STATE_FIELDS):
+            return dict(pairs)
+        raise ValueError(
+            "observation revocation list state JSON keys must be exactly"
+            " version, sequence, digest and mac in field order"
+        )
+
+
+@dataclass(frozen=True)
+class ObservationRevocationListState:
+    """A root-MAC'd, rollback-resistant checkpoint of the audited
+    observation-revocation-list frontier.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer (the accepted :class:`ObservationRevocationList` sequence);
+    ``digest`` exactly 32 bytes — ``SHA256(crl)`` over the canonical
+    :meth:`ObservationRevocationList.to_bytes` bytes of the accepted
+    snapshot, binding the frontier to that one definite snapshot rather
+    than any other snapshot carrying the same sequence; ``mac`` exactly 32
+    bytes — ``HMAC-SHA256(root, b"NPORS1" + encoding)`` over the canonical
+    encoding of every field except ``mac`` itself, the prefix and the
+    encoding concatenated directly with no separator or length prefix. A
+    field of the wrong type raises :class:`TypeError` at construction time;
+    a value contract violation raises :class:`ValueError`. Instances are
+    frozen, hashable, constructed positionally in field order and compare
+    equal by their fields. No root material is stored.
+    """
+
+    version: int
+    sequence: int
+    digest: bytes
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError(
+                "observation revocation list state version must be an integer"
+            )
+        if self.version != 1:
+            raise ValueError(
+                "observation revocation list state version must be 1"
+            )
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "observation revocation list state sequence must be a non-bool"
+                " integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "observation revocation list state sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        for name in ("digest", "mac"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(
+                    f"observation revocation list state {name} must be bytes"
+                )
+            if len(value) != 32:
+                raise ValueError(
+                    f"observation revocation list state {name} must be exactly"
+                    " 32 bytes"
+                )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, ``digest`` and
+        ``mac`` as lowercase hex, no whitespace, no length prefix."""
+        payload = _observation_revocation_list_state_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ObservationRevocationListState":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes``; raises
+        :class:`ValueError` for anything that does not satisfy the contract:
+        an object with exactly the keys ``version, sequence, digest, mac``
+        once each in that order (missing, extra, duplicated or out-of-order
+        keys are rejected), ``version == 1``, a non-bool u64 ``sequence``,
+        and ``digest``/``mac`` lowercase hex strings decoding to exactly 32
+        bytes each. After parsing and field validation the record is
+        re-encoded with :meth:`to_bytes` and the result must equal the input
+        byte for byte, so formatted JSON, whitespace and any non-canonical
+        number or string spelling are rejected as well. The MAC is not
+        verified here — pass the encoding to
+        :class:`ObservationRevocationListAuditor` (or recompute
+        :func:`_observation_revocation_list_state_mac` with the root) for
+        that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError(
+                "observation revocation list state data must be bytes"
+            )
+        try:
+            obj = json.loads(
+                data, cls=_OrderedObservationRevocationListStateObject
+            )
+        except ValueError as error:
+            raise ValueError(
+                "observation revocation list state is not valid JSON:"
+                f" {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _OBSERVATION_REVOCATION_LIST_STATE_FIELDS
+        ):
+            raise ValueError(
+                "observation revocation list state must be a JSON object with"
+                " exactly the version, sequence, digest and mac fields in"
+                " field order"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError(
+                "observation revocation list state version must be 1"
+            )
+        sequence = _parse_int_field(obj["sequence"], "sequence")
+        if not 0 <= sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "observation revocation list state sequence must fit in an"
+                " unsigned 64-bit integer"
+            )
+        digest = _parse_observation_revocation_list_state_hex(
+            obj["digest"], "digest"
+        )
+        if len(digest) != 32:
+            raise ValueError(
+                "observation revocation list state digest must decode to"
+                " exactly 32 bytes"
+            )
+        mac = _parse_observation_revocation_list_state_hex(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "observation revocation list state mac must decode to exactly"
+                " 32 bytes"
+            )
+        record = cls(version=version, sequence=sequence, digest=digest, mac=mac)
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError(
+                "observation revocation list state encoding is not canonical"
+            )
+        return record
+
+
+class ObservationRevocationListAuditor:
+    """Stateful :class:`ObservationRevocationList` auditor that refuses
+    snapshot sequence rollback across restarts.
+
+    ``root`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    root the snapshots and checkpoints are MAC'd with. ``checkpoint`` is
+    keyword-only: ``None`` (the default) starts from the empty state;
+    otherwise it must be an :class:`ObservationRevocationListState` or its
+    canonical :meth:`ObservationRevocationListState.to_bytes` encoding, and
+    its MAC is recomputed with ``root`` and compared in constant time (a
+    malformed encoding or MAC mismatch raises :class:`ValueError`). Across a
+    restart the caller must pass the value previously exported at
+    :attr:`checkpoint`; nothing is persisted by the auditor itself.
+
+    Each :meth:`audit` accepts an :class:`ObservationRevocationList` or its
+    canonical bytes and runs, under a single lock, the same two-layer
+    stateless review as :func:`audit_observation_crl` — the list
+    ``NPORL1`` MAC under ``root`` and every entry's per-verifier MAC under
+    ``keys[id]`` in constant time, rejection of unknown entry ids, plus the
+    ``issued_at <= now``/``revoked_at <= now`` freshness and
+    ``sequence >= min`` floor checks — and only then gates the snapshot
+    against the checkpoint: a lower sequence is rejected, an equal sequence
+    is accepted solely as a replay of the identical snapshot digest (a
+    different snapshot at the same sequence is rejected), and a higher
+    sequence advances the checkpoint to a freshly ``NPORS1``-MAC'd
+    :class:`ObservationRevocationListState`. The verify, gate and update
+    are one atomic critical section, so a rejected snapshot never changes
+    the checkpoint and concurrent audits are linearized in lock-acquisition
+    order with the accepted frontier never lost or moved backwards. A
+    sequence outside the unsigned 64-bit range cannot reach the gate (the
+    snapshot or state record contract rejects it), so such an overflow
+    attempt raises :class:`ValueError` before the checkpoint changes. A
+    snapshot that is not a list instance or canonical bytes raises
+    :class:`ValueError`; a non-mapping ``keys`` or an id/key of the wrong
+    shape, or a wrongly shaped ``now``/``min`` keyword argument, raises
+    :class:`TypeError` (an empty id or empty key is a value violation
+    raising :class:`ValueError`); every other failure — an empty root or
+    key, a malformed or non-canonical encoding, a MAC mismatch, an unknown
+    id, a future snapshot or revocation, a sequence below the floor or
+    checkpoint, a same-sequence/different-digest snapshot, an out-of-range
+    sequence, or a tampered checkpoint — raises :class:`ValueError`.
+    """
+
+    def __init__(self, root: object, *, checkpoint: object = None) -> None:
+        self._root = _require_root(root)
+        self._lock = threading.Lock()
+        self._state: "Optional[ObservationRevocationListState]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, ObservationRevocationListState):
+            state = checkpoint
+        elif isinstance(checkpoint, bytes):
+            state = ObservationRevocationListState.from_bytes(checkpoint)
+        else:
+            raise TypeError(
+                "checkpoint must be an ObservationRevocationListState"
+                " instance, its canonical bytes, or None"
+            )
+        if not hmac.compare_digest(
+            _observation_revocation_list_state_mac(
+                self._root,
+                _observation_revocation_list_state_payload(state),
+            ),
+            state.mac,
+        ):
+            raise ValueError("checkpoint mac does not match the root")
+        self._state = state
+
+    @property
+    def checkpoint(self) -> "Optional[ObservationRevocationListState]":
+        """The current frontier :class:`ObservationRevocationListState`, or
+        ``None`` before the first successfully audited snapshot. The
+        returned object is frozen and the property read-only; persist its
+        :meth:`ObservationRevocationListState.to_bytes` output and pass it
+        back to a new auditor to survive a restart."""
+        return self._state
+
+    def audit(
+        self,
+        snapshot: "ObservationRevocationList | bytes",
+        keys: object,
+        *,
+        now: object,
+        min: object = 0,
+    ) -> "ObservationRevocationListAuditor":
+        """Authenticate ``snapshot`` and enforce monotone snapshot progress.
+
+        ``snapshot`` must be an :class:`ObservationRevocationList` or its
+        canonical :meth:`ObservationRevocationList.to_bytes` encoding —
+        anything else, or bytes that do not parse, raises
+        :class:`ValueError`. ``keys`` must be a mapping of observation id
+        to non-empty shared key bytes exactly as for
+        :func:`audit_observation_crl` — a shape error raises
+        :class:`TypeError`, an empty id or key :class:`ValueError`.
+        ``now`` must be given explicitly as a finite non-bool number and
+        ``min`` as a non-bool unsigned 64-bit integer (default ``0``); a
+        wrongly shaped keyword raises :class:`TypeError`, a non-finite
+        ``now`` or out-of-range ``min`` raises :class:`ValueError`. The
+        two MAC layers, unknown-id and freshness checks and the sequence
+        floor are reviewed exactly as in
+        :func:`audit_observation_crl`, and the frontier gate and
+        checkpoint update happen in the same locked critical section, so
+        verification, gating and progress are atomic together. On success
+        the auditor itself is returned; an equal-sequence replay of the
+        identical snapshot returns ``self`` without advancing the
+        checkpoint.
+        """
+        with self._lock:
+            # Shape contract of the new stateful entry point: a foreign
+            # snapshot type is a snapshot violation (ValueError), while a
+            # wrongly shaped keys mapping or keyword argument is a
+            # TypeError. These run before the pure stateless review so the
+            # error-type allocation below cannot be shadowed.
+            if not isinstance(
+                snapshot, (ObservationRevocationList, bytes)
+            ):
+                raise ValueError(
+                    "snapshot must be an ObservationRevocationList instance"
+                    " or bytes"
+                )
+            key_map = _require_observation_crl_keys(keys)
+            if isinstance(now, bool) or not isinstance(now, (int, float)):
+                raise TypeError("now must be a finite number")
+            current_now = float(now)
+            if not math.isfinite(current_now):
+                raise ValueError("now must be a finite number")
+            if isinstance(min, bool) or type(min) is not int:
+                raise TypeError("min must be a non-bool integer")
+            if not 0 <= min <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(
+                    "min must fit in an unsigned 64-bit integer"
+                )
+            # Run the existing snapshot review semantics inside the lock so
+            # verification, gating and advancement form one atomic step; the
+            # review is pure and touches no registry or state.
+            audit_observation_crl(
+                snapshot,
+                self._root,
+                key_map,
+                now=current_now,
+                min=min,
+            )
+            if isinstance(snapshot, bytes):
+                crl = ObservationRevocationList.from_bytes(snapshot)
+            else:
+                crl = snapshot
+            digest = hashlib.sha256(crl.to_bytes()).digest()
+            sequence = crl.sequence
+            current = self._state
+            if current is not None:
+                if sequence < current.sequence:
+                    raise ValueError(
+                        "observation revocation list sequence is below the"
+                        " audited checkpoint"
+                    )
+                if sequence == current.sequence and not hmac.compare_digest(
+                    digest, current.digest
+                ):
+                    raise ValueError(
+                        "observation revocation list carries a different"
+                        " snapshot at the checkpoint sequence"
+                    )
+                if sequence == current.sequence:
+                    # Identical snapshot: an accepted replay, nothing to
+                    # advance.
+                    return self
+            candidate = ObservationRevocationListState(
+                version=1,
+                sequence=sequence,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._state = replace(
+                candidate,
+                mac=_observation_revocation_list_state_mac(
+                    self._root,
+                    _observation_revocation_list_state_payload(candidate),
+                ),
+            )
+        return self
 
 
 def attest_observation(
