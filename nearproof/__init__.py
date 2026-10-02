@@ -153,6 +153,8 @@ __all__ = [
     "CrlState",
     "DelayBoundEvidence",
     "Evidence",
+    "EvidenceReplayAuditor",
+    "EvidenceReplayState",
     "EvidenceRevocationList",
     "EvidenceRevocationListAuditor",
     "EvidenceRevocationListBundle",
@@ -331,6 +333,8 @@ _DELAY_BOUND_EVIDENCE_PREFIX = b"NPDB1"
 _BOUND_REVOCATION_PREFIX = b"NPBR1"
 # Domain separation prefix for the evidence-revocation-list MAC.
 _EVIDENCE_REVOCATION_LIST_PREFIX = b"NPERL1"
+# Domain separation prefix for the evidence-replay ledger-state MAC.
+_EVIDENCE_REPLAY_STATE_PREFIX = b"NPRS1"
 # Domain separation prefix for the rollback-protection evidence-revocation
 # frontier-state MAC.
 _EVIDENCE_REVOCATION_LIST_STATE_PREFIX = b"NPES1"
@@ -959,6 +963,19 @@ _EVIDENCE_REVOCATION_LIST_STATE_FIELDS = (
     "sequence",
     "digest",
     "mac",
+)
+
+_EVIDENCE_REPLAY_STATE_FIELDS = (
+    "version",
+    "sequence",
+    "entries",
+    "mac",
+)
+
+_EVIDENCE_REPLAY_ENTRY_FIELDS = (
+    "kind",
+    "round_index",
+    "nonce",
 )
 
 _EVIDENCE_REVOCATION_LIST_BUNDLE_FIELDS = (
@@ -20316,6 +20333,505 @@ def audit_bound_policy(
         if not 0.0 <= age <= age_limit:
             raise ValueError("bound evidence is outside the allowed age")
     return measurement
+
+
+# Evidence-replay ledger consumption kinds: each accepted record is consumed
+# under exactly one of these, tagging its consumption identifier with the
+# evidence kind it was audited as.
+_EVIDENCE_REPLAY_KIND_EVIDENCE = 1
+_EVIDENCE_REPLAY_KIND_BOUND = 2
+_EVIDENCE_REPLAY_KIND_DELAY_BOUND = 3
+_EVIDENCE_REPLAY_KINDS = (
+    _EVIDENCE_REPLAY_KIND_EVIDENCE,
+    _EVIDENCE_REPLAY_KIND_BOUND,
+    _EVIDENCE_REPLAY_KIND_DELAY_BOUND,
+)
+
+
+def _evidence_replay_state_payload(state: "EvidenceReplayState") -> dict:
+    """The JSON-ready evidence-replay-state fields except ``mac``.
+
+    Each entry is the consumption identifier of one accepted record: the
+    evidence kind, the ``round_index`` and the lowercase-hex ``nonce``, kept
+    in the state's sorted order.
+    """
+    return {
+        "version": state.version,
+        "sequence": state.sequence,
+        "entries": [
+            {
+                "kind": kind,
+                "round_index": round_index,
+                "nonce": nonce.hex(),
+            }
+            for kind, round_index, nonce in state.entries
+        ],
+    }
+
+
+def _evidence_replay_state_mac(key: bytes, payload: dict) -> bytes:
+    """HMAC-SHA256 over ``b"NPRS1"`` plus the canonical encoding without ``mac``.
+
+    The prefix and the encoding are concatenated directly with no separator
+    or length prefix.
+    """
+    return hmac.new(
+        key,
+        _EVIDENCE_REPLAY_STATE_PREFIX + _encode_payload(payload),
+        hashlib.sha256,
+    ).digest()
+
+
+def _parse_evidence_replay_state_hex(value: object, name: str) -> bytes:
+    # Same lowercase, round-tripping hex rule as the other records.
+    if not isinstance(value, str):
+        raise ValueError(
+            f"evidence replay state {name} must be a lowercase hex string"
+        )
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"evidence replay state {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        # Rejects uppercase digits, separators and odd-length input that
+        # bytes.fromhex would otherwise tolerate.
+        raise ValueError(
+            f"evidence replay state {name} must be a lowercase hex string"
+        )
+    return raw
+
+
+class _OrderedEvidenceReplayStateObject(json.JSONDecoder):
+    """JSON decoder rejecting duplicate/out-of-order state and entry keys."""
+
+    def __init__(self) -> None:
+        super().__init__(object_pairs_hook=self._check_pairs)
+
+    @staticmethod
+    def _check_pairs(pairs: list) -> dict:
+        keys = [key for key, _value in pairs]
+        if keys in (
+            list(_EVIDENCE_REPLAY_STATE_FIELDS),
+            list(_EVIDENCE_REPLAY_ENTRY_FIELDS),
+        ):
+            return dict(pairs)
+        raise ValueError(
+            "evidence replay state JSON keys must be exactly the state or"
+            " entry fields in field order"
+        )
+
+
+@dataclass(frozen=True)
+class EvidenceReplayState:
+    """A key-MAC'd, transferable checkpoint of the evidence-replay ledger.
+
+    ``version`` is always ``1``; ``sequence`` a non-bool unsigned 64-bit
+    integer counting the consumed records (always ``len(entries)``);
+    ``entries`` the consumption identifiers of every accepted record as
+    ``(kind, round_index, nonce)`` triples — ``kind`` one of ``1``
+    (:class:`Evidence`), ``2`` (:class:`BoundEvidence`) or ``3``
+    (:class:`DelayBoundEvidence`) — sorted ascending and free of duplicates,
+    with no ``(round_index, nonce)`` pair consumed under two different
+    kinds; ``mac`` exactly 32 bytes — ``HMAC-SHA256(key, b"NPRS1" +
+    encoding)`` over the canonical encoding of every field except ``mac``
+    itself, the prefix and the encoding concatenated directly with no
+    separator or length prefix. A field of the wrong type raises
+    :class:`TypeError` at construction time; a value contract violation
+    raises :class:`ValueError`. Instances are frozen, constructed
+    positionally in field order and compare equal by their fields. No key
+    material is stored and nothing is persisted by the state itself.
+    """
+
+    version: int
+    sequence: int
+    entries: tuple
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise TypeError("evidence replay state version must be an integer")
+        if self.version != 1:
+            raise ValueError("evidence replay state version must be 1")
+        if isinstance(self.sequence, bool) or type(self.sequence) is not int:
+            raise TypeError(
+                "evidence replay state sequence must be a non-bool integer"
+            )
+        if not 0 <= self.sequence <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(
+                "evidence replay state sequence must fit in an unsigned"
+                " 64-bit integer"
+            )
+        if not isinstance(self.entries, tuple):
+            raise TypeError("evidence replay state entries must be a tuple")
+        pairs = set()
+        for entry in self.entries:
+            if not isinstance(entry, tuple) or len(entry) != 3:
+                raise TypeError(
+                    "evidence replay state entries items must be"
+                    " (kind, round_index, nonce) triples"
+                )
+            kind, round_index, nonce = entry
+            if isinstance(kind, bool) or type(kind) is not int:
+                raise TypeError(
+                    "evidence replay state entry kind must be a non-bool"
+                    " integer"
+                )
+            if kind not in _EVIDENCE_REPLAY_KINDS:
+                raise ValueError(
+                    "evidence replay state entry kind must be 1, 2 or 3"
+                )
+            if isinstance(round_index, bool) or type(round_index) is not int:
+                raise TypeError(
+                    "evidence replay state entry round_index must be a"
+                    " non-bool integer"
+                )
+            if not isinstance(nonce, bytes):
+                raise TypeError(
+                    "evidence replay state entry nonce must be bytes"
+                )
+            pair = (round_index, nonce)
+            if pair in pairs:
+                raise ValueError(
+                    "evidence replay state entries must not consume the same"
+                    " round_index and nonce under two kinds"
+                )
+            pairs.add(pair)
+        if list(self.entries) != sorted(self.entries) or len(
+            set(self.entries)
+        ) != len(self.entries):
+            raise ValueError(
+                "evidence replay state entries must be sorted ascending"
+                " without duplicates"
+            )
+        if self.sequence != len(self.entries):
+            raise ValueError(
+                "evidence replay state sequence must equal the entry count"
+            )
+        if not isinstance(self.mac, bytes):
+            raise TypeError("evidence replay state mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError(
+                "evidence replay state mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: keys in field order, each entry an
+        object with its own keys in field order, ``nonce`` and ``mac`` as
+        lowercase hex, no whitespace, no length prefix."""
+        payload = _evidence_replay_state_payload(self)
+        payload["mac"] = self.mac.hex()
+        return _encode_payload(payload)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "EvidenceReplayState":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes``; raises
+        :class:`ValueError` for anything that does not satisfy the contract:
+        an object with exactly the keys ``version, sequence, entries, mac``
+        once each in that order (missing, extra, duplicated or out-of-order
+        keys are rejected, likewise inside each nested entry object),
+        ``version == 1``, a non-bool u64 ``sequence`` equal to the entry
+        count, entries sorted ascending without duplicates and without a
+        ``(round_index, nonce)`` pair shared across kinds, and ``nonce``/
+        ``mac`` lowercase hex strings with ``mac`` decoding to exactly 32
+        bytes. After parsing and field validation the record is re-encoded
+        with :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical number or
+        string spelling are rejected as well. The MAC is not verified here —
+        pass the state to :class:`EvidenceReplayAuditor` for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("evidence replay state data must be bytes")
+        try:
+            obj = json.loads(data, cls=_OrderedEvidenceReplayStateObject)
+        except ValueError as error:
+            raise ValueError(
+                f"evidence replay state is not valid JSON: {error}"
+            ) from error
+        if not isinstance(obj, dict) or list(obj) != list(
+            _EVIDENCE_REPLAY_STATE_FIELDS
+        ):
+            raise ValueError(
+                "evidence replay state must be a JSON object with exactly"
+                " the version, sequence, entries and mac fields in field"
+                " order"
+            )
+        version = _parse_int_field(obj["version"], "version")
+        if version != 1:
+            raise ValueError("evidence replay state version must be 1")
+        sequence = _parse_int_field(obj["sequence"], "sequence")
+        raw_entries = obj["entries"]
+        if not isinstance(raw_entries, list):
+            raise ValueError("evidence replay state entries must be an array")
+        entries = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict) or list(raw_entry) != list(
+                _EVIDENCE_REPLAY_ENTRY_FIELDS
+            ):
+                raise ValueError(
+                    "evidence replay state entries items must be JSON"
+                    " objects with exactly the kind, round_index and nonce"
+                    " fields in field order"
+                )
+            entries.append(
+                (
+                    _parse_int_field(raw_entry["kind"], "kind"),
+                    _parse_int_field(
+                        raw_entry["round_index"], "round_index"
+                    ),
+                    _parse_evidence_replay_state_hex(
+                        raw_entry["nonce"], "nonce"
+                    ),
+                )
+            )
+        mac = _parse_evidence_replay_state_hex(obj["mac"], "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "evidence replay state mac must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=version,
+            sequence=sequence,
+            entries=tuple(entries),
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            # Same canonical-encoding rule as the other records: no
+            # whitespace, pretty-printing, framing or non-canonical
+            # number/string spellings.
+            raise ValueError(
+                "evidence replay state encoding is not canonical"
+            )
+        return record
+
+
+class EvidenceReplayAuditor:
+    """Stateful auditor that consumes each accepted ranging evidence once.
+
+    ``key`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    shared key the evidence records and checkpoints are MAC'd with.
+    ``checkpoint`` is ``None`` (the default, an empty ledger), an
+    :class:`EvidenceReplayState` or its canonical
+    :meth:`EvidenceReplayState.to_bytes` encoding; anything else, a
+    malformed encoding or a MAC mismatch raises :class:`ValueError` (the
+    checkpoint MAC is recomputed with ``key`` and compared in constant
+    time). Across a restart the caller must pass the value previously
+    exported at :attr:`checkpoint`; nothing is persisted by the auditor
+    itself.
+
+    Each :meth:`audit` accepts an :class:`Evidence`,
+    :class:`BoundEvidence` or :class:`DelayBoundEvidence` — or the
+    canonical ``to_bytes()`` encoding of any of them — and first runs the
+    full stateless review of the matching public audit (:func:`audit`,
+    :func:`audit_bound` or :func:`audit_delay_bound`): every MAC, the
+    response, the context commitment, the timing and the distance are
+    recomputed exactly as there. Only then, under a single lock, is the
+    consumption identifier ``(kind, round_index, nonce)`` taken into the
+    ledger: an identifier already consumed is rejected, and so is a
+    ``(round_index, nonce)`` pair already consumed under a different
+    evidence kind. On success the audited :class:`Measurement` is returned
+    and the checkpoint advances; on any failure the checkpoint is
+    untouched. Verification and consumption of one record are atomic
+    against other consumption, so concurrent audits of the same identifier
+    succeed at most once. :meth:`audit_batch` consumes a whole sequence in
+    input order as one atomic step: any failed record, any repeated
+    identifier or any cross-kind ``(round_index, nonce)`` collision inside
+    the batch rejects the whole batch with the checkpoint unchanged.
+    """
+
+    def __init__(self, key: object, checkpoint: object = None) -> None:
+        if not isinstance(key, bytes):
+            raise TypeError("key must be bytes")
+        if not key:
+            raise ValueError("key must be non-empty")
+        self._key = key
+        self._lock = threading.Lock()
+        self._state: "Optional[EvidenceReplayState]" = None
+        if checkpoint is None:
+            return
+        if isinstance(checkpoint, EvidenceReplayState):
+            state = checkpoint
+        elif isinstance(checkpoint, bytes):
+            state = EvidenceReplayState.from_bytes(checkpoint)
+        else:
+            raise ValueError(
+                "checkpoint must be an EvidenceReplayState instance, its"
+                " canonical bytes, or None"
+            )
+        if not hmac.compare_digest(
+            _evidence_replay_state_mac(
+                self._key, _evidence_replay_state_payload(state)
+            ),
+            state.mac,
+        ):
+            raise ValueError("checkpoint mac does not match the key")
+        self._state = state
+
+    @property
+    def checkpoint(self) -> "Optional[EvidenceReplayState]":
+        """The current ledger :class:`EvidenceReplayState`, or ``None``
+        before the first successfully consumed record. The returned object
+        is frozen and the property read-only; persist its
+        :meth:`EvidenceReplayState.to_bytes` output and pass it back to a
+        new auditor to survive a restart."""
+        return self._state
+
+    def _verify_record(
+        self, record: object
+    ) -> "tuple[Measurement, tuple]":
+        """Run the matching stateless public audit on one record and derive
+        its consumption identifier ``(kind, round_index, nonce)``.
+
+        Pure: touches no auditor state. Every contract violation raises
+        :class:`ValueError`.
+        """
+        if isinstance(record, Evidence):
+            measurement = audit(record, self._key)
+            return measurement, (
+                _EVIDENCE_REPLAY_KIND_EVIDENCE,
+                record.round_index,
+                record.nonce,
+            )
+        if isinstance(record, BoundEvidence):
+            measurement = audit_bound(record, self._key)
+            evidence = record.evidence
+            return measurement, (
+                _EVIDENCE_REPLAY_KIND_BOUND,
+                evidence.round_index,
+                evidence.nonce,
+            )
+        if isinstance(record, DelayBoundEvidence):
+            measurement = audit_delay_bound(record, self._key)
+            evidence = record.evidence
+            return measurement, (
+                _EVIDENCE_REPLAY_KIND_DELAY_BOUND,
+                evidence.round_index,
+                evidence.nonce,
+            )
+        if isinstance(record, bytes):
+            # The three canonical encodings carry disjoint key sets, so at
+            # most one of them parses.
+            for cls in (DelayBoundEvidence, BoundEvidence, Evidence):
+                try:
+                    parsed = cls.from_bytes(record)
+                except ValueError:
+                    continue
+                return self._verify_record(parsed)
+            raise ValueError(
+                "evidence replay record bytes must be the canonical"
+                " encoding of an Evidence, BoundEvidence or"
+                " DelayBoundEvidence"
+            )
+        raise ValueError(
+            "evidence replay record must be an Evidence, BoundEvidence or"
+            " DelayBoundEvidence instance or canonical bytes"
+        )
+
+    def _consume_locked(self, entries: list) -> None:
+        """Take ``entries`` into the ledger as one atomic step.
+
+        The caller must hold the auditor lock; every entry was already
+        verified and checked for in-batch conflicts. Any conflict with the
+        already-consumed identifiers raises :class:`ValueError` before any
+        state change.
+        """
+        current = () if self._state is None else self._state.entries
+        consumed = set(current)
+        pairs = {
+            (round_index, nonce)
+            for _kind, round_index, nonce in current
+        }
+        for kind, round_index, nonce in entries:
+            if (kind, round_index, nonce) in consumed:
+                raise ValueError(
+                    "evidence replay identifier was already consumed"
+                )
+            if (round_index, nonce) in pairs:
+                raise ValueError(
+                    "evidence replay round_index and nonce were already"
+                    " consumed under another evidence kind"
+                )
+        merged = tuple(sorted(current + tuple(entries)))
+        candidate = EvidenceReplayState(
+            version=1,
+            sequence=len(merged),
+            entries=merged,
+            mac=b"\x00" * 32,
+        )
+        self._state = replace(
+            candidate,
+            mac=_evidence_replay_state_mac(
+                self._key, _evidence_replay_state_payload(candidate)
+            ),
+        )
+
+    def audit(self, record: object) -> Measurement:
+        """Verify one evidence record and consume its identifier once.
+
+        ``record`` must be an :class:`Evidence`, :class:`BoundEvidence` or
+        :class:`DelayBoundEvidence` instance or the canonical
+        ``to_bytes()`` encoding of one of them — anything else raises
+        :class:`ValueError`. The full stateless review of the matching
+        public audit runs first; then, atomically under the auditor lock,
+        the consumption identifier is checked against the ledger and taken
+        into it. A record already consumed, a ``(round_index, nonce)``
+        pair already consumed under another evidence kind, a wrong key, a
+        forged or tampered record and every contract violation raise
+        :class:`ValueError` and leave the checkpoint unchanged. On success
+        the audited :class:`Measurement` is returned and the checkpoint
+        advances.
+        """
+        measurement, entry = self._verify_record(record)
+        with self._lock:
+            self._consume_locked([entry])
+        return measurement
+
+    def audit_batch(self, records: object) -> tuple:
+        """Verify and consume a whole sequence of evidence records
+        atomically, in input order.
+
+        ``records`` must be a list or tuple whose items each follow the
+        :meth:`audit` record contract — anything else raises
+        :class:`ValueError`. Every record is verified first; any failed
+        record, any identifier repeated inside the batch, any
+        ``(round_index, nonce)`` pair repeated inside the batch (across
+        evidence kinds included) or any conflict with the already-consumed
+        ledger rejects the whole batch with :class:`ValueError` and leaves
+        the checkpoint unchanged. Only when every record verifies and no
+        conflict exists are all identifiers consumed in one locked step.
+        An empty sequence consumes nothing and leaves the state as it is.
+        On success the audited :class:`Measurement` of each record is
+        returned as a tuple in input order.
+        """
+        if not isinstance(records, (list, tuple)):
+            raise ValueError(
+                "evidence replay batch must be a list or tuple of records"
+            )
+        verified = [self._verify_record(record) for record in records]
+        seen = set()
+        pairs = set()
+        for _measurement, entry in verified:
+            kind, round_index, nonce = entry
+            if entry in seen:
+                raise ValueError(
+                    "evidence replay batch repeats a consumption identifier"
+                )
+            if (round_index, nonce) in pairs:
+                raise ValueError(
+                    "evidence replay batch repeats a round_index and nonce"
+                    " pair across evidence kinds"
+                )
+            seen.add(entry)
+            pairs.add((round_index, nonce))
+        if not verified:
+            return ()
+        with self._lock:
+            self._consume_locked([entry for _measurement, entry in verified])
+        return tuple(measurement for measurement, _entry in verified)
 
 
 def _check_assess_params(limit: object, min_samples: object) -> tuple[float, int]:
