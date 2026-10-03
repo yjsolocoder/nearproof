@@ -28388,6 +28388,155 @@ def cert(
     return replace(record, mac=_trust_mac(root, _trust_payload(record)))
 
 
+def _require_query_binding(point: object, context: object) -> "tuple[float, float]":
+    """Validate the queried point/context pair, returning the coordinates.
+
+    Shared by every root-certified consensus entry point: ``point`` must be
+    a tuple of exactly two finite non-bool numbers and ``context`` a
+    non-empty string, under the same rules as :func:`locate`.
+    """
+    if not isinstance(point, tuple) or len(point) != 2:
+        raise ValueError("point must be a tuple of exactly two finite numbers")
+    px = _finite_non_bool(point[0])
+    py = _finite_non_bool(point[1])
+    if not isinstance(context, str) or not context:
+        raise ValueError("context must be a non-empty string")
+    return px, py
+
+
+def _parse_cert_trusts(trusts: object) -> "list[VerifierTrust]":
+    """Materialise the trust iterable, decoding any canonical byte entries.
+
+    Accepts :class:`VerifierTrust` instances and their
+    :meth:`VerifierTrust.to_bytes` encodings, mixed freely, from any
+    (including one-shot) iterable. No cryptographic check is done here.
+    """
+    try:
+        raw_trusts = list(trusts)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "trusts must be an iterable of VerifierTrust or bytes"
+        ) from error
+    parsed: list[VerifierTrust] = []
+    for entry in raw_trusts:
+        if isinstance(entry, bytes):
+            entry = VerifierTrust.from_bytes(entry)
+        if not isinstance(entry, VerifierTrust):
+            raise ValueError(
+                "trusts must contain only VerifierTrust instances or bytes"
+            )
+        parsed.append(entry)
+    return parsed
+
+
+def _verify_cert_trusts(trusts: object, root: bytes) -> "dict[str, VerifierTrust]":
+    """Parse the trust iterable and authenticate every certificate.
+
+    Every trust's MAC is recomputed with ``root`` and compared in constant
+    time — including certificates no observation ends up using; a duplicated
+    trust id, a wrong root, or any tampering raises :class:`ValueError`.
+    Returns the id-keyed trust map.
+    """
+    trust_map: dict[str, VerifierTrust] = {}
+    for entry in _parse_cert_trusts(trusts):
+        ident = entry.id
+        if ident in trust_map:
+            raise ValueError(f"duplicate trust id: {ident!r}")
+        if not hmac.compare_digest(
+            _trust_mac(root, _trust_payload(entry)), entry.mac
+        ):
+            raise ValueError(f"verifier trust mac does not match: {ident!r}")
+        trust_map[ident] = entry
+    return trust_map
+
+
+def _parse_cert_records(records: object) -> "list[BoundAttestedObservation]":
+    """Materialise the record iterable, decoding any canonical byte entries.
+
+    Accepts :class:`BoundAttestedObservation` instances and their
+    :meth:`BoundAttestedObservation.to_bytes` encodings, mixed freely, from
+    any (including one-shot) iterable. No cryptographic check is done here.
+    """
+    try:
+        raw_records = list(records)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            "records must be an iterable of BoundAttestedObservation or bytes"
+        ) from error
+    parsed: list[BoundAttestedObservation] = []
+    for item in raw_records:
+        if isinstance(item, bytes):
+            item = BoundAttestedObservation.from_bytes(item)
+        if not isinstance(item, BoundAttestedObservation):
+            raise ValueError(
+                "records must contain only BoundAttestedObservation"
+                " instances or bytes"
+            )
+        parsed.append(item)
+    return parsed
+
+
+def _verify_cert_records(
+    parsed_records: "list[BoundAttestedObservation]",
+    trust_map: "dict[str, VerifierTrust]",
+    px: float,
+    py: float,
+    context: str,
+    revoked_pairs: "set[tuple[str, bytes]] | frozenset[tuple[str, bytes]]" = frozenset(),
+) -> "list[Observation]":
+    """Authenticate parsed records against the trusts and the query binding.
+
+    Each record id must have exactly one trust: the record's MAC is
+    recomputed with that trust's ``key`` and compared in constant time, and
+    the trust's ``id``/``x``/``y`` must equal the record's — a duplicated id,
+    a missing trust, a revoked certificate (an ``(id, trust.mac)`` pair in
+    ``revoked_pairs``), a MAC mismatch, or an ``x``/``y`` disagreement raises
+    :class:`ValueError`. Only after both MACs verify do the trust bindings
+    count, and the signed record must match the queried point coordinate by
+    coordinate and carry exactly the queried use context. Returns the
+    verified :class:`Observation` list in input order.
+    """
+    observations: list[Observation] = []
+    seen_ids: set[str] = set()
+    for item in parsed_records:
+        ident = item.id
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        trust = trust_map.get(ident)
+        if trust is None:
+            raise ValueError(f"missing verifier trust for id: {ident!r}")
+        if (ident, trust.mac) in revoked_pairs:
+            # Permanent revocation: a certificate whose root MAC is the
+            # target of a valid revocation can never support a record.
+            raise ValueError(f"verifier trust has been revoked: {ident!r}")
+        if not hmac.compare_digest(
+            _bound_attested_mac(trust.key, _bound_attested_payload(item)), item.mac
+        ):
+            raise ValueError(
+                f"bound attested observation mac does not match: {ident!r}"
+            )
+        # Only after both MACs verify do the trust bindings count: the
+        # certified id/x/y must equal the record's, or it is a contract
+        # breach.
+        if trust.x != item.x or trust.y != item.y:
+            raise ValueError(
+                f"verifier trust does not match the observation: {ident!r}"
+            )
+        # The signed record must match the query coordinate by coordinate
+        # and carry exactly the queried use context, as in
+        # locate_bound_attested.
+        if item.point[0] != px or item.point[1] != py or item.context != context:
+            raise ValueError(
+                "bound attested observation is not bound to the queried"
+                f" point and context: {ident!r}"
+            )
+        observations.append(
+            Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
+        )
+    return observations
+
+
 def locate_cert(
     records: object,
     point: object,
@@ -28463,60 +28612,17 @@ def locate_cert(
 
     # The query binding is needed while examining every record, so enforce
     # the point/context contract up front under the same rules as locate().
-    if not isinstance(point, tuple) or len(point) != 2:
-        raise ValueError("point must be a tuple of exactly two finite numbers")
-    px = _finite_non_bool(point[0])
-    py = _finite_non_bool(point[1])
-    if not isinstance(context, str) or not context:
-        raise ValueError("context must be a non-empty string")
+    px, py = _require_query_binding(point, context)
 
-    try:
-        raw_trusts = list(trusts)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "trusts must be an iterable of VerifierTrust or bytes"
-        ) from error
-    trust_map: dict[str, VerifierTrust] = {}
-    for entry in raw_trusts:
-        if isinstance(entry, bytes):
-            entry = VerifierTrust.from_bytes(entry)
-        if not isinstance(entry, VerifierTrust):
-            raise ValueError(
-                "trusts must contain only VerifierTrust instances or bytes"
-            )
-        ident = entry.id
-        if ident in trust_map:
-            raise ValueError(f"duplicate trust id: {ident!r}")
-        if not hmac.compare_digest(
-            _trust_mac(root, _trust_payload(entry)), entry.mac
-        ):
-            raise ValueError(f"verifier trust mac does not match: {ident!r}")
-        trust_map[ident] = entry
+    trust_map = _verify_cert_trusts(trusts, root)
 
     # A revocation is permanent and targets the exact MAC of one
     # certificate, so every entry is fully validated (shape, uniqueness and
     # root MAC, all in constant time) before the records are verified; a
     # pair that does not hit a certificate the records actually use is
     # itself a contract breach.
-    try:
-        raw_records = list(records)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "records must be an iterable of BoundAttestedObservation or bytes"
-        ) from error
-
-    parsed_records: list[BoundAttestedObservation] = []
-    used_ids: set[str] = set()
-    for item in raw_records:
-        if isinstance(item, bytes):
-            item = BoundAttestedObservation.from_bytes(item)
-        if not isinstance(item, BoundAttestedObservation):
-            raise ValueError(
-                "records must contain only BoundAttestedObservation"
-                " instances or bytes"
-            )
-        parsed_records.append(item)
-        used_ids.add(item.id)
+    parsed_records = _parse_cert_records(records)
+    used_ids: set[str] = {item.id for item in parsed_records}
 
     used_pairs = {
         (ident, trust_map[ident].mac)
@@ -28584,45 +28690,9 @@ def locate_cert(
                         f" the records: {pair[0]!r}"
                     )
 
-    verified: list[Observation] = []
-    seen_ids: set[str] = set()
-    for item in parsed_records:
-        ident = item.id
-        if ident in seen_ids:
-            raise ValueError(f"duplicate observation id: {ident!r}")
-        seen_ids.add(ident)
-        trust = trust_map.get(ident)
-        if trust is None:
-            raise ValueError(f"missing verifier trust for id: {ident!r}")
-        if (ident, trust.mac) in revoked_pairs:
-            # Permanent revocation: a certificate whose root MAC is the
-            # target of a valid revocation can never support a record.
-            raise ValueError(f"verifier trust has been revoked: {ident!r}")
-        if not hmac.compare_digest(
-            _bound_attested_mac(trust.key, _bound_attested_payload(item)), item.mac
-        ):
-            raise ValueError(
-                f"bound attested observation mac does not match: {ident!r}"
-            )
-        # Only after both MACs verify do the trust bindings count: the
-        # certified id/x/y must equal the record's, or it is a contract
-        # breach.
-        if trust.x != item.x or trust.y != item.y:
-            raise ValueError(
-                f"verifier trust does not match the observation: {ident!r}"
-            )
-        # The signed record must match the query coordinate by coordinate
-        # and carry exactly the queried use context, as in
-        # locate_bound_attested.
-        if item.point[0] != px or item.point[1] != py or item.context != context:
-            raise ValueError(
-                "bound attested observation is not bound to the queried"
-                f" point and context: {ident!r}"
-            )
-        verified.append(
-            Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
-        )
-
+    verified = _verify_cert_records(
+        parsed_records, trust_map, px, py, context, revoked_pairs
+    )
     return locate(verified, point, quorum=3, tolerance=0.0)
 
 
@@ -29046,38 +29116,8 @@ def locate_cert_evidence(
     # Materialise the iterables under the same mixing rules as locate_cert
     # before running it, so a one-shot iterable can be re-used to build the
     # body and so the body carries exactly the participating records.
-    try:
-        raw_records = list(records)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "records must be an iterable of BoundAttestedObservation or bytes"
-        ) from error
-    parsed_records: list[BoundAttestedObservation] = []
-    for item in raw_records:
-        if isinstance(item, bytes):
-            item = BoundAttestedObservation.from_bytes(item)
-        if not isinstance(item, BoundAttestedObservation):
-            raise ValueError(
-                "records must contain only BoundAttestedObservation"
-                " instances or bytes"
-            )
-        parsed_records.append(item)
-
-    try:
-        raw_trusts = list(trusts)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "trusts must be an iterable of VerifierTrust or bytes"
-        ) from error
-    parsed_trusts: list[VerifierTrust] = []
-    for entry in raw_trusts:
-        if isinstance(entry, bytes):
-            entry = VerifierTrust.from_bytes(entry)
-        if not isinstance(entry, VerifierTrust):
-            raise ValueError(
-                "trusts must contain only VerifierTrust instances or bytes"
-            )
-        parsed_trusts.append(entry)
+    parsed_records = _parse_cert_records(records)
+    parsed_trusts = _parse_cert_trusts(trusts)
 
     consensus = locate_cert(parsed_records, point, context, parsed_trusts, root)
 
@@ -29654,85 +29694,10 @@ def _locate_weighted_cert(
     together with the parsed records and the id-keyed trust map so callers
     can freeze the exact participating inputs into an evidence body.
     """
-    if not isinstance(point, tuple) or len(point) != 2:
-        raise ValueError("point must be a tuple of exactly two finite numbers")
-    px = _finite_non_bool(point[0])
-    py = _finite_non_bool(point[1])
-    if not isinstance(context, str) or not context:
-        raise ValueError("context must be a non-empty string")
-
-    try:
-        raw_trusts = list(trusts)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "trusts must be an iterable of VerifierTrust or bytes"
-        ) from error
-    trust_map: dict[str, VerifierTrust] = {}
-    for entry in raw_trusts:
-        if isinstance(entry, bytes):
-            entry = VerifierTrust.from_bytes(entry)
-        if not isinstance(entry, VerifierTrust):
-            raise ValueError(
-                "trusts must contain only VerifierTrust instances or bytes"
-            )
-        ident = entry.id
-        if ident in trust_map:
-            raise ValueError(f"duplicate trust id: {ident!r}")
-        if not hmac.compare_digest(
-            _trust_mac(root, _trust_payload(entry)), entry.mac
-        ):
-            raise ValueError(f"verifier trust mac does not match: {ident!r}")
-        trust_map[ident] = entry
-
-    try:
-        raw_records = list(records)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "records must be an iterable of BoundAttestedObservation or bytes"
-        ) from error
-    parsed_records: list[BoundAttestedObservation] = []
-    observations: list[Observation] = []
-    seen_ids: set[str] = set()
-    for item in raw_records:
-        if isinstance(item, bytes):
-            item = BoundAttestedObservation.from_bytes(item)
-        if not isinstance(item, BoundAttestedObservation):
-            raise ValueError(
-                "records must contain only BoundAttestedObservation"
-                " instances or bytes"
-            )
-        ident = item.id
-        if ident in seen_ids:
-            raise ValueError(f"duplicate observation id: {ident!r}")
-        seen_ids.add(ident)
-        trust = trust_map.get(ident)
-        if trust is None:
-            raise ValueError(f"missing verifier trust for id: {ident!r}")
-        if not hmac.compare_digest(
-            _bound_attested_mac(trust.key, _bound_attested_payload(item)),
-            item.mac,
-        ):
-            raise ValueError(
-                f"bound attested observation mac does not match: {ident!r}"
-            )
-        # Only after both MACs verify do the trust bindings count: the
-        # certified id/x/y must equal the record's, or it is a contract
-        # breach.
-        if trust.x != item.x or trust.y != item.y:
-            raise ValueError(
-                f"verifier trust does not match the observation: {ident!r}"
-            )
-        # The signed record must match the query coordinate by coordinate
-        # and carry exactly the queried use context, as in locate_cert.
-        if item.point[0] != px or item.point[1] != py or item.context != context:
-            raise ValueError(
-                "bound attested observation is not bound to the queried"
-                f" point and context: {ident!r}"
-            )
-        parsed_records.append(item)
-        observations.append(
-            Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
-        )
+    px, py = _require_query_binding(point, context)
+    trust_map = _verify_cert_trusts(trusts, root)
+    parsed_records = _parse_cert_records(records)
+    observations = _verify_cert_records(parsed_records, trust_map, px, py, context)
 
     consensus = locate_weighted(observations, point, policy)
     return consensus, parsed_records, trust_map
