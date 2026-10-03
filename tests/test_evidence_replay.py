@@ -620,6 +620,348 @@ class EvidenceReplayAuditorBatchTest(unittest.TestCase):
         self.assertIs(self.auditor.checkpoint, before)
 
 
+def expected_measurement(record, *, key=KEY):
+    """The stateless public audit result for one record object."""
+    if isinstance(record, BoundEvidence):
+        return audit_bound(record, key)
+    if isinstance(record, DelayBoundEvidence):
+        return audit_delay_bound(record, key)
+    return audit(record, key)
+
+
+def ledger_entry(record):
+    """The (kind, round_index, nonce) ledger entry of one record object."""
+    if isinstance(record, BoundEvidence):
+        evidence = record.evidence
+        return (2, evidence.round_index, evidence.nonce)
+    if isinstance(record, DelayBoundEvidence):
+        evidence = record.evidence
+        return (3, evidence.round_index, evidence.nonce)
+    return (1, record.round_index, record.nonce)
+
+
+def run_concurrently(testcase, calls):
+    """Run zero-argument calls on separate threads released together.
+
+    Returns one ("ok", value), ("value-error", error) or
+    ("error", error) triple per call, in call order. Anything that is
+    not a ValueError and any call that fails to finish is surfaced to
+    the calling test instead of being lost inside the thread.
+    """
+    barrier = threading.Barrier(len(calls))
+    outcomes = [None] * len(calls)
+
+    def make_worker(index, call):
+        def worker():
+            try:
+                barrier.wait(timeout=10)
+                outcomes[index] = ("ok", call())
+            except ValueError as error:
+                outcomes[index] = ("value-error", error)
+            except BaseException as error:
+                outcomes[index] = ("error", error)
+        return worker
+
+    threads = [
+        threading.Thread(target=make_worker(index, call), name=f"race-{index}")
+        for index, call in enumerate(calls)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    for index, thread in enumerate(threads):
+        testcase.assertFalse(
+            thread.is_alive(), f"concurrent call {index} did not finish"
+        )
+    return outcomes
+
+
+def split_outcomes(testcase, outcomes):
+    """Partition run_concurrently output into (values, ValueErrors)."""
+    values = []
+    failures = []
+    for index, (status, payload) in enumerate(outcomes):
+        if status == "ok":
+            values.append(payload)
+        elif status == "value-error":
+            failures.append(payload)
+        else:
+            testcase.fail(f"concurrent call {index} raised {payload!r}")
+    return values, failures
+
+
+class EvidenceReplayAuditorConcurrentBatchTest(unittest.TestCase):
+    """Concurrent audit_batch races against the shared ledger.
+
+    Every race is decided by the auditor, never by the test: the
+    assertions hold for any legal winner, and no test assumes a
+    particular thread runs first or waits a fixed amount of time.
+    """
+
+    def test_identical_batches_race(self):
+        records = make_evidence_records(2)
+        auditor = EvidenceReplayAuditor(KEY)
+        outcomes = run_concurrently(self, [
+            lambda: auditor.audit_batch(records),
+            lambda: auditor.audit_batch(records),
+        ])
+        values, failures = split_outcomes(self, outcomes)
+        self.assertEqual(len(values), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(
+            values[0],
+            tuple(expected_measurement(record) for record in records),
+        )
+        self.assertEqual(auditor.checkpoint.sequence, 2)
+
+    def test_overlapping_batches_exactly_one_succeeds(self):
+        records = make_evidence_records(3)
+        common, unique_a, unique_b = records
+        auditor = EvidenceReplayAuditor(KEY)
+        batch_a = [unique_a, common]
+        batch_b = [common, unique_b]
+        outcomes = run_concurrently(self, [
+            lambda: auditor.audit_batch(batch_a),
+            lambda: auditor.audit_batch(batch_b),
+        ])
+        values, failures = split_outcomes(self, outcomes)
+        self.assertEqual(len(values), 1)
+        self.assertEqual(len(failures), 1)
+        winner = batch_a if outcomes[0][0] == "ok" else batch_b
+        loser_unique = unique_b if outcomes[0][0] == "ok" else unique_a
+        # The winner returns the stateless measurements in input order.
+        self.assertEqual(
+            values[0],
+            tuple(expected_measurement(record) for record in winner),
+        )
+        # The ledger gained exactly the winner batch's entries.
+        checkpoint = auditor.checkpoint
+        self.assertEqual(checkpoint.sequence, len(winner))
+        self.assertEqual(
+            checkpoint.entries,
+            tuple(sorted(ledger_entry(record) for record in winner)),
+        )
+        # The shared record stays consumed for the loser as well.
+        with self.assertRaises(ValueError):
+            auditor.audit(common)
+        # The loser's unique evidence was not partially consumed.
+        auditor.audit(loser_unique)
+        self.assertEqual(auditor.checkpoint.sequence, 3)
+
+    def test_single_audit_races_batch(self):
+        records = make_evidence_records(2)
+        auditor = EvidenceReplayAuditor(KEY)
+        outcomes = run_concurrently(self, [
+            lambda: auditor.audit(records[0]),
+            lambda: auditor.audit_batch([records[0], records[1]]),
+        ])
+        values, failures = split_outcomes(self, outcomes)
+        self.assertEqual(len(values), 1)
+        self.assertEqual(len(failures), 1)
+        # The final state equals the winning operation run alone.
+        reference = EvidenceReplayAuditor(KEY)
+        if outcomes[0][0] == "ok":
+            expected = reference.audit(records[0])
+        else:
+            expected = reference.audit_batch([records[0], records[1]])
+        self.assertEqual(values[0], expected)
+        self.assertEqual(auditor.checkpoint, reference.checkpoint)
+        # The shared evidence is consumed no matter who won.
+        with self.assertRaises(ValueError):
+            auditor.audit(records[0])
+
+    def test_object_and_canonical_bytes_conflict(self):
+        records = make_evidence_records(3)
+        auditor = EvidenceReplayAuditor(KEY)
+        # The canonical bytes decode to the same evidence and pass the
+        # same stateless audit before the race.
+        decoded = Evidence.from_bytes(records[0].to_bytes())
+        self.assertEqual(decoded, records[0])
+        self.assertEqual(audit(decoded, KEY), audit(records[0], KEY))
+        batch_objects = [records[0], records[1]]
+        batch_bytes = [records[0].to_bytes(), records[2].to_bytes()]
+        outcomes = run_concurrently(self, [
+            lambda: auditor.audit_batch(batch_objects),
+            lambda: auditor.audit_batch(batch_bytes),
+        ])
+        values, failures = split_outcomes(self, outcomes)
+        self.assertEqual(len(values), 1)
+        self.assertEqual(len(failures), 1)
+        winner = (
+            [records[0], records[1]]
+            if outcomes[0][0] == "ok"
+            else [records[0], records[2]]
+        )
+        checkpoint = auditor.checkpoint
+        self.assertEqual(checkpoint.sequence, 2)
+        self.assertEqual(
+            checkpoint.entries,
+            tuple(sorted(ledger_entry(record) for record in winner)),
+        )
+        with self.assertRaises(ValueError):
+            auditor.audit(records[0].to_bytes())
+
+    def test_cross_kind_twin_batches_race(self):
+        records = make_evidence_records(4)
+        record = records[0]
+        bound = bound_twin(record)
+        delay = delay_twin(record)
+        # Each kind passes its own stateless audit before the race, so a
+        # rejection below is replay protection, not an authentication
+        # failure.
+        audit(record, KEY)
+        audit_bound(bound, KEY)
+        audit_delay_bound(delay, KEY)
+        auditor = EvidenceReplayAuditor(KEY)
+        batches = [
+            [record, records[1]],
+            [bound, records[2]],
+            [delay, records[3]],
+        ]
+        outcomes = run_concurrently(self, [
+            lambda batch=batch: auditor.audit_batch(batch)
+            for batch in batches
+        ])
+        values, failures = split_outcomes(self, outcomes)
+        self.assertEqual(len(values), 1)
+        self.assertEqual(len(failures), 2)
+        winner_index = next(
+            index
+            for index, (status, _payload) in enumerate(outcomes)
+            if status == "ok"
+        )
+        winner = batches[winner_index]
+        self.assertEqual(
+            values[0],
+            tuple(expected_measurement(record) for record in winner),
+        )
+        checkpoint = auditor.checkpoint
+        self.assertEqual(checkpoint.sequence, 2)
+        self.assertEqual(
+            checkpoint.entries,
+            tuple(sorted(ledger_entry(record) for record in winner)),
+        )
+        # The shared (round_index, nonce) pair stays consumed under
+        # every evidence kind.
+        with self.assertRaises(ValueError):
+            auditor.audit(record)
+        with self.assertRaises(ValueError):
+            auditor.audit(bound)
+        with self.assertRaises(ValueError):
+            auditor.audit(delay)
+        # Neither losing batch was partially consumed.
+        for index, batch in enumerate(batches):
+            if index != winner_index:
+                auditor.audit(batch[1])
+        self.assertEqual(auditor.checkpoint.sequence, 4)
+
+    def test_disjoint_batches_all_succeed(self):
+        records = make_evidence_records(8)
+        batches = [records[index:index + 2] for index in range(0, 8, 2)]
+        auditor = EvidenceReplayAuditor(KEY)
+        outcomes = run_concurrently(self, [
+            lambda batch=batch: auditor.audit_batch(list(batch))
+            for batch in batches
+        ])
+        values, failures = split_outcomes(self, outcomes)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(values), len(batches))
+        # Each batch got its own measurements back in input order.
+        for batch, (status, payload) in zip(batches, outcomes):
+            self.assertEqual(status, "ok")
+            self.assertEqual(
+                payload,
+                tuple(expected_measurement(record) for record in batch),
+            )
+        # No record was lost: sequence equals the consumed entry count.
+        checkpoint = auditor.checkpoint
+        self.assertEqual(checkpoint.sequence, len(records))
+        self.assertEqual(
+            checkpoint.entries,
+            tuple(sorted(ledger_entry(record) for record in records)),
+        )
+
+    def test_empty_batch_races_without_consuming(self):
+        records = make_evidence_records(2)
+        auditor = EvidenceReplayAuditor(KEY)
+        outcomes = run_concurrently(self, [
+            lambda: auditor.audit_batch([]),
+            lambda: auditor.audit_batch(records),
+        ])
+        values, failures = split_outcomes(self, outcomes)
+        self.assertEqual(failures, [])
+        self.assertEqual(outcomes[0], ("ok", ()))
+        self.assertEqual(
+            outcomes[1][1],
+            tuple(expected_measurement(record) for record in records),
+        )
+        self.assertEqual(auditor.checkpoint.sequence, 2)
+
+    def test_forged_batch_races_legal_batch(self):
+        records = make_evidence_records(4)
+        forged = replace(records[3], mac=b"\x00" * 32)
+        auditor = EvidenceReplayAuditor(KEY)
+        legal_batch = [records[0], records[1]]
+        forged_batch = [records[2], forged]
+        outcomes = run_concurrently(self, [
+            lambda: auditor.audit_batch(legal_batch),
+            lambda: auditor.audit_batch(forged_batch),
+        ])
+        values, failures = split_outcomes(self, outcomes)
+        self.assertEqual(len(values), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(
+            values[0],
+            tuple(expected_measurement(record) for record in legal_batch),
+        )
+        # The legal batch committed in full. The judgment is the final
+        # state, not an unchanged checkpoint across the forged call —
+        # the legal call legitimately advances the ledger.
+        reference = EvidenceReplayAuditor(KEY)
+        reference.audit_batch(legal_batch)
+        self.assertEqual(auditor.checkpoint, reference.checkpoint)
+        # The forged batch left nothing behind, not even its valid
+        # prefix record.
+        auditor.audit_batch([records[2], records[3]])
+        self.assertEqual(auditor.checkpoint.sequence, 4)
+
+    def test_checkpoint_after_race_restores_as_object_and_bytes(self):
+        records = make_evidence_records(4)
+        auditor = EvidenceReplayAuditor(KEY)
+        outcomes = run_concurrently(self, [
+            lambda: auditor.audit_batch([records[0], records[1]]),
+            lambda: auditor.audit_batch([records[1], records[2]]),
+        ])
+        values, failures = split_outcomes(self, outcomes)
+        self.assertEqual(len(values), 1)
+        self.assertEqual(len(failures), 1)
+        checkpoint = auditor.checkpoint
+        consumed = set(checkpoint.entries)
+        self.assertEqual(len(consumed), 2)
+        for restored in (
+            EvidenceReplayAuditor(KEY, checkpoint),
+            EvidenceReplayAuditor(KEY, checkpoint.to_bytes()),
+        ):
+            self.assertEqual(restored.checkpoint, checkpoint)
+            # Every consumed evidence stays consumed after the restart,
+            # as an object, as canonical bytes and across kinds.
+            for record in records[:3]:
+                if ledger_entry(record) in consumed:
+                    with self.assertRaises(ValueError):
+                        restored.audit(record)
+                    with self.assertRaises(ValueError):
+                        restored.audit(record.to_bytes())
+                    with self.assertRaises(ValueError):
+                        restored.audit(bound_twin(record))
+            # The evidence no batch consumed is still accepted.
+            measurement = restored.audit(records[3])
+            self.assertEqual(measurement, audit(records[3], KEY))
+            self.assertEqual(
+                restored.checkpoint.sequence, checkpoint.sequence + 1
+            )
+
+
 class EvidenceReplayAuditorRestartTest(unittest.TestCase):
     def test_checkpoint_bytes_resume_across_instances(self):
         records = make_evidence_records(3)
