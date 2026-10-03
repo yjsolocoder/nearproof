@@ -620,6 +620,157 @@ class EvidenceReplayAuditorBatchTest(unittest.TestCase):
         self.assertIs(self.auditor.checkpoint, before)
 
 
+def noncanonical_evidence_bytes(record):
+    """Decodable-but-non-canonical spellings of one Evidence record.
+
+    Every variant still decodes through ``Evidence.from_bytes`` to the
+    very same record — fields and signatures intact — so only the
+    missing byte-for-byte equality with ``to_bytes()`` keeps it out of
+    the replay auditor.
+    """
+    data = record.to_bytes()
+    variants = {
+        "extra whitespace": json.dumps(json.loads(data), indent=2).encode(),
+        "equivalent number spelling": data.replace(
+            b"299792458.0", b"299792458.00", 1
+        ),
+        "string escape": data.replace(b'"accepted"', b'"\\u0061ccepted"', 1),
+    }
+    for variant in variants.values():
+        assert variant != data
+        assert Evidence.from_bytes(variant) == record
+    return variants
+
+
+def whitespace_variant(record):
+    """A pretty-printed (non-canonical) respelling of any record's bytes."""
+    return json.dumps(json.loads(record.to_bytes()), indent=2).encode()
+
+
+class EvidenceReplayCanonicalBytesTest(unittest.TestCase):
+    """The replay auditor only consumes canonical record bytes.
+
+    Unlike the stateless decoders, which keep accepting historical
+    decodable input, ``audit`` and ``audit_batch`` require bytes to be
+    byte-for-byte the ``to_bytes()`` encoding of the decoded evidence —
+    uniformly for Evidence, BoundEvidence and DelayBoundEvidence — and a
+    rejection never touches the ledger.
+    """
+
+    def setUp(self):
+        self.records = make_evidence_records(3)
+        self.bounds = make_bound_records(1)
+        self.delays = make_delay_records(1)
+        self.auditor = EvidenceReplayAuditor(KEY)
+
+    def test_noncanonical_evidence_bytes_rejected_before_first_consumption(self):
+        for name, variant in noncanonical_evidence_bytes(
+            self.records[0]
+        ).items():
+            with self.subTest(variant=name):
+                with self.assertRaises(ValueError):
+                    self.auditor.audit(variant)
+        self.assertIsNone(self.auditor.checkpoint)
+
+    def test_noncanonical_bytes_rejected_for_all_three_kinds(self):
+        for record in (self.records[0], self.bounds[0], self.delays[0]):
+            with self.subTest(kind=type(record).__name__):
+                with self.assertRaises(ValueError):
+                    self.auditor.audit(whitespace_variant(record))
+        self.assertIsNone(self.auditor.checkpoint)
+
+    def test_stateless_entry_points_still_accept_decodable_input(self):
+        # The compatibility of Evidence.from_bytes and the standalone
+        # audit with historical decodable input is out of scope for the
+        # tightening: both keep accepting the non-canonical spellings.
+        record = self.records[0]
+        expected = audit(record, KEY)
+        for name, variant in noncanonical_evidence_bytes(record).items():
+            with self.subTest(variant=name):
+                self.assertEqual(Evidence.from_bytes(variant), record)
+                self.assertEqual(audit(variant, KEY), expected)
+
+    def test_rejection_leaves_existing_checkpoint_bytes_untouched(self):
+        self.auditor.audit(self.records[0])
+        before = self.auditor.checkpoint
+        before_bytes = before.to_bytes()
+        for name, variant in noncanonical_evidence_bytes(
+            self.records[1]
+        ).items():
+            with self.subTest(variant=name):
+                with self.assertRaises(ValueError):
+                    self.auditor.audit(variant)
+        self.assertIs(self.auditor.checkpoint, before)
+        self.assertEqual(self.auditor.checkpoint.to_bytes(), before_bytes)
+
+    def test_canonical_bytes_accepted_after_rejection_then_replay_rules(self):
+        record = self.records[0]
+        variant = noncanonical_evidence_bytes(record)["extra whitespace"]
+        with self.assertRaises(ValueError):
+            self.auditor.audit(variant)
+        # The same evidence as canonical bytes still consumes successfully.
+        measurement = self.auditor.audit(record.to_bytes())
+        self.assertEqual(measurement, audit(record, KEY))
+        # And from then on the usual replay rules apply, to both forms.
+        before = self.auditor.checkpoint
+        with self.assertRaises(ValueError):
+            self.auditor.audit(record.to_bytes())
+        with self.assertRaises(ValueError):
+            self.auditor.audit(record)
+        self.assertIs(self.auditor.checkpoint, before)
+
+    def test_restored_auditor_enforces_same_rule(self):
+        self.auditor.audit(self.records[0])
+        restored = EvidenceReplayAuditor(KEY, self.auditor.checkpoint.to_bytes())
+        before_bytes = restored.checkpoint.to_bytes()
+        with self.assertRaises(ValueError):
+            restored.audit(whitespace_variant(self.records[1]))
+        self.assertEqual(restored.checkpoint.to_bytes(), before_bytes)
+        measurement = restored.audit(self.records[1].to_bytes())
+        self.assertEqual(measurement, audit(self.records[1], KEY))
+        self.assertEqual(restored.checkpoint.sequence, 2)
+
+    def test_batch_rejects_noncanonical_member_atomically(self):
+        good = [record.to_bytes() for record in self.records]
+        variant = noncanonical_evidence_bytes(self.records[1])[
+            "equivalent number spelling"
+        ]
+        for batch in (
+            [variant, good[1], good[2]],
+            [good[0], variant, good[2]],
+            [good[0], good[1], variant],
+            [good[0], whitespace_variant(self.bounds[0]), good[2]],
+        ):
+            with self.assertRaises(ValueError):
+                self.auditor.audit_batch(batch)
+            # No consumed prefix survives any rejection position.
+            self.assertIsNone(self.auditor.checkpoint)
+        # The all-canonical batch is still accepted, in input order.
+        expected = tuple(audit(record, KEY) for record in self.records)
+        self.assertEqual(self.auditor.audit_batch(good), expected)
+        self.assertEqual(self.auditor.checkpoint.sequence, 3)
+
+    def test_batch_rejection_after_consumption_leaves_checkpoint_untouched(self):
+        self.auditor.audit(self.records[0])
+        before = self.auditor.checkpoint
+        before_bytes = before.to_bytes()
+        with self.assertRaises(ValueError):
+            self.auditor.audit_batch(
+                [
+                    self.records[1].to_bytes(),
+                    whitespace_variant(self.records[2]),
+                ]
+            )
+        self.assertIs(self.auditor.checkpoint, before)
+        self.assertEqual(self.auditor.checkpoint.to_bytes(), before_bytes)
+        # The un-consumed canonical prefix records remain acceptable.
+        result = self.auditor.audit_batch(
+            [self.records[1].to_bytes(), self.records[2].to_bytes()]
+        )
+        self.assertEqual(len(result), 2)
+        self.assertEqual(self.auditor.checkpoint.sequence, 3)
+
+
 def expected_measurement(record, *, key=KEY):
     """The stateless public audit result for one record object."""
     if isinstance(record, BoundEvidence):

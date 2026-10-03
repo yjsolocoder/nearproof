@@ -20703,7 +20703,11 @@ class EvidenceReplayAuditor:
         its consumption identifier ``(kind, round_index, nonce)``.
 
         Pure: touches no auditor state. Every contract violation raises
-        :class:`ValueError`.
+        :class:`ValueError`. A ``bytes`` record is only accepted when it is
+        byte-for-byte the canonical ``to_bytes()`` encoding of the decoded
+        evidence — decodable-but-non-canonical input (extra whitespace,
+        equivalent number spellings, string escapes) is rejected here even
+        though the stateless decoders still accept it.
         """
         if isinstance(record, Evidence):
             measurement = audit(record, self._key)
@@ -20736,6 +20740,16 @@ class EvidenceReplayAuditor:
                     parsed = cls.from_bytes(record)
                 except ValueError:
                     continue
+                if parsed.to_bytes() != record:
+                    # Decodable but not the canonical encoding of the
+                    # decoded evidence (whitespace, an equivalent number
+                    # spelling, a string escape, ...). The replay auditor
+                    # only consumes canonical bytes, unlike the stateless
+                    # decoders, which keep accepting historical input.
+                    raise ValueError(
+                        "evidence replay record bytes must be the canonical"
+                        " to_bytes() encoding of the decoded evidence"
+                    )
                 return self._verify_record(parsed)
             raise ValueError(
                 "evidence replay record bytes must be the canonical"
