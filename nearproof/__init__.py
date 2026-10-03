@@ -26078,6 +26078,61 @@ def _disk_covers(
     return distance <= radius
 
 
+def _validate_tolerance(tolerance: object) -> float:
+    """Return ``float(tolerance)`` for a finite non-bool non-negative number."""
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError("tolerance must be a finite non-negative number")
+    slack = float(tolerance)
+    if not math.isfinite(slack) or slack < 0:
+        raise ValueError("tolerance must be a finite non-negative number")
+    return slack
+
+
+def _validate_point(point: object) -> tuple[float, float]:
+    """Return ``point`` as two finite non-bool floats, else raise."""
+    if not isinstance(point, tuple) or len(point) != 2:
+        raise ValueError("point must be a tuple of exactly two finite numbers")
+    return _finite_non_bool(point[0]), _finite_non_bool(point[1])
+
+
+def _observation_list(observations: object) -> list:
+    """Materialize ``observations`` (any iterable, once) or raise."""
+    try:
+        return list(observations)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("observations must be an iterable of Observation") from error
+
+
+def _validated_disks(observations: list) -> list[tuple[str, float, float, float]]:
+    """Validate every observation, returning ``(id, x, y, upper_bound)`` rows.
+
+    Each row carries a unique non-empty string id, finite non-bool
+    coordinates and a finite non-negative ``upper_bound`` taken from a
+    :class:`RangeDecision` (whose ``accepted`` flag never participates).
+    """
+    disks: list[tuple[str, float, float, float]] = []
+    seen_ids: set[str] = set()
+    for observation in observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        disks.append((ident, ox, oy, bound))
+    return disks
+
+
 def locate(
     observations: object,
     point: object,
@@ -26111,25 +26166,14 @@ def locate(
     of input order; ``accepted`` is ``True`` exactly when ``support``
     reaches ``quorum``.
     """
-    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
-        raise ValueError("tolerance must be a finite non-negative number")
-    slack = float(tolerance)
-    if not math.isfinite(slack) or slack < 0:
-        raise ValueError("tolerance must be a finite non-negative number")
+    slack = _validate_tolerance(tolerance)
 
     if isinstance(quorum, bool) or type(quorum) is not int or quorum < 1:
         raise ValueError("quorum must be a positive integer")
 
-    if not isinstance(point, tuple) or len(point) != 2:
-        raise ValueError("point must be a tuple of exactly two finite numbers")
-    px = _finite_non_bool(point[0])
-    py = _finite_non_bool(point[1])
+    px, py = _validate_point(point)
 
-    try:
-        raw_observations = list(observations)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError("observations must be an iterable of Observation") from error
-
+    raw_observations = _observation_list(observations)
     if len(raw_observations) < 3:
         raise ValueError(
             f"need at least 3 observations, got {len(raw_observations)}"
@@ -26137,29 +26181,11 @@ def locate(
     if quorum > len(raw_observations):
         raise ValueError("quorum must not exceed the number of observations")
 
-    rejected: list[str] = []
-    seen_ids: set[str] = set()
-    for observation in raw_observations:
-        if not isinstance(observation, Observation):
-            raise ValueError("observations must contain only Observation instances")
-        ident = observation.id
-        if not isinstance(ident, str) or not ident:
-            raise ValueError("observation id must be a non-empty string")
-        if ident in seen_ids:
-            raise ValueError(f"duplicate observation id: {ident!r}")
-        seen_ids.add(ident)
-        ox = _finite_non_bool(observation.x)
-        oy = _finite_non_bool(observation.y)
-        decision = observation.decision
-        if not isinstance(decision, RangeDecision):
-            raise ValueError("observation decision must be a RangeDecision")
-        bound = _finite_non_bool(decision.upper_bound)
-        if bound < 0:
-            raise ValueError("decision upper_bound must be non-negative")
-        if not _disk_covers(px, py, ox, oy, bound, slack):
-            rejected.append(ident)
-
-    rejected.sort()
+    rejected = sorted(
+        ident
+        for ident, ox, oy, bound in _validated_disks(raw_observations)
+        if not _disk_covers(px, py, ox, oy, bound, slack)
+    )
     support = len(raw_observations) - len(rejected)
     return Consensus(
         total=len(raw_observations),
@@ -26203,43 +26229,17 @@ def locate_weighted(
     (sorted lexicographically), never as an exception. The result is
     independent of input order and the function does not mutate its inputs.
     """
-    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
-        raise ValueError("tolerance must be a finite non-negative number")
-    slack = float(tolerance)
-    if not math.isfinite(slack) or slack < 0:
-        raise ValueError("tolerance must be a finite non-negative number")
+    slack = _validate_tolerance(tolerance)
 
-    if not isinstance(point, tuple) or len(point) != 2:
-        raise ValueError("point must be a tuple of exactly two finite numbers")
-    px = _finite_non_bool(point[0])
-    py = _finite_non_bool(point[1])
+    px, py = _validate_point(point)
 
     if not isinstance(policy, ConsensusPolicy):
         raise ValueError("policy must be a ConsensusPolicy")
 
-    try:
-        raw_observations = list(observations)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError("observations must be an iterable of Observation") from error
-
-    supported: dict[str, bool] = {}
-    for observation in raw_observations:
-        if not isinstance(observation, Observation):
-            raise ValueError("observations must contain only Observation instances")
-        ident = observation.id
-        if not isinstance(ident, str) or not ident:
-            raise ValueError("observation id must be a non-empty string")
-        if ident in supported:
-            raise ValueError(f"duplicate observation id: {ident!r}")
-        ox = _finite_non_bool(observation.x)
-        oy = _finite_non_bool(observation.y)
-        decision = observation.decision
-        if not isinstance(decision, RangeDecision):
-            raise ValueError("observation decision must be a RangeDecision")
-        bound = _finite_non_bool(decision.upper_bound)
-        if bound < 0:
-            raise ValueError("decision upper_bound must be non-negative")
-        supported[ident] = _disk_covers(px, py, ox, oy, bound, slack)
+    supported = {
+        ident: _disk_covers(px, py, ox, oy, bound, slack)
+        for ident, ox, oy, bound in _validated_disks(_observation_list(observations))
+    }
 
     weights = policy.weights
     if set(supported) != set(weights):
@@ -26317,42 +26317,18 @@ def locate_region(
     The result is independent of input order, the function does not mutate
     its inputs, and every reported coordinate is a finite non-bool float.
     """
-    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
-        raise ValueError("tolerance must be a finite non-negative number")
-    slack = float(tolerance)
-    if not math.isfinite(slack) or slack < 0:
-        raise ValueError("tolerance must be a finite non-negative number")
+    slack = _validate_tolerance(tolerance)
 
-    try:
-        raw_observations = list(observations)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError("observations must be an iterable of Observation") from error
-
+    raw_observations = _observation_list(observations)
     if len(raw_observations) < 3:
         raise ValueError(
             f"need at least 3 observations, got {len(raw_observations)}"
         )
 
-    disks: list[tuple[float, float, float]] = []
-    seen_ids: set[str] = set()
-    for observation in raw_observations:
-        if not isinstance(observation, Observation):
-            raise ValueError("observations must contain only Observation instances")
-        ident = observation.id
-        if not isinstance(ident, str) or not ident:
-            raise ValueError("observation id must be a non-empty string")
-        if ident in seen_ids:
-            raise ValueError(f"duplicate observation id: {ident!r}")
-        seen_ids.add(ident)
-        ox = _finite_non_bool(observation.x)
-        oy = _finite_non_bool(observation.y)
-        decision = observation.decision
-        if not isinstance(decision, RangeDecision):
-            raise ValueError("observation decision must be a RangeDecision")
-        bound = _finite_non_bool(decision.upper_bound)
-        if bound < 0:
-            raise ValueError("decision upper_bound must be non-negative")
-        disks.append((ox, oy, bound + slack))
+    disks = [
+        (ox, oy, bound + slack)
+        for _ident, ox, oy, bound in _validated_disks(raw_observations)
+    ]
 
     scale = 1.0
     for cx, cy, radius in disks:
