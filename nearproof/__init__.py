@@ -20009,6 +20009,67 @@ class StreamCommitReceiptBundleReceiptAuditor:
             )
 
 
+def _audit_key(key: object) -> bytes:
+    """Coerce the shared key for :func:`audit` and :func:`audit_bound`.
+
+    An empty key (``b""``, ``""`` or any other falsy value) is rejected
+    with :class:`ValueError` before coercion, preserving the long-standing
+    acceptance of other bytes-like values through ``bytes(key)``.
+    :func:`audit_delay_bound` deliberately keeps its stricter
+    non-:class:`bytes` → :class:`TypeError` rule and does not use this.
+    """
+    if not key:
+        raise ValueError("key must not be empty")
+    return bytes(key)
+
+
+def _audit_inner_mac(key: bytes, evidence: "Evidence", message: str) -> None:
+    """Recompute the inner :class:`Evidence` MAC common to all three audits.
+
+    This is the one inner signature shared by :func:`audit`,
+    :func:`audit_bound` and :func:`audit_delay_bound`: a correct outer
+    signature never satisfies it, so a record whose nested MAC was made
+    under another key or over different fields is rejected even when the
+    caller re-signed the outer record. The comparison is constant time and
+    a mismatch raises :class:`ValueError` with the protocol-specific
+    ``message``.
+    """
+    if not hmac.compare_digest(
+        _evidence_mac(key, _evidence_payload(evidence)), evidence.mac
+    ):
+        raise ValueError(message)
+
+
+def _audit_round_trip(evidence: "Evidence", label: str) -> float:
+    """Recompute the ranging result from the recorded clock readings.
+
+    ``elapsed`` is ``end - start`` and ``distance`` is
+    ``elapsed * speed / 2.0``, evaluated in exactly that operation order,
+    then compared against the recorded fields with exact equality — no
+    tolerance or rounding. ``label`` (``"evidence"``, ``"bound evidence"``
+    or ``"delay bound evidence"``) prefixes the protocol-specific messages.
+    Returns the recomputed elapsed for callers with further timing checks.
+    """
+    elapsed = evidence.end - evidence.start
+    if elapsed != evidence.elapsed:
+        raise ValueError(f"{label} elapsed does not match start and end")
+    distance = elapsed * evidence.speed / 2.0
+    if distance != evidence.distance:
+        raise ValueError(f"{label} distance does not match elapsed and speed")
+    return elapsed
+
+
+def _measurement_from_evidence(evidence: "Evidence") -> Measurement:
+    """Build the identical :class:`Measurement` every audit path returns."""
+    return Measurement(
+        round_index=evidence.round_index,
+        nonce=evidence.nonce,
+        response=evidence.response,
+        elapsed_seconds=evidence.elapsed,
+        distance_meters=evidence.distance,
+    )
+
+
 def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
     """Re-verify an :class:`Evidence` record against the shared ``key``.
 
@@ -20022,31 +20083,17 @@ def audit(evidence: Evidence | bytes, key: bytes) -> Measurement:
     Auditing is a pure check: it touches no verifier state and is no
     substitute for replay protection or challenge TTLs at verification time.
     """
-    if not key:
-        raise ValueError("key must not be empty")
-    key = bytes(key)
+    key = _audit_key(key)
     if isinstance(evidence, bytes):
         evidence = Evidence.from_bytes(evidence)
     elif not isinstance(evidence, Evidence):
         raise ValueError("evidence must be an Evidence instance or bytes")
     _validate_evidence(evidence)
-    if not hmac.compare_digest(_evidence_mac(key, _evidence_payload(evidence)), evidence.mac):
-        raise ValueError("evidence mac does not match")
+    _audit_inner_mac(key, evidence, "evidence mac does not match")
     if not hmac.compare_digest(keyed_response(key, evidence.nonce), evidence.response):
         raise ValueError("evidence response does not match the key and nonce")
-    elapsed = evidence.end - evidence.start
-    if elapsed != evidence.elapsed:
-        raise ValueError("evidence elapsed does not match start and end")
-    distance = elapsed * evidence.speed / 2.0
-    if distance != evidence.distance:
-        raise ValueError("evidence distance does not match elapsed and speed")
-    return Measurement(
-        round_index=evidence.round_index,
-        nonce=evidence.nonce,
-        response=evidence.response,
-        elapsed_seconds=evidence.elapsed,
-        distance_meters=evidence.distance,
-    )
+    _audit_round_trip(evidence, "evidence")
+    return _measurement_from_evidence(evidence)
 
 
 def audit_bound(bound: "BoundEvidence | bytes", key: bytes) -> Measurement:
@@ -20071,9 +20118,7 @@ def audit_bound(bound: "BoundEvidence | bytes", key: bytes) -> Measurement:
     Auditing is a pure check: it touches no verifier state and is no
     substitute for replay protection or challenge TTLs at verification time.
     """
-    if not key:
-        raise ValueError("key must not be empty")
-    key = bytes(key)
+    key = _audit_key(key)
     if isinstance(bound, bytes):
         bound = BoundEvidence.from_bytes(bound)
     elif not isinstance(bound, BoundEvidence):
@@ -20083,10 +20128,9 @@ def audit_bound(bound: "BoundEvidence | bytes", key: bytes) -> Measurement:
         _bound_evidence_mac(key, _bound_evidence_payload(bound)), bound.mac
     ):
         raise ValueError("bound evidence mac does not match")
-    if not hmac.compare_digest(
-        _evidence_mac(key, _evidence_payload(evidence)), evidence.mac
-    ):
-        raise ValueError("bound evidence evidence mac does not match")
+    _audit_inner_mac(
+        key, evidence, "bound evidence evidence mac does not match"
+    )
     if not hmac.compare_digest(
         context_digest(bound.context, bound.opening), bound.digest
     ):
@@ -20096,19 +20140,8 @@ def audit_bound(bound: "BoundEvidence | bytes", key: bytes) -> Measurement:
         evidence.response,
     ):
         raise ValueError("bound evidence response does not match the key and binding")
-    elapsed = evidence.end - evidence.start
-    if elapsed != evidence.elapsed:
-        raise ValueError("bound evidence elapsed does not match start and end")
-    distance = elapsed * evidence.speed / 2.0
-    if distance != evidence.distance:
-        raise ValueError("bound evidence distance does not match elapsed and speed")
-    return Measurement(
-        round_index=evidence.round_index,
-        nonce=evidence.nonce,
-        response=evidence.response,
-        elapsed_seconds=evidence.elapsed,
-        distance_meters=evidence.distance,
-    )
+    _audit_round_trip(evidence, "bound evidence")
+    return _measurement_from_evidence(evidence)
 
 
 def audit_delay_bound(
@@ -20155,10 +20188,9 @@ def audit_delay_bound(
         record.mac,
     ):
         raise ValueError("delay bound evidence mac does not match")
-    if not hmac.compare_digest(
-        _evidence_mac(key, _evidence_payload(evidence)), evidence.mac
-    ):
-        raise ValueError("delay bound evidence evidence mac does not match")
+    _audit_inner_mac(
+        key, evidence, "delay bound evidence evidence mac does not match"
+    )
     if not hmac.compare_digest(
         context_digest(record.context, record.opening), record.digest
     ):
@@ -20176,16 +20208,7 @@ def audit_delay_bound(
         raise ValueError(
             "delay bound evidence start does not match issued_at"
         )
-    elapsed = evidence.end - evidence.start
-    if elapsed != evidence.elapsed:
-        raise ValueError(
-            "delay bound evidence elapsed does not match start and end"
-        )
-    distance = elapsed * evidence.speed / 2.0
-    if distance != evidence.distance:
-        raise ValueError(
-            "delay bound evidence distance does not match elapsed and speed"
-        )
+    elapsed = _audit_round_trip(evidence, "delay bound evidence")
     delay = evidence.end - record.issued_at
     if delay != elapsed:
         raise ValueError(
@@ -20197,13 +20220,7 @@ def audit_delay_bound(
         raise ValueError(
             "delay bound evidence delay exceeds max_delay_seconds"
         )
-    return Measurement(
-        round_index=evidence.round_index,
-        nonce=evidence.nonce,
-        response=evidence.response,
-        elapsed_seconds=evidence.elapsed,
-        distance_meters=evidence.distance,
-    )
+    return _measurement_from_evidence(evidence)
 
 
 def audit_bound_policy(
