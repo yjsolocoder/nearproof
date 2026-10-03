@@ -20702,7 +20702,9 @@ class EvidenceReplayAuditor:
         """Run the matching stateless public audit on one record and derive
         its consumption identifier ``(kind, round_index, nonce)``.
 
-        Pure: touches no auditor state. Every contract violation raises
+        Pure: touches no auditor state. A ``bytes`` record is accepted only
+        when it equals the canonical ``to_bytes()`` output of the evidence
+        it decodes to, byte for byte. Every contract violation raises
         :class:`ValueError`.
         """
         if isinstance(record, Evidence):
@@ -20730,12 +20732,21 @@ class EvidenceReplayAuditor:
             )
         if isinstance(record, bytes):
             # The three canonical encodings carry disjoint key sets, so at
-            # most one of them parses.
+            # most one of them parses. Decoding alone is not enough: the
+            # input must equal the canonical re-encoding of the decoded
+            # record byte for byte, so extra JSON whitespace, equivalent
+            # number spellings or string escapes are rejected here even
+            # when every field and signature is otherwise valid.
             for cls in (DelayBoundEvidence, BoundEvidence, Evidence):
                 try:
                     parsed = cls.from_bytes(record)
                 except ValueError:
                     continue
+                if parsed.to_bytes() != record:
+                    raise ValueError(
+                        "evidence replay record bytes are not the canonical"
+                        " to_bytes() encoding of the decoded evidence"
+                    )
                 return self._verify_record(parsed)
             raise ValueError(
                 "evidence replay record bytes must be the canonical"

@@ -539,6 +539,213 @@ class EvidenceReplayAuditorAuditTest(unittest.TestCase):
         self.assertEqual(auditor.checkpoint.sequence, 1)
 
 
+class EvidenceReplayCanonicalBytesTest(unittest.TestCase):
+    """The replay auditor entry accepts only canonical ``to_bytes()`` bytes.
+
+    Bytes that decode to a fully valid evidence record -- every field and
+    signature intact -- are still rejected with ``ValueError`` when they
+    differ from the decoded record's canonical ``to_bytes()`` output, and
+    the rejection never touches the ledger. ``Evidence.from_bytes`` and
+    the stateless audits keep accepting those historical decodable
+    inputs; only the replay-auditor boundary is tightened.
+    """
+
+    def setUp(self):
+        self.records = make_evidence_records(3)
+        self.bounds = make_bound_records(2)
+        self.delays = make_delay_records(2)
+
+    # -- non-canonical spellings of an otherwise valid record -----------
+
+    @staticmethod
+    def _whitespace_variant(record):
+        # Same JSON values, default (spaced) separators.
+        return json.dumps(json.loads(record.to_bytes())).encode("utf-8")
+
+    @staticmethod
+    def _number_variant(record):
+        # The start field respelled as an equal-valued number:
+        # 0.0 -> 0.00, 1e-07 -> 1.0e-07.
+        canonical = record.to_bytes()
+        token = json.dumps(record.start).encode("utf-8")
+        if b"." in token:
+            respelled = token + b"0"
+        elif b"e" in token:
+            mantissa, exponent = token.split(b"e", 1)
+            respelled = mantissa + b".0e" + exponent
+        else:
+            respelled = token + b".0"
+        variant = canonical.replace(
+            b'"start":' + token, b'"start":' + respelled, 1
+        )
+        assert variant != canonical
+        return variant
+
+    @staticmethod
+    def _escape_variant(record):
+        # The result string with one character spelled as a \u escape.
+        variant = record.to_bytes().replace(
+            b'"accepted"', b'"\\u0061ccepted"', 1
+        )
+        assert variant != record.to_bytes()
+        return variant
+
+    def _evidence_variants(self, record):
+        return (
+            ("whitespace", self._whitespace_variant(record)),
+            ("number", self._number_variant(record)),
+            ("escape", self._escape_variant(record)),
+        )
+
+    def _assert_decodes_to_same_valid_evidence(self, record, variants):
+        """Every variant still decodes to the identical, fully valid
+        record through the compatibility paths that are not tightened."""
+        for description, variant in variants:
+            decoded = Evidence.from_bytes(variant)
+            self.assertEqual(
+                decoded, record,
+                f"{description} variant must decode to the same evidence",
+            )
+            self.assertIsInstance(
+                audit(decoded, KEY),
+                Measurement,
+                f"{description} variant must still pass the stateless audit",
+            )
+
+    # -- single-record entry --------------------------------------------
+
+    def test_noncanonical_evidence_bytes_rejected_before_first_consumption(self):
+        auditor = EvidenceReplayAuditor(KEY)
+        record = self.records[0]
+        variants = self._evidence_variants(record)
+        self._assert_decodes_to_same_valid_evidence(record, variants)
+        for description, variant in variants:
+            with self.assertRaises(
+                ValueError, msg=f"{description} variant must be rejected"
+            ):
+                auditor.audit(variant)
+        self.assertIsNone(auditor.checkpoint)
+
+    def test_noncanonical_rejection_leaves_existing_checkpoint_untouched(self):
+        auditor = EvidenceReplayAuditor(KEY)
+        auditor.audit(self.records[0])
+        checkpoint = auditor.checkpoint
+        before_bytes = checkpoint.to_bytes()
+        record = self.records[1]
+        variants = self._evidence_variants(record)
+        self._assert_decodes_to_same_valid_evidence(record, variants)
+        for description, variant in variants:
+            with self.assertRaises(
+                ValueError, msg=f"{description} variant must be rejected"
+            ):
+                auditor.audit(variant)
+        self.assertIs(auditor.checkpoint, checkpoint)
+        self.assertEqual(auditor.checkpoint.to_bytes(), before_bytes)
+        # The same evidence as canonical bytes still succeeds, and a
+        # second submission is then rejected by the ordinary replay rule.
+        measurement = auditor.audit(record.to_bytes())
+        self.assertEqual(measurement, audit(record, KEY))
+        with self.assertRaises(ValueError):
+            auditor.audit(record.to_bytes())
+
+    def test_noncanonical_bytes_rejected_for_all_three_kinds(self):
+        auditor = EvidenceReplayAuditor(KEY)
+        for record in (self.records[0], self.bounds[0], self.delays[0]):
+            variant = self._whitespace_variant(record)
+            self.assertNotEqual(variant, record.to_bytes())
+            with self.assertRaises(ValueError):
+                auditor.audit(variant)
+        self.assertIsNone(auditor.checkpoint)
+        # Canonical bytes of all three kinds are still accepted and match
+        # the stateless audits.
+        self.assertEqual(
+            auditor.audit(self.records[0].to_bytes()),
+            audit(self.records[0], KEY),
+        )
+        self.assertEqual(
+            auditor.audit(self.bounds[0].to_bytes()),
+            audit_bound(self.bounds[0], KEY),
+        )
+        self.assertEqual(
+            auditor.audit(self.delays[0].to_bytes()),
+            audit_delay_bound(self.delays[0], KEY),
+        )
+        self.assertEqual(auditor.checkpoint.sequence, 3)
+
+    # -- batch entry ------------------------------------------------------
+
+    def test_batch_with_noncanonical_member_rejected_wholesale(self):
+        record = self.records[1]
+        variant = self._escape_variant(record)
+        self._assert_decodes_to_same_valid_evidence(
+            record, (("escape", variant),)
+        )
+        canonical = [r.to_bytes() for r in self.records]
+        for position in (0, 1, 2):
+            auditor = EvidenceReplayAuditor(KEY)
+            batch = list(canonical)
+            batch[position] = variant
+            with self.assertRaises(
+                ValueError,
+                msg=f"non-canonical member at position {position}",
+            ):
+                auditor.audit_batch(batch)
+            # No consumed prefix is left behind: the whole legal batch
+            # still succeeds afterwards, in input order.
+            self.assertIsNone(auditor.checkpoint)
+            self.assertEqual(
+                auditor.audit_batch(canonical),
+                tuple(audit(r, KEY) for r in self.records),
+            )
+            self.assertEqual(auditor.checkpoint.sequence, 3)
+
+    def test_batch_noncanonical_member_after_consumption_keeps_checkpoint(self):
+        auditor = EvidenceReplayAuditor(KEY)
+        auditor.audit(self.records[0])
+        checkpoint = auditor.checkpoint
+        before_bytes = checkpoint.to_bytes()
+        variant = self._whitespace_variant(self.records[1])
+        with self.assertRaises(ValueError):
+            auditor.audit_batch(
+                [self.bounds[0], variant, self.delays[0].to_bytes()]
+            )
+        self.assertIs(auditor.checkpoint, checkpoint)
+        self.assertEqual(auditor.checkpoint.to_bytes(), before_bytes)
+        # Nothing in the rejected batch was consumed.
+        self.assertEqual(
+            auditor.audit_batch(
+                [self.bounds[0].to_bytes(), self.delays[0].to_bytes()]
+            ),
+            (
+                audit_bound(self.bounds[0], KEY),
+                audit_delay_bound(self.delays[0], KEY),
+            ),
+        )
+
+    # -- restored instances ------------------------------------------------
+
+    def test_restored_auditor_enforces_the_same_canonical_boundary(self):
+        auditor = EvidenceReplayAuditor(KEY)
+        auditor.audit(self.records[0].to_bytes())
+        exported = auditor.checkpoint.to_bytes()
+        for checkpoint in (exported, EvidenceReplayState.from_bytes(exported)):
+            restored = EvidenceReplayAuditor(KEY, checkpoint)
+            record = self.records[1]
+            variants = self._evidence_variants(record)
+            for description, variant in variants:
+                with self.assertRaises(
+                    ValueError, msg=f"{description} variant must be rejected"
+                ):
+                    restored.audit(variant)
+            self.assertEqual(restored.checkpoint.to_bytes(), exported)
+            # Canonical bytes succeed, replays of the consumed record fail.
+            self.assertEqual(
+                restored.audit(record.to_bytes()), audit(record, KEY)
+            )
+            with self.assertRaises(ValueError):
+                restored.audit(self.records[0].to_bytes())
+
+
 class EvidenceReplayAuditorBatchTest(unittest.TestCase):
     def setUp(self):
         self.records = make_evidence_records(4)
