@@ -2522,6 +2522,66 @@ class Verifier:
             return entry
         return None
 
+    # Terminal registry states and the error each one raises when a
+    # challenge is used again. The ordinary (plain, context-bound and
+    # delay-bound) verification entry points and revoke share this table so
+    # every protocol enforces the same anti-replay rules.
+    _TERMINAL_STATES: tuple[tuple[str, str], ...] = (
+        (_CONSUMED, "challenge has already been verified"),
+        (_REVOKED, "challenge has been revoked"),
+        (_EXPIRED, "challenge has expired"),
+    )
+
+    def _load_registered_entry(self, challenge: Challenge) -> list:
+        """Resolve a challenge argument to its registry entry.
+
+        The single identity rule for every registered entry point: a
+        challenge is accepted only when replay protection is on and it is the
+        exact pending object this verifier issued. Content-equal copies and
+        challenges issued by other instances fail here.
+        """
+        if not self._replay_protection:
+            raise ChallengeStateError(
+                "challenge is not registered because replay protection is disabled"
+            )
+        entry = self._entry_for(challenge)
+        if entry is None:
+            raise ChallengeStateError("challenge was not issued by this verifier")
+        return entry
+
+    def _check_terminal_state(self, entry: list) -> None:
+        """Reject an entry already in a terminal state.
+
+        Already confirmed terminal states are reported without reading the
+        clock, so a rolled-back clock can never revive one.
+        """
+        for state, message in self._TERMINAL_STATES:
+            if entry[1] == state:
+                raise ChallengeStateError(message)
+
+    def _read_and_check_deadline(self, entry: list, *, revoke_call: bool):
+        """Read the clock once and enforce the challenge deadline.
+
+        This is the single expiry rule shared by every registered entry
+        point: the deadline instant itself counts as expired, and a confirmed
+        expiry is pinned terminally so no later reading (including a clock
+        rolled backwards) can revive the challenge.
+
+        For a revoke with no TTL configured no clock is read at all.
+        Otherwise the reading is returned (possibly ``None``) so the caller
+        reuses this single reading for ranging or the delay measurement.
+        """
+        deadline = entry[2]
+        if deadline is None:
+            if revoke_call:
+                return None
+            return self._clock()
+        now = self._clock()
+        if now >= deadline:
+            entry[1] = _EXPIRED
+            raise ChallengeStateError("challenge has expired")
+        return now
+
     def revoke(self, challenge: Challenge) -> None:
         """Revoke a pending challenge so it can never be verified.
 
@@ -2532,26 +2592,11 @@ class Verifier:
         if not isinstance(challenge, Challenge):
             raise TypeError("challenge must be a Challenge")
         with self._lock:
-            entry = self._entry_for(challenge)
-            if entry is None:
-                if not self._replay_protection:
-                    raise ChallengeStateError(
-                        "challenge is not registered because replay protection is disabled"
-                    )
-                raise ChallengeStateError("challenge was not issued by this verifier")
-            state = entry[1]
-            if state == _CONSUMED:
-                raise ChallengeStateError("challenge has already been verified")
-            if state == _REVOKED:
-                raise ChallengeStateError("challenge has already been revoked")
-            if state == _EXPIRED:
-                raise ChallengeStateError("challenge has expired")
-            if entry[2] is not None and self._clock() >= entry[2]:
-                # Expiry is terminal: record it once so a later clock reading
-                # (even a clock rolled backwards) can never revive the
-                # challenge.
-                entry[1] = _EXPIRED
-                raise ChallengeStateError("challenge has expired")
+            entry = self._load_registered_entry(challenge)
+            self._check_terminal_state(entry)
+            # With no TTL configured revocation never reads the clock; a
+            # pending challenge past its deadline is pinned expired instead.
+            self._read_and_check_deadline(entry, revoke_call=True)
             entry[1] = _REVOKED
             return
 
@@ -2760,23 +2805,12 @@ class Verifier:
         if not isinstance(challenge, Challenge):
             raise TypeError("challenge must be a Challenge")
         with self._lock:
-            entry = self._entry_for(challenge)
-            if entry is None:
-                raise ChallengeStateError("challenge was not issued by this verifier")
-            state = entry[1]
-            if state == _CONSUMED:
-                raise ChallengeStateError("challenge has already been verified")
-            if state == _REVOKED:
-                raise ChallengeStateError("challenge has been revoked")
-            if state == _EXPIRED:
-                raise ChallengeStateError("challenge has expired")
+            entry = self._load_registered_entry(challenge)
+            self._check_terminal_state(entry)
 
             # One clock reading, under the lock, for both the TTL deadline
             # and the delay measurement; pin expiry terminally as elsewhere.
-            end = self._clock()
-            if entry[2] is not None and end >= entry[2]:
-                entry[1] = _EXPIRED
-                raise ChallengeStateError("challenge has expired")
+            end = self._read_and_check_deadline(entry, revoke_call=False)
 
             delay_binding = entry[5]
             if delay_binding is None:
@@ -2903,25 +2937,13 @@ class Verifier:
             )
 
         with self._lock:
-            entry = self._entry_for(challenge)
-            if entry is None:
-                raise ChallengeStateError("challenge was not issued by this verifier")
-            state = entry[1]
-            if state == _CONSUMED:
-                raise ChallengeStateError("challenge has already been verified")
-            if state == _REVOKED:
-                raise ChallengeStateError("challenge has been revoked")
-            if state == _EXPIRED:
-                raise ChallengeStateError("challenge has expired")
+            entry = self._load_registered_entry(challenge)
+            self._check_terminal_state(entry)
 
             # State, expiry and consumption are all decided under the same
             # lock, with the clock read at most once, so a challenge can
             # succeed at most once before its deadline and never at/after it.
-            now = self._clock()
-            if entry[2] is not None and now >= entry[2]:
-                # Terminal: pin the state so nothing can revive the challenge.
-                entry[1] = _EXPIRED
-                raise ChallengeStateError("challenge has expired")
+            now = self._read_and_check_deadline(entry, revoke_call=False)
 
             # All validations run while holding the lock so a failure leaves
             # the challenge pending and the pending -> consumed transition is
