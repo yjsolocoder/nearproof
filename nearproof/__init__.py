@@ -11,7 +11,8 @@ BitSession /
 BitState / BoundAttestedObservation / BoundEvidence /
 BoundEvidenceRevocation / BoundSeriesEvidence /
 CertifiedConsensusEvidence / Challenge /
-ChallengeStateError / CommitRange / CommitRangeAuditor / Consensus /
+ChallengeStateError / CommitRange / CommitRangeAuditor / ConfidenceEvidence /
+Consensus /
 ConsensusPolicy / ContextRevocation / CrlProof / CrlProofAuditor / CrlState /
 DelayBoundEvidence /
 Evidence / EvidenceRevocationList / EvidenceRevocationListAuditor /
@@ -59,7 +60,7 @@ VerifierTrust / WeightedConsensus / assess / attest_observation /
 attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
 audit_b / audit_bound /
 audit_bound_policy / audit_bound_series /
-audit_cert_evidence / audit_cert_evidence_policy / audit_crl / audit_delay_bound /
+audit_cert_evidence / audit_cert_evidence_policy / audit_confidence / audit_crl / audit_delay_bound /
 audit_evidence_revocation_list /
 audit_evidence_revocation_list_bundle /
 audit_evidence_revocation_list_bundle_receipt /
@@ -85,7 +86,7 @@ cert / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / locate_weighted / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
 revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
-seal_bound_series /
+seal_bound_series / seal_confidence /
 seal_evidence_revocation_list_bundle /
 seal_evidence_revocation_list_bundle_receipt_batch /
 seal_map_history /
@@ -144,6 +145,7 @@ __all__ = [
     "ChallengeStateError",
     "CommitRange",
     "CommitRangeAuditor",
+    "ConfidenceEvidence",
     "Consensus",
     "ConsensusPolicy",
     "ContextRevocation",
@@ -242,6 +244,7 @@ __all__ = [
     "audit_cert_evidence",
     "audit_cert_evidence_policy",
     "audit_commit",
+    "audit_confidence",
     "audit_crl",
     "audit_delay_bound",
     "audit_evidence_revocation_list",
@@ -298,6 +301,7 @@ __all__ = [
     "revoke_trust",
     "seal_assess_evidence",
     "seal_bound_series",
+    "seal_confidence",
     "seal_evidence_revocation_list_bundle",
     "seal_evidence_revocation_list_bundle_receipt_batch",
     "seal_map_history",
@@ -373,6 +377,8 @@ _OBSERVATION_REVOCATION_LIST_PREFIX = b"NPORL1"
 _OBSERVATION_REVOCATION_LIST_STATE_PREFIX = b"NPORS1"
 # Domain separation prefix for the assess-evidence MAC.
 _ASSESS_EVIDENCE_PREFIX = b"NPAE1"
+# Domain separation prefix for the confidence-evidence MAC.
+_CONFIDENCE_EVIDENCE_PREFIX = b"NPCE1"
 # Domain separation prefixes for the bound-series evidence: the ordered
 # chain digest and the record MAC respectively.
 _BOUND_SERIES_CHAIN_PREFIX = b"NPBS1"
@@ -21666,6 +21672,530 @@ def audit_assess_evidence(x: object, key: object) -> "RangeDecision":
         raise ValueError(
             "assess evidence accepted does not match the recomputed decision"
         )
+    return decision
+
+
+def _confidence_evidence_content(record: "ConfidenceEvidence") -> list:
+    """The JSON-ready confidence-evidence array without its ``mac``.
+
+    The samples are the lowercase hex strings of their canonical
+    :meth:`Evidence.to_bytes` encodings, in the record's own (canonical,
+    order-independent) order, and the decision is the array of the
+    :class:`NoiseDecision` public fields in declaration order.
+    """
+    decision = record.decision
+    return [
+        record.version,
+        [sample.hex() for sample in record.samples],
+        record.limit,
+        record.min_samples,
+        [
+            decision.sample_count,
+            decision.inlier_count,
+            decision.center,
+            decision.mad,
+            decision.coverage,
+            decision.lower_bound,
+            decision.upper_bound,
+            decision.accepted,
+        ],
+    ]
+
+
+def _confidence_evidence_content_bytes(record: "ConfidenceEvidence") -> bytes:
+    """The canonical compact encoding ``C`` of every field but ``mac``."""
+    return _encode_payload(_confidence_evidence_content(record))
+
+
+def _confidence_evidence_mac(key: bytes, content: bytes) -> bytes:
+    """``HMAC-SHA256(key, b"NPCE1" + C)`` where ``C`` is the canonical
+    compact encoding of every field but ``mac``. The prefix and ``C`` are
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key, _CONFIDENCE_EVIDENCE_PREFIX + content, hashlib.sha256
+    ).digest()
+
+
+def _require_confidence_evidence_sample(value: bytes) -> None:
+    """Enforce the canonical-:class:`Evidence`-bytes contract of a carried
+    confidence-evidence sample.
+
+    ``value`` is already known to be ``bytes``; the record must satisfy the
+    full :class:`Evidence` field contract and its canonical re-encoding must
+    match the input byte for byte. Every violation raises
+    :class:`ValueError`.
+    """
+    try:
+        record = Evidence.from_bytes(value)
+    except ValueError as error:
+        raise ValueError(
+            "confidence evidence samples items must be the canonical"
+            " Evidence encoding"
+        ) from error
+    if record.to_bytes() != value:
+        raise ValueError(
+            "confidence evidence samples items must be the canonical"
+            " Evidence encoding"
+        )
+
+
+def _require_confidence_evidence_decision(decision: "NoiseDecision") -> None:
+    """Enforce the field contract of the carried :class:`NoiseDecision`.
+
+    Every violation raises :class:`ValueError`.
+    """
+    for name in ("sample_count", "inlier_count"):
+        value = getattr(decision, name)
+        if type(value) is not int:
+            raise ValueError(
+                f"confidence evidence decision {name} must be an integer"
+            )
+        if value < 1:
+            raise ValueError(
+                f"confidence evidence decision {name} must be positive"
+            )
+    for name in ("center", "mad", "lower_bound", "upper_bound"):
+        value = getattr(decision, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"confidence evidence decision {name} must be a finite"
+                " non-negative number"
+            )
+        if not math.isfinite(float(value)) or float(value) < 0:
+            raise ValueError(
+                f"confidence evidence decision {name} must be a finite"
+                " non-negative number"
+            )
+    coverage = decision.coverage
+    if isinstance(coverage, bool) or not isinstance(coverage, (int, float)):
+        raise ValueError(
+            "confidence evidence decision coverage must be a finite number"
+            " strictly between 0 and 1"
+        )
+    if not math.isfinite(float(coverage)) or not 0.0 < float(coverage) < 1.0:
+        raise ValueError(
+            "confidence evidence decision coverage must be a finite number"
+            " strictly between 0 and 1"
+        )
+    if not isinstance(decision.accepted, bool):
+        raise ValueError("confidence evidence decision accepted must be a bool")
+
+
+@dataclass(frozen=True)
+class ConfidenceEvidence:
+    """A key-MAC'd, auditable snapshot of one :func:`assess_confidence`
+    decision.
+
+    Freezes the exact sample set one coverage-bracketed robust distance
+    decision was made from together with its threshold and full interval
+    conclusion, so a third party holding the shared key can re-run the whole
+    determination independently with :func:`audit_confidence`.
+
+    The canonical encoding is a compact UTF-8 JSON array in field order::
+
+        [1, S, L, M, D, MAC]
+
+    ``version`` is always ``1``; ``S`` is a tuple of canonical
+    :meth:`Evidence.to_bytes` bytes — only single-round evidence records are
+    carried, never :class:`Measurement` objects, which a third party could
+    not re-verify; ``L`` is the finite non-negative non-bool limit,
+    canonicalized to a float; ``M`` the non-bool positive minimum sample
+    count; ``D`` the full :class:`NoiseDecision` conclusion, encoded as the
+    array of its public fields in declaration order; ``MAC`` is exactly 32
+    bytes — ``HMAC-SHA256(key, b"NPCE1" + C)`` over the canonical compact
+    encoding of the first five fields, the prefix and the body concatenated
+    directly with no separator or length prefix. Instances are frozen,
+    constructed positionally in field order and compare equal by their
+    fields. Every contract violation raises :class:`ValueError`. No key
+    material is stored.
+    """
+
+    version: int
+    samples: tuple
+    limit: float
+    min_samples: int
+    decision: NoiseDecision
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("confidence evidence version must be 1")
+        if not isinstance(self.samples, tuple) or not self.samples:
+            raise ValueError(
+                "confidence evidence samples must be a non-empty tuple"
+            )
+        for sample in self.samples:
+            if not isinstance(sample, bytes):
+                raise ValueError(
+                    "confidence evidence samples items must be bytes"
+                )
+            _require_confidence_evidence_sample(sample)
+        if isinstance(self.limit, bool) or not isinstance(
+            self.limit, (int, float)
+        ):
+            raise ValueError(
+                "confidence evidence limit must be a finite non-negative"
+                " number"
+            )
+        if not math.isfinite(float(self.limit)) or float(self.limit) < 0:
+            raise ValueError(
+                "confidence evidence limit must be a finite non-negative"
+                " number"
+            )
+        # The limit is canonicalized to a float so equal limits always
+        # produce identical encodings.
+        object.__setattr__(self, "limit", float(self.limit))
+        if type(self.min_samples) is not int or self.min_samples < 1:
+            raise ValueError(
+                "confidence evidence min_samples must be a positive integer"
+            )
+        if not isinstance(self.decision, NoiseDecision):
+            raise ValueError(
+                "confidence evidence decision must be a NoiseDecision"
+            )
+        _require_confidence_evidence_decision(self.decision)
+        if not isinstance(self.mac, bytes) or len(self.mac) != 32:
+            raise ValueError(
+                "confidence evidence mac must be exactly 32 bytes"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, S, L, M, D, MAC]`` where ``S`` is the array of the
+        lowercase-hex canonical sample encodings, ``D`` the array of the
+        :class:`NoiseDecision` public fields in declaration order and
+        ``MAC`` the lowercase hex of the MAC, no whitespace, no
+        NaN/Infinity."""
+        return _encode_payload(
+            _confidence_evidence_content(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ConfidenceEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes``;
+        raises :class:`ValueError` for anything that does not satisfy the
+        value contract: an array of exactly ``[version, samples, limit,
+        min_samples, decision, mac]`` in that order, ``version == 1``, a
+        non-empty ``samples`` array of lowercase hex strings each decoding
+        to the canonical :class:`Evidence` encoding, a finite non-bool
+        non-negative ``limit``, a positive non-bool integer
+        ``min_samples``, a ``decision`` array of exactly the
+        :class:`NoiseDecision` public fields in declaration order and a
+        lowercase-hex ``mac`` decoding to exactly 32 bytes. After parsing
+        and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for byte,
+        so formatted JSON, whitespace and any non-canonical spelling are
+        rejected too. The MAC is not verified here — pass the record to
+        :func:`audit_confidence` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("confidence evidence data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"confidence evidence is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 6:
+            raise ValueError(
+                "confidence evidence must be a JSON array of exactly"
+                " version, samples, limit, min_samples, decision and mac"
+            )
+        (
+            raw_version,
+            raw_samples,
+            raw_limit,
+            raw_min_samples,
+            raw_decision,
+            raw_mac,
+        ) = outer
+        if type(raw_version) is not int or raw_version != 1:
+            raise ValueError("confidence evidence version must be 1")
+        if not isinstance(raw_samples, list) or not raw_samples:
+            raise ValueError(
+                "confidence evidence samples must be a non-empty array"
+            )
+        samples = tuple(
+            _parse_confidence_evidence_hex(raw_sample, "samples item")
+            for raw_sample in raw_samples
+        )
+        for sample in samples:
+            _require_confidence_evidence_sample(sample)
+        limit = _parse_confidence_evidence_number(raw_limit, "limit")
+        if limit < 0:
+            raise ValueError(
+                "confidence evidence limit must be a finite non-negative"
+                " number"
+            )
+        if type(raw_min_samples) is not int or raw_min_samples < 1:
+            raise ValueError(
+                "confidence evidence min_samples must be a positive integer"
+            )
+        decision = _parse_confidence_evidence_decision(raw_decision)
+        mac = _parse_confidence_evidence_hex(raw_mac, "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "confidence evidence mac must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            samples=samples,
+            limit=limit,
+            min_samples=raw_min_samples,
+            decision=decision,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError("confidence evidence encoding is not canonical")
+        return record
+
+
+def _parse_confidence_evidence_decision(value: object) -> "NoiseDecision":
+    """Parse the carried decision array of a confidence-evidence encoding.
+
+    The value must be an array of exactly the :class:`NoiseDecision` public
+    fields in declaration order; every violation raises
+    :class:`ValueError`. The field value contract itself is enforced by the
+    :class:`ConfidenceEvidence` constructor.
+    """
+    if not isinstance(value, list) or len(value) != 8:
+        raise ValueError(
+            "confidence evidence decision must be an array of exactly"
+            " sample_count, inlier_count, center, mad, coverage,"
+            " lower_bound, upper_bound and accepted"
+        )
+    (
+        raw_sample_count,
+        raw_inlier_count,
+        raw_center,
+        raw_mad,
+        raw_coverage,
+        raw_lower_bound,
+        raw_upper_bound,
+        raw_accepted,
+    ) = value
+    if not isinstance(raw_accepted, bool):
+        raise ValueError(
+            "confidence evidence decision accepted must be a bool"
+        )
+    return NoiseDecision(
+        sample_count=_parse_int_field(raw_sample_count, "sample_count"),
+        inlier_count=_parse_int_field(raw_inlier_count, "inlier_count"),
+        center=_parse_confidence_evidence_number(raw_center, "decision center"),
+        mad=_parse_confidence_evidence_number(raw_mad, "decision mad"),
+        coverage=_parse_confidence_evidence_number(
+            raw_coverage, "decision coverage"
+        ),
+        lower_bound=_parse_confidence_evidence_number(
+            raw_lower_bound, "decision lower_bound"
+        ),
+        upper_bound=_parse_confidence_evidence_number(
+            raw_upper_bound, "decision upper_bound"
+        ),
+        accepted=raw_accepted,
+    )
+
+
+def _parse_confidence_evidence_hex(value: object, name: str) -> bytes:
+    """Lowercase round-tripping hex for confidence-evidence byte fields.
+
+    Every violation raises :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"confidence evidence {name} must be a lowercase hex string"
+        )
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"confidence evidence {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        raise ValueError(
+            f"confidence evidence {name} must be a lowercase hex string"
+        )
+    return raw
+
+
+def _parse_confidence_evidence_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"confidence evidence {name} must be a finite number"
+        )
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(
+            f"confidence evidence {name} must be a finite number"
+        )
+    return number
+
+
+def _coerce_confidence_evidence(
+    x: object, name: str
+) -> "ConfidenceEvidence":
+    """Coerce a :class:`ConfidenceEvidence` or its canonical bytes,
+    splitting the TypeError/ValueError contract exactly as the public
+    auditors do: the wrong kind of argument raises :class:`TypeError`, a
+    field-contract failure surfacing while parsing byte content of the
+    right kind is a value error."""
+    if isinstance(x, ConfidenceEvidence):
+        return x
+    if isinstance(x, bytes):
+        return ConfidenceEvidence.from_bytes(x)
+    raise TypeError(
+        f"{name} must be a ConfidenceEvidence instance or its canonical"
+        " bytes"
+    )
+
+
+def seal_confidence(
+    samples: object,
+    limit: object,
+    key: object,
+    *,
+    min_samples: object = 5,
+    coverage: object = 0.95,
+) -> "ConfidenceEvidence":
+    """Run :func:`assess_confidence` over evidence samples and freeze the
+    decision.
+
+    ``samples`` must be an iterable whose items are each an
+    :class:`Evidence` instance or its canonical :meth:`Evidence.to_bytes`
+    encoding — the two forms may be mixed freely, but :class:`Measurement`
+    objects are not accepted, since they carry nothing a third party could
+    re-verify; a non-iterable ``samples`` or an element of any other type
+    raises :class:`TypeError`. ``key`` must be non-empty ``bytes`` — a
+    non-``bytes`` value raises :class:`TypeError`, an empty value
+    :class:`ValueError`. ``limit`` and the keyword-only ``min_samples``
+    (default ``5``) and ``coverage`` (default ``0.95``) follow the
+    :func:`assess_confidence` contract exactly: bools, non-numbers,
+    non-finite or negative limits, non-positive or non-integer minimum
+    sample counts and coverages not strictly between ``0`` and ``1`` raise
+    :class:`ValueError`.
+
+    Every sample is audited with :func:`audit` first and the
+    coverage-bracketed robust decision is then computed with exactly the
+    :func:`assess_confidence` semantics, so a bad MAC, a malformed or
+    non-canonical sample encoding, a duplicate ``(round_index, nonce)``
+    pair, too few samples or too few inliers raises :class:`ValueError` and
+    no evidence is produced. Accepted and rejected decisions are sealed
+    alike: whenever the decision is computed it is frozen into a
+    :class:`ConfidenceEvidence`, the carried sample encodings are sorted
+    into one canonical order (neither the input order nor the object/bytes
+    spelling of a sample affects the artifact bytes) and MAC'd as
+    ``HMAC-SHA256(key, b"NPCE1" + C)`` over the compact encoding of every
+    field but ``mac``. Sealing is pure computation: it reads no clock and
+    touches no challenge registry, consumption state or verifier.
+    """
+    try:
+        items = list(samples)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "samples must be an iterable of Evidence instances or their"
+            " canonical bytes"
+        ) from error
+    for item in items:
+        if not isinstance(item, (Evidence, bytes)):
+            raise TypeError(
+                "samples items must be Evidence instances or their canonical"
+                " bytes"
+            )
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    bound, minimum = _check_assess_params(limit, min_samples)
+    level = _check_coverage(coverage)
+    sample_blobs = [_coerce_assess_evidence_sample(item) for item in items]
+    # Every evidence is verified exactly as a standalone audit() call would:
+    # MAC, response HMAC, elapsed and halved distance recomputation.
+    measurements = [audit(blob, key) for blob in sample_blobs]
+    decision = _assess_confidence_measurements(
+        measurements, bound, minimum, level
+    )
+    # One canonical sample order makes the artifact independent of the input
+    # order and of the object/bytes spelling of each sample; the decision
+    # itself is order-independent already.
+    ordered = tuple(sorted(sample_blobs))
+    record = ConfidenceEvidence(
+        version=1,
+        samples=ordered,
+        limit=bound,
+        min_samples=minimum,
+        decision=decision,
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record,
+        mac=_confidence_evidence_mac(
+            key, _confidence_evidence_content_bytes(record)
+        ),
+    )
+
+
+def audit_confidence(x: object, key: object) -> "NoiseDecision":
+    """Independently re-verify a :class:`ConfidenceEvidence` against
+    ``key``.
+
+    ``x`` must be a :class:`ConfidenceEvidence` or its canonical
+    :meth:`ConfidenceEvidence.to_bytes` encoding — anything else raises
+    :class:`TypeError`; ``key`` must be non-empty ``bytes`` — a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`.
+
+    The outer MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPCE1" + C)`` and compared in constant time; then
+    every carried sample is re-verified with :func:`audit` — its MAC and
+    response HMAC checked and its elapsed time and halved distance
+    recomputed — and the whole coverage-bracketed robust determination is
+    rerun with exactly the :func:`assess_confidence` semantics against the
+    carried ``limit``, ``min_samples`` and decision ``coverage``. Every
+    recomputed :class:`NoiseDecision` field must equal the recorded one, or
+    :class:`ValueError` is raised — even when the record was re-signed
+    under the right key, statistical fields that do not match the carried
+    samples are rejected. A bad outer or sample signature, non-canonical
+    encoding, tampered sample, threshold or conclusion, a duplicate sample,
+    too few samples or too few inliers all raise :class:`ValueError`; no
+    partial result is returned. Auditing is pure computation: it reads no
+    clock, touches no challenge registry, consumption state or verifier and
+    persists nothing, and is no substitute for verification-time replay
+    protection or challenge expiry.
+    """
+    record = _coerce_confidence_evidence(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _confidence_evidence_mac(
+            key, _confidence_evidence_content_bytes(record)
+        ),
+        record.mac,
+    ):
+        raise ValueError("confidence evidence mac does not match the key")
+    measurements = [audit(sample, key) for sample in record.samples]
+    bound, minimum = _check_assess_params(record.limit, record.min_samples)
+    level = _check_coverage(record.decision.coverage)
+    decision = _assess_confidence_measurements(
+        measurements, bound, minimum, level
+    )
+    for name in (
+        "sample_count",
+        "inlier_count",
+        "center",
+        "mad",
+        "coverage",
+        "lower_bound",
+        "upper_bound",
+        "accepted",
+    ):
+        if getattr(decision, name) != getattr(record.decision, name):
+            raise ValueError(
+                f"confidence evidence decision {name} does not match the"
+                " recomputed decision"
+            )
     return decision
 
 
