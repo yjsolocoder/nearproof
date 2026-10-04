@@ -290,6 +290,7 @@ __all__ = [
     "locate_region",
     "locate_weighted",
     "locate_weighted_cert_evidence",
+    "locate_weighted_region",
     "make_crl",
     "make_evidence_revocation_list",
     "make_observation_crl",
@@ -27084,6 +27085,174 @@ def locate_region(
         feasible=True,
         bounds=(min_x, min_y, max_x, max_y),
         witness=(wx, wy),
+    )
+
+
+def locate_weighted_region(
+    observations: object,
+    policy: object,
+    *,
+    tolerance: object = 0.0,
+) -> "RegionDecision":
+    """Infer the 2D region where the weighted disk support reaches the threshold.
+
+    Like :func:`locate_weighted`, each :class:`Observation` contributes the
+    closed disk centered at ``(x, y)`` with radius
+    ``decision.upper_bound + tolerance`` (boundary points count as covered
+    and the decision's ``accepted`` flag is ignored), and each observation
+    carries the positive integer weight that ``policy`` declares for its
+    id. The feasible region is the set of points where the summed weight of
+    the covering disks reaches ``policy.threshold`` — no candidate point is
+    required. The region may be disconnected, so ``bounds`` is only the
+    smallest axis-aligned box ``(min_x, min_y, max_x, max_y)`` covering the
+    whole region, not a set of feasible points, and ``witness`` is the
+    feasible point with the smallest ``x`` (ties broken toward the smallest
+    ``y``), never an untested box center. When no point reaches the
+    threshold, ``feasible`` is ``False`` and both ``bounds`` and
+    ``witness`` are ``None``. When the threshold equals the total weight,
+    the region is exactly the intersection of all disks, matching
+    :func:`locate_region` semantics.
+
+    ``observations`` must be an iterable (a one-shot iterator is fine) of
+    :class:`Observation` with unique non-empty string ids, finite non-bool
+    ``x``/``y`` coordinates and a :class:`RangeDecision` whose
+    ``upper_bound`` is finite and non-negative; ``policy`` must be a
+    :class:`ConsensusPolicy` whose weight ids match the observation ids
+    exactly; ``tolerance`` must be a finite non-bool non-negative number.
+    Unlike :func:`locate` there is no minimum observation count — the
+    policy weights bound the set. Every contract violation raises
+    :class:`ValueError`.
+
+    The result is independent of input order (of both the observations and
+    the weight mapping), the function does not mutate its inputs, and every
+    reported coordinate is a finite float. If the true bounds exceed the
+    finite float range a :class:`ValueError` is raised instead of reporting
+    an overflowed or spuriously empty region.
+    """
+    slack = _slack_from_tolerance(tolerance)
+
+    if not isinstance(policy, ConsensusPolicy):
+        raise ValueError("policy must be a ConsensusPolicy")
+
+    raw_observations = _materialize_observations(observations)
+
+    ids: list[str] = []
+    disks: list[tuple[float, float, float]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        ids.append(ident)
+        disks.append((ox, oy, bound))
+
+    weights = policy.weights
+    if set(ids) != set(weights):
+        raise ValueError("policy weight ids must match the observation ids")
+
+    # The geometry is computed on a power-of-two-scaled copy of the disks
+    # so no intermediate (radius sums, squared distances, circle-meeting
+    # formulas) can overflow or underflow for huge or tiny finite inputs.
+    # Scaling by a power of two is exact, and scaling the resulting
+    # extremes back up either reproduces the true value or provably
+    # overflows — reported as a ValueError, never as an empty region.
+    raw_scale = slack
+    for ox, oy, bound in disks:
+        raw_scale = max(raw_scale, abs(ox), abs(oy), bound)
+    shift = 0
+    if raw_scale > 0.0:
+        exponent = math.frexp(raw_scale)[1]
+        if exponent > 500:
+            shift = exponent - 500
+        elif exponent < -500:
+            shift = exponent + 500
+
+    scaled = [
+        (
+            math.ldexp(ox, -shift),
+            math.ldexp(oy, -shift),
+            math.ldexp(bound, -shift) + math.ldexp(slack, -shift),
+        )
+        for ox, oy, bound in disks
+    ]
+    disk_weights = [weights[ident] for ident in ids]
+
+    scale = 0.0
+    for cx, cy, radius in scaled:
+        scale = max(scale, abs(cx) + abs(cy) + radius)
+    eps = 1e-12 * scale
+
+    # The feasible region is a union of cells of the arrangement of the
+    # disks' boundary circles, so each of its axis-aligned extremes (and
+    # the lowest point of its leftmost slice) is attained either at a
+    # disk's own axis-extreme point whose covering weight reaches the
+    # threshold or at a point where two boundary circles meet; collecting
+    # both kinds of candidates suffices, and the region is non-empty
+    # exactly when at least one candidate reaches the threshold. Sorting
+    # each circle pair keeps the computed meeting points independent of
+    # input order.
+    candidates: list[tuple[float, float]] = []
+    for cx, cy, radius in scaled:
+        candidates.append((cx - radius, cy))
+        candidates.append((cx + radius, cy))
+        candidates.append((cx, cy - radius))
+        candidates.append((cx, cy + radius))
+    for first in range(len(scaled)):
+        for second in range(first + 1, len(scaled)):
+            pair = sorted((scaled[first], scaled[second]))
+            candidates.extend(
+                _circle_boundary_intersections(pair[0], pair[1], eps)
+            )
+
+    threshold = policy.threshold
+
+    def support_weight(px: float, py: float) -> int:
+        return sum(
+            weight
+            for (cx, cy, radius), weight in zip(scaled, disk_weights)
+            if math.hypot(px - cx, py - cy) <= radius + eps
+        )
+
+    feasible_points = [
+        point for point in candidates if support_weight(*point) >= threshold
+    ]
+    if not feasible_points:
+        return RegionDecision(feasible=False, bounds=None, witness=None)
+
+    min_x = min(px for px, _py in feasible_points)
+    max_x = max(px for px, _py in feasible_points)
+    min_y = min(py for _px, py in feasible_points)
+    max_y = max(py for _px, py in feasible_points)
+    wx, wy = min(
+        (point for point in feasible_points if point[0] <= min_x + eps),
+        key=lambda point: (point[1], point[0]),
+    )
+
+    factor = 2.0 ** shift
+
+    def unscale(value: float) -> float:
+        result = value * factor
+        if not math.isfinite(result):
+            raise ValueError("region bounds exceed the finite float range")
+        return result
+
+    return RegionDecision(
+        feasible=True,
+        bounds=(unscale(min_x), unscale(min_y), unscale(max_x), unscale(max_y)),
+        witness=(unscale(wx), unscale(wy)),
     )
 
 
