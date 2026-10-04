@@ -27909,6 +27909,234 @@ def attest_observation_for_point(
     )
 
 
+def _attested_key_map(keys: object) -> dict[str, bytes]:
+    """Validate the ``keys`` contract shared by the attested locate entries.
+
+    Returns a fresh ``{id: key}`` dict of plain ``bytes``; any contract
+    violation raises :class:`ValueError`. The caller's mapping is neither
+    mutated nor aliased.
+    """
+    if not isinstance(keys, Mapping) or not keys:
+        raise ValueError("keys must be a non-empty mapping of observation id to key")
+    key_map: dict[str, bytes] = {}
+    for ident, key in keys.items():
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("keys must map non-empty string ids to non-empty keys")
+        if not isinstance(key, (bytes, bytearray)) or not key:
+            raise ValueError("keys must map non-empty string ids to non-empty keys")
+        key_map[ident] = bytes(key)
+    return key_map
+
+
+def _attested_age_limit(max_age: object) -> tuple[bool, float]:
+    """Validate ``max_age``: returns ``(check_age, age_limit)``.
+
+    ``max_age=None`` disables the freshness check; otherwise it must be a
+    finite non-bool non-negative number and the allowed age interval is
+    closed.
+    """
+    check_age = max_age is not None
+    age_limit = 0.0
+    if check_age:
+        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+            raise ValueError("max_age must be a finite non-negative number")
+        age_limit = float(max_age)
+        if not math.isfinite(age_limit) or age_limit < 0:
+            raise ValueError("max_age must be a finite non-negative number")
+    return check_age, age_limit
+
+
+def _attested_snapshot_root(revocation_list: object, root: object) -> object:
+    """Validate ``root`` when a snapshot is given; pass it through otherwise."""
+    if revocation_list is not None:
+        # A snapshot is authenticated under the root key and an explicit
+        # caller-supplied now; the clock is never read for it.
+        root = _require_root(root)
+    return root
+
+
+def _attested_now(
+    check_age: bool,
+    revocations: object,
+    revocation_list: object,
+    now: object,
+) -> float:
+    """Resolve the current time for the attested locate entries.
+
+    The clock is read at most once per call, and only when a freshness or
+    revocation check actually needs the current time; a snapshot always
+    requires an explicit finite non-bool ``now``.
+    """
+    current = 0.0
+    if check_age or revocations is not None or revocation_list is not None:
+        if now is None:
+            if revocation_list is not None:
+                raise ValueError(
+                    "now must be given explicitly when revocation_list is"
+                    " provided"
+                )
+            current = time.time()
+        elif isinstance(now, bool) or not isinstance(now, (int, float)):
+            raise ValueError("now must be a finite number")
+        else:
+            current = float(now)
+            if not math.isfinite(current):
+                raise ValueError("now must be a finite number")
+    return current
+
+
+def _attested_revoked_at_by_id(
+    revocations: object,
+    revocation_list: object,
+    root: object,
+    key_map: dict[str, bytes],
+    current: float,
+    minimum: object,
+) -> dict[str, float]:
+    """Merge per-call revocations and the signed snapshot into id -> revoked_at.
+
+    Every revocation is authenticated and time-checked, whether or not it
+    names an observed id. Both sources may name the same id; the observation
+    must then postdate each matching revocation, which is the latest
+    ``revoked_at`` of the two.
+    """
+    revoked_at_by_id: dict[str, float] = {}
+    if revocations is not None:
+        try:
+            raw_revocations = list(revocations)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise ValueError(
+                "revocations must be an iterable of ObservationRevocation or bytes"
+            ) from error
+        for entry in raw_revocations:
+            if isinstance(entry, bytes):
+                entry = ObservationRevocation.from_bytes(entry)
+            if not isinstance(entry, ObservationRevocation):
+                raise ValueError(
+                    "revocations must contain only ObservationRevocation"
+                    " instances or bytes"
+                )
+            ident = entry.id
+            if ident in revoked_at_by_id:
+                raise ValueError(f"duplicate revocation id: {ident!r}")
+            key = key_map.get(ident)
+            if key is None:
+                raise ValueError(f"unknown revocation id: {ident!r}")
+            if not hmac.compare_digest(
+                _revocation_mac(key, _revocation_payload(entry)), entry.mac
+            ):
+                raise ValueError(
+                    f"observation revocation mac does not match: {ident!r}"
+                )
+            revoked_at = float(entry.revoked_at)
+            if revoked_at > current:
+                raise ValueError(
+                    f"observation revocation is dated in the future: {ident!r}"
+                )
+            revoked_at_by_id[ident] = revoked_at
+
+    if revocation_list is not None:
+        # Signed global snapshot: authenticated as a whole (both MAC layers,
+        # issued_at, sequence and future-dated entries) under
+        # root/keys/now/min.
+        audit_observation_crl(revocation_list, root, key_map, now=current, min=minimum)
+        snapshot = (
+            ObservationRevocationList.from_bytes(revocation_list)
+            if isinstance(revocation_list, bytes)
+            else revocation_list
+        )
+        for entry in snapshot.entries:
+            revoked_at = float(entry.revoked_at)
+            previous = revoked_at_by_id.get(entry.id)
+            if previous is None or revoked_at > previous:
+                revoked_at_by_id[entry.id] = revoked_at
+    return revoked_at_by_id
+
+
+def _verify_attested_records(
+    observations: object,
+    record_type: type,
+    mac: object,
+    payload: object,
+    key_map: dict[str, bytes],
+    revoked_at_by_id: dict[str, float],
+    check_age: bool,
+    age_limit: float,
+    current: float,
+    binding: "tuple[float, float, str] | None" = None,
+) -> list[Observation]:
+    """Verify MAC'd observation records into plain :class:`Observation` items.
+
+    Shared by :func:`locate_attested` and :func:`locate_bound_attested`:
+    each item must be a ``record_type`` instance or its canonical bytes, its
+    id must be unique and known to ``key_map``, and its MAC must verify.
+    When ``binding`` is ``(px, py, context)`` the record must additionally
+    match the queried point and context after its MAC verifies. Revocation
+    and freshness rules are identical for both entries.
+    """
+    type_name = record_type.__name__
+    kind = (
+        "bound attested observation"
+        if record_type is BoundAttestedObservation
+        else "attested observation"
+    )
+    try:
+        raw_observations = list(observations)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError(
+            f"observations must be an iterable of {type_name} or bytes"
+        ) from error
+
+    verified: list[Observation] = []
+    seen_ids: set[str] = set()
+    for item in raw_observations:
+        if isinstance(item, bytes):
+            item = record_type.from_bytes(item)
+        if not isinstance(item, record_type):
+            raise ValueError(
+                f"observations must contain only {type_name} instances or bytes"
+            )
+        ident = item.id
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        key = key_map.get(ident)
+        if key is None:
+            raise ValueError(f"unknown observation id: {ident!r}")
+        if not hmac.compare_digest(mac(key, payload(item)), item.mac):
+            raise ValueError(f"{kind} mac does not match: {ident!r}")
+        if binding is not None:
+            # Only after the MAC verifies do the point/context bindings
+            # count: the signed record must match the query coordinate by
+            # coordinate and carry exactly the queried use context, or it is
+            # a contract breach.
+            px, py, context = binding
+            if (
+                item.point[0] != px
+                or item.point[1] != py
+                or item.context != context
+            ):
+                raise ValueError(
+                    "bound attested observation is not bound to the queried"
+                    f" point and context: {ident!r}"
+                )
+        revoked_at = revoked_at_by_id.get(ident)
+        if revoked_at is not None and float(item.issued_at) <= revoked_at:
+            raise ValueError(
+                f"attested observation not issued after its revocation: {ident!r}"
+            )
+        if check_age:
+            age = current - float(item.issued_at)
+            if not 0.0 <= age <= age_limit:
+                raise ValueError(
+                    f"attested observation outside the allowed age: {ident!r}"
+                )
+        verified.append(
+            Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
+        )
+    return verified
+
+
 def locate_attested(
     observations: object,
     point: object,
@@ -27980,141 +28208,24 @@ def locate_attested(
     returned. The function is pure: it reads no verifier state and, aside
     from the default ``now`` clock reading, has no side effects.
     """
-    if not isinstance(keys, Mapping) or not keys:
-        raise ValueError("keys must be a non-empty mapping of observation id to key")
-    key_map: dict[str, bytes] = {}
-    for ident, key in keys.items():
-        if not isinstance(ident, str) or not ident:
-            raise ValueError("keys must map non-empty string ids to non-empty keys")
-        if not isinstance(key, (bytes, bytearray)) or not key:
-            raise ValueError("keys must map non-empty string ids to non-empty keys")
-        key_map[ident] = bytes(key)
-
-    check_age = max_age is not None
-    age_limit = 0.0
-    if check_age:
-        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
-            raise ValueError("max_age must be a finite non-negative number")
-        age_limit = float(max_age)
-        if not math.isfinite(age_limit) or age_limit < 0:
-            raise ValueError("max_age must be a finite non-negative number")
-    if revocation_list is not None:
-        # A snapshot is authenticated under the root key and an explicit
-        # caller-supplied now; the clock is never read for it.
-        root = _require_root(root)
-    current = 0.0
-    if check_age or revocations is not None or revocation_list is not None:
-        # The clock is read at most once per call, and only when a freshness
-        # or revocation check actually needs the current time.
-        if now is None:
-            if revocation_list is not None:
-                raise ValueError(
-                    "now must be given explicitly when revocation_list is"
-                    " provided"
-                )
-            current = time.time()
-        elif isinstance(now, bool) or not isinstance(now, (int, float)):
-            raise ValueError("now must be a finite number")
-        else:
-            current = float(now)
-            if not math.isfinite(current):
-                raise ValueError("now must be a finite number")
-
-    revoked_at_by_id: dict[str, float] = {}
-    if revocations is not None:
-        try:
-            raw_revocations = list(revocations)  # type: ignore[arg-type]
-        except TypeError as error:
-            raise ValueError(
-                "revocations must be an iterable of ObservationRevocation or bytes"
-            ) from error
-        for entry in raw_revocations:
-            if isinstance(entry, bytes):
-                entry = ObservationRevocation.from_bytes(entry)
-            if not isinstance(entry, ObservationRevocation):
-                raise ValueError(
-                    "revocations must contain only ObservationRevocation"
-                    " instances or bytes"
-                )
-            ident = entry.id
-            if ident in revoked_at_by_id:
-                raise ValueError(f"duplicate revocation id: {ident!r}")
-            key = key_map.get(ident)
-            if key is None:
-                raise ValueError(f"unknown revocation id: {ident!r}")
-            if not hmac.compare_digest(
-                _revocation_mac(key, _revocation_payload(entry)), entry.mac
-            ):
-                raise ValueError(
-                    f"observation revocation mac does not match: {ident!r}"
-                )
-            revoked_at = float(entry.revoked_at)
-            if revoked_at > current:
-                raise ValueError(
-                    f"observation revocation is dated in the future: {ident!r}"
-                )
-            revoked_at_by_id[ident] = revoked_at
-
-    if revocation_list is not None:
-        # Signed global snapshot: authenticated as a whole (both MAC layers,
-        # issued_at, sequence and future-dated entries) under
-        # root/keys/now/min. Both sources may name the same id; the
-        # observation must then postdate each matching revocation, which is
-        # the latest revoked_at of the two.
-        audit_observation_crl(revocation_list, root, key_map, now=current, min=min)
-        snapshot = (
-            ObservationRevocationList.from_bytes(revocation_list)
-            if isinstance(revocation_list, bytes)
-            else revocation_list
-        )
-        for entry in snapshot.entries:
-            revoked_at = float(entry.revoked_at)
-            previous = revoked_at_by_id.get(entry.id)
-            if previous is None or revoked_at > previous:
-                revoked_at_by_id[entry.id] = revoked_at
-
-    try:
-        raw_observations = list(observations)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "observations must be an iterable of AttestedObservation or bytes"
-        ) from error
-
-    verified: list[Observation] = []
-    seen_ids: set[str] = set()
-    for item in raw_observations:
-        if isinstance(item, bytes):
-            item = AttestedObservation.from_bytes(item)
-        if not isinstance(item, AttestedObservation):
-            raise ValueError(
-                "observations must contain only AttestedObservation instances or bytes"
-            )
-        ident = item.id
-        if ident in seen_ids:
-            raise ValueError(f"duplicate observation id: {ident!r}")
-        seen_ids.add(ident)
-        key = key_map.get(ident)
-        if key is None:
-            raise ValueError(f"unknown observation id: {ident!r}")
-        if not hmac.compare_digest(
-            _attested_mac(key, _attested_payload(item)), item.mac
-        ):
-            raise ValueError(f"attested observation mac does not match: {ident!r}")
-        revoked_at = revoked_at_by_id.get(ident)
-        if revoked_at is not None and float(item.issued_at) <= revoked_at:
-            raise ValueError(
-                f"attested observation not issued after its revocation: {ident!r}"
-            )
-        if check_age:
-            age = current - float(item.issued_at)
-            if not 0.0 <= age <= age_limit:
-                raise ValueError(
-                    f"attested observation outside the allowed age: {ident!r}"
-                )
-        verified.append(
-            Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
-        )
-
+    key_map = _attested_key_map(keys)
+    check_age, age_limit = _attested_age_limit(max_age)
+    root = _attested_snapshot_root(revocation_list, root)
+    current = _attested_now(check_age, revocations, revocation_list, now)
+    revoked_at_by_id = _attested_revoked_at_by_id(
+        revocations, revocation_list, root, key_map, current, min
+    )
+    verified = _verify_attested_records(
+        observations,
+        AttestedObservation,
+        _attested_mac,
+        _attested_payload,
+        key_map,
+        revoked_at_by_id,
+        check_age,
+        age_limit,
+        current,
+    )
     return locate(verified, point, quorum=quorum, tolerance=tolerance)
 
 
@@ -28162,45 +28273,10 @@ def locate_bound_attested(
     calling-shape errors (missing or unexpected arguments, keyword-only
     options passed positionally) raise :class:`TypeError` as usual.
     """
-    if not isinstance(keys, Mapping) or not keys:
-        raise ValueError("keys must be a non-empty mapping of observation id to key")
-    key_map: dict[str, bytes] = {}
-    for ident, key in keys.items():
-        if not isinstance(ident, str) or not ident:
-            raise ValueError("keys must map non-empty string ids to non-empty keys")
-        if not isinstance(key, (bytes, bytearray)) or not key:
-            raise ValueError("keys must map non-empty string ids to non-empty keys")
-        key_map[ident] = bytes(key)
-
-    check_age = max_age is not None
-    age_limit = 0.0
-    if check_age:
-        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
-            raise ValueError("max_age must be a finite non-negative number")
-        age_limit = float(max_age)
-        if not math.isfinite(age_limit) or age_limit < 0:
-            raise ValueError("max_age must be a finite non-negative number")
-    if revocation_list is not None:
-        # A snapshot is authenticated under the root key and an explicit
-        # caller-supplied now; the clock is never read for it.
-        root = _require_root(root)
-    current = 0.0
-    if check_age or revocations is not None or revocation_list is not None:
-        # The clock is read at most once per call, and only when a freshness
-        # or revocation check actually needs the current time.
-        if now is None:
-            if revocation_list is not None:
-                raise ValueError(
-                    "now must be given explicitly when revocation_list is"
-                    " provided"
-                )
-            current = time.time()
-        elif isinstance(now, bool) or not isinstance(now, (int, float)):
-            raise ValueError("now must be a finite number")
-        else:
-            current = float(now)
-            if not math.isfinite(current):
-                raise ValueError("now must be a finite number")
+    key_map = _attested_key_map(keys)
+    check_age, age_limit = _attested_age_limit(max_age)
+    root = _attested_snapshot_root(revocation_list, root)
+    current = _attested_now(check_age, revocations, revocation_list, now)
 
     # The query binding is needed while examining every record, so enforce
     # the point/context contract up front under the same rules as locate().
@@ -28211,112 +28287,21 @@ def locate_bound_attested(
     if not isinstance(context, str) or not context:
         raise ValueError("context must be a non-empty string")
 
-    revoked_at_by_id: dict[str, float] = {}
-    if revocations is not None:
-        try:
-            raw_revocations = list(revocations)  # type: ignore[arg-type]
-        except TypeError as error:
-            raise ValueError(
-                "revocations must be an iterable of ObservationRevocation or bytes"
-            ) from error
-        for entry in raw_revocations:
-            if isinstance(entry, bytes):
-                entry = ObservationRevocation.from_bytes(entry)
-            if not isinstance(entry, ObservationRevocation):
-                raise ValueError(
-                    "revocations must contain only ObservationRevocation"
-                    " instances or bytes"
-                )
-            ident = entry.id
-            if ident in revoked_at_by_id:
-                raise ValueError(f"duplicate revocation id: {ident!r}")
-            key = key_map.get(ident)
-            if key is None:
-                raise ValueError(f"unknown revocation id: {ident!r}")
-            if not hmac.compare_digest(
-                _revocation_mac(key, _revocation_payload(entry)), entry.mac
-            ):
-                raise ValueError(
-                    f"observation revocation mac does not match: {ident!r}"
-                )
-            revoked_at = float(entry.revoked_at)
-            if revoked_at > current:
-                raise ValueError(
-                    f"observation revocation is dated in the future: {ident!r}"
-                )
-            revoked_at_by_id[ident] = revoked_at
-
-    if revocation_list is not None:
-        # Signed global snapshot: authenticated as a whole (both MAC layers,
-        # issued_at, sequence and future-dated entries) under
-        # root/keys/now/min. Both sources may name the same id; the
-        # observation must then postdate each matching revocation, which is
-        # the latest revoked_at of the two.
-        audit_observation_crl(revocation_list, root, key_map, now=current, min=min)
-        snapshot = (
-            ObservationRevocationList.from_bytes(revocation_list)
-            if isinstance(revocation_list, bytes)
-            else revocation_list
-        )
-        for entry in snapshot.entries:
-            revoked_at = float(entry.revoked_at)
-            previous = revoked_at_by_id.get(entry.id)
-            if previous is None or revoked_at > previous:
-                revoked_at_by_id[entry.id] = revoked_at
-
-    try:
-        raw_observations = list(observations)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError(
-            "observations must be an iterable of BoundAttestedObservation or bytes"
-        ) from error
-
-    verified: list[Observation] = []
-    seen_ids: set[str] = set()
-    for item in raw_observations:
-        if isinstance(item, bytes):
-            item = BoundAttestedObservation.from_bytes(item)
-        if not isinstance(item, BoundAttestedObservation):
-            raise ValueError(
-                "observations must contain only BoundAttestedObservation"
-                " instances or bytes"
-            )
-        ident = item.id
-        if ident in seen_ids:
-            raise ValueError(f"duplicate observation id: {ident!r}")
-        seen_ids.add(ident)
-        key = key_map.get(ident)
-        if key is None:
-            raise ValueError(f"unknown observation id: {ident!r}")
-        if not hmac.compare_digest(
-            _bound_attested_mac(key, _bound_attested_payload(item)), item.mac
-        ):
-            raise ValueError(
-                f"bound attested observation mac does not match: {ident!r}"
-            )
-        # Only after the MAC verifies do the point/context bindings count:
-        # the signed record must match the query coordinate by coordinate and
-        # carry exactly the queried use context, or it is a contract breach.
-        if item.point[0] != px or item.point[1] != py or item.context != context:
-            raise ValueError(
-                "bound attested observation is not bound to the queried"
-                f" point and context: {ident!r}"
-            )
-        revoked_at = revoked_at_by_id.get(ident)
-        if revoked_at is not None and float(item.issued_at) <= revoked_at:
-            raise ValueError(
-                f"attested observation not issued after its revocation: {ident!r}"
-            )
-        if check_age:
-            age = current - float(item.issued_at)
-            if not 0.0 <= age <= age_limit:
-                raise ValueError(
-                    f"attested observation outside the allowed age: {ident!r}"
-                )
-        verified.append(
-            Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
-        )
-
+    revoked_at_by_id = _attested_revoked_at_by_id(
+        revocations, revocation_list, root, key_map, current, min
+    )
+    verified = _verify_attested_records(
+        observations,
+        BoundAttestedObservation,
+        _bound_attested_mac,
+        _bound_attested_payload,
+        key_map,
+        revoked_at_by_id,
+        check_age,
+        age_limit,
+        current,
+        binding=(px, py, context),
+    )
     return locate(verified, point, quorum=quorum, tolerance=tolerance)
 
 
