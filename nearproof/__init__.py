@@ -31608,6 +31608,113 @@ class CrlState:
         return record
 
 
+def _restore_crl_checkpoint(root: bytes, checkpoint: object) -> "Optional[CrlState]":
+    """Restore a MAC-verified :class:`CrlState` checkpoint shared by both CRL
+    proof auditors.
+
+    ``None`` is the empty frontier. Otherwise ``checkpoint`` must be a
+    :class:`CrlState` or its canonical :meth:`CrlState.to_bytes` encoding;
+    its MAC is recomputed with ``root`` and compared in constant time.
+    Anything else — a non-state object, a malformed or non-canonical
+    encoding, or a MAC that does not match the root — raises
+    :class:`ValueError`.
+    """
+    if checkpoint is None:
+        return None
+    if isinstance(checkpoint, CrlState):
+        state = checkpoint
+    elif isinstance(checkpoint, bytes):
+        state = CrlState.from_bytes(checkpoint)
+    else:
+        raise ValueError(
+            "checkpoint must be a CrlState instance, its canonical bytes, or"
+            " None"
+        )
+    if not hmac.compare_digest(
+        _crl_state_mac(root, _crl_state_payload(state)), state.mac
+    ):
+        raise ValueError("checkpoint mac does not match the root")
+    return state
+
+
+class _CrlCheckpointFrontier:
+    """Locked, rollback-resistant CRL checkpoint shared by both proof auditors.
+
+    Owns the common :class:`CrlState` lifecycle of
+    :class:`CrlProofAuditor` and :class:`WeightedCrlProofAuditor`: restore
+    under the root MAC, and a single atomic compare-and-update against the
+    carried CRL's sequence and the digest of its canonical bytes. The two
+    entry points keep their own proof parsing, signatures, tallies and
+    consensus types; this object carries only the rules they share, so the
+    gating can never drift between them and a checkpoint exported by one
+    can always be handed to the other.
+    """
+
+    def __init__(self, root: bytes, checkpoint: object) -> None:
+        self._root = root
+        self._lock = threading.Lock()
+        self._state: "Optional[CrlState]" = _restore_crl_checkpoint(
+            root, checkpoint
+        )
+
+    @property
+    def checkpoint(self) -> "Optional[CrlState]":
+        """The current frontier :class:`CrlState`, or ``None`` before the
+        first successfully audited proof. The returned object is frozen and
+        the property read-only; persist its :meth:`CrlState.to_bytes` output
+        and pass it back to a new auditor to survive a restart."""
+        return self._state
+
+    def advance(self, sequence: int, digest: bytes, label: str) -> bool:
+        """Atomically gate one already-audited CRL snapshot.
+
+        The caller must only reach this after the stateless proof audit has
+        succeeded. ``label`` names the entry point (``"crl proof"`` or
+        ``"weighted crl proof"``) for error messages. Under the lock: a
+        sequence lower than the checkpoint is rejected, an equal sequence is
+        accepted solely as a replay of the identical digest (a different
+        digest at the same sequence is rejected), and a higher sequence MACs
+        and installs a new checkpoint. Returns ``True`` when the checkpoint
+        advanced and ``False`` for an identical-digest replay, in which case
+        the checkpoint bytes are left untouched — the checkpoint keys on the
+        CRL alone, so two proofs over the identical CRL that report
+        different consensus results are a replay, never a conflict. A
+        rejected snapshot never mutates the frontier, and concurrent calls
+        can never move it backwards.
+        """
+        with self._lock:
+            current = self._state
+            if current is not None:
+                if sequence < current.sequence:
+                    raise ValueError(
+                        f"{label} sequence is below the audited checkpoint"
+                    )
+                if sequence == current.sequence and not hmac.compare_digest(
+                    digest, current.digest
+                ):
+                    raise ValueError(
+                        f"{label} carries a different crl at the checkpoint"
+                        " sequence"
+                    )
+                if sequence == current.sequence:
+                    # Identical snapshot: an accepted replay, nothing to
+                    # advance.
+                    return False
+            candidate = CrlState(
+                version=1,
+                sequence=sequence,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._state = replace(
+                candidate,
+                mac=_crl_state_mac(
+                    self._root, _crl_state_payload(candidate)
+                ),
+            )
+            return True
+
+
 def _crl_proof_snapshot(proof: CrlProof) -> "tuple[int, bytes]":
     """Return ``(sequence, crl_bytes)`` from an already audited CRL proof.
 
@@ -31632,7 +31739,9 @@ class CrlProofAuditor:
     empty state; otherwise it must be a :class:`CrlState` or its canonical
     :meth:`CrlState.to_bytes` encoding, and its MAC is recomputed with
     ``root`` and compared in constant time (a malformed encoding or MAC
-    mismatch raises :class:`ValueError`). Across a restart the caller must
+    mismatch raises :class:`ValueError`). The checkpoint is the exact one
+    :class:`WeightedCrlProofAuditor` exports, so either auditor may resume
+    from a checkpoint the other produced. Across a restart the caller must
     pass the value previously exported at :attr:`checkpoint`; nothing is
     persisted by the auditor itself.
 
@@ -31650,24 +31759,7 @@ class CrlProofAuditor:
 
     def __init__(self, root: object, *, checkpoint: object = None) -> None:
         self._root = _require_root(root)
-        self._lock = threading.Lock()
-        self._state: "Optional[CrlState]" = None
-        if checkpoint is None:
-            return
-        if isinstance(checkpoint, CrlState):
-            state = checkpoint
-        elif isinstance(checkpoint, bytes):
-            state = CrlState.from_bytes(checkpoint)
-        else:
-            raise ValueError(
-                "checkpoint must be a CrlState instance, its canonical bytes,"
-                " or None"
-            )
-        if not hmac.compare_digest(
-            _crl_state_mac(self._root, _crl_state_payload(state)), state.mac
-        ):
-            raise ValueError("checkpoint mac does not match the root")
-        self._state = state
+        self._frontier = _CrlCheckpointFrontier(self._root, checkpoint)
 
     @property
     def checkpoint(self) -> "Optional[CrlState]":
@@ -31675,7 +31767,7 @@ class CrlProofAuditor:
         first successfully audited proof. The returned object is frozen and
         the property read-only; persist its :meth:`CrlState.to_bytes` output
         and pass it back to a new auditor to survive a restart."""
-        return self._state
+        return self._frontier.checkpoint
 
     def audit(self, proof: "CrlProof | bytes") -> "Consensus":
         """Audit ``proof`` and enforce monotone CRL progress.
@@ -31699,40 +31791,13 @@ class CrlProofAuditor:
         else:
             raise ValueError("crl proof must be a CrlProof instance or bytes")
         # audit_proof is pure and owns the cryptographic/value contract, so
-        # run it outside the lock; only the compare-and-update is serialized.
+        # run it outside the lock; only the compare-and-update is serialized
+        # by the shared frontier.
         consensus = audit_proof(record, self._root)
         sequence, crl_blob = _crl_proof_snapshot(record)
-        digest = hashlib.sha256(crl_blob).digest()
-        with self._lock:
-            current = self._state
-            if current is not None:
-                if sequence < current.sequence:
-                    raise ValueError(
-                        "crl proof sequence is below the audited checkpoint"
-                    )
-                if sequence == current.sequence and not hmac.compare_digest(
-                    digest, current.digest
-                ):
-                    raise ValueError(
-                        "crl proof carries a different crl at the checkpoint"
-                        " sequence"
-                    )
-                if sequence == current.sequence:
-                    # Identical snapshot: an accepted replay, nothing to
-                    # advance.
-                    return consensus
-            candidate = CrlState(
-                version=1,
-                sequence=sequence,
-                digest=digest,
-                mac=b"\x00" * 32,
-            )
-            self._state = replace(
-                candidate,
-                mac=_crl_state_mac(
-                    self._root, _crl_state_payload(candidate)
-                ),
-            )
+        self._frontier.advance(
+            sequence, hashlib.sha256(crl_blob).digest(), "crl proof"
+        )
         return consensus
 
 
@@ -32507,24 +32572,7 @@ class WeightedCrlProofAuditor:
 
     def __init__(self, root: object, *, checkpoint: object = None) -> None:
         self._root = _require_root(root)
-        self._lock = threading.Lock()
-        self._state: "Optional[CrlState]" = None
-        if checkpoint is None:
-            return
-        if isinstance(checkpoint, CrlState):
-            state = checkpoint
-        elif isinstance(checkpoint, bytes):
-            state = CrlState.from_bytes(checkpoint)
-        else:
-            raise ValueError(
-                "checkpoint must be a CrlState instance, its canonical bytes,"
-                " or None"
-            )
-        if not hmac.compare_digest(
-            _crl_state_mac(self._root, _crl_state_payload(state)), state.mac
-        ):
-            raise ValueError("checkpoint mac does not match the root")
-        self._state = state
+        self._frontier = _CrlCheckpointFrontier(self._root, checkpoint)
 
     @property
     def checkpoint(self) -> "Optional[CrlState]":
@@ -32532,7 +32580,7 @@ class WeightedCrlProofAuditor:
         first successfully audited proof. The returned object is frozen and
         the property read-only; persist its :meth:`CrlState.to_bytes` output
         and pass it back to a new auditor to survive a restart."""
-        return self._state
+        return self._frontier.checkpoint
 
     def audit(self, proof: "WeightedCrlProof | bytes") -> "WeightedConsensus":
         """Audit ``proof`` and enforce monotone CRL progress.
@@ -32561,41 +32609,12 @@ class WeightedCrlProofAuditor:
             )
         # audit_weighted_crl_proof is pure and owns the cryptographic/value
         # contract, so run it outside the lock; only compare-and-update is
-        # serialized.
+        # serialized by the shared frontier.
         consensus = audit_weighted_crl_proof(record, self._root)
         sequence, crl_blob = _weighted_crl_proof_snapshot(record)
-        digest = hashlib.sha256(crl_blob).digest()
-        with self._lock:
-            current = self._state
-            if current is not None:
-                if sequence < current.sequence:
-                    raise ValueError(
-                        "weighted crl proof sequence is below the audited"
-                        " checkpoint"
-                    )
-                if sequence == current.sequence and not hmac.compare_digest(
-                    digest, current.digest
-                ):
-                    raise ValueError(
-                        "weighted crl proof carries a different crl at the"
-                        " checkpoint sequence"
-                    )
-                if sequence == current.sequence:
-                    # Identical snapshot: an accepted replay, nothing to
-                    # advance.
-                    return consensus
-            candidate = CrlState(
-                version=1,
-                sequence=sequence,
-                digest=digest,
-                mac=b"\x00" * 32,
-            )
-            self._state = replace(
-                candidate,
-                mac=_crl_state_mac(
-                    self._root, _crl_state_payload(candidate)
-                ),
-            )
+        self._frontier.advance(
+            sequence, hashlib.sha256(crl_blob).digest(), "weighted crl proof"
+        )
         return consensus
 
 
