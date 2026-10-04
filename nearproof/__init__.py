@@ -31622,31 +31622,20 @@ def _crl_proof_snapshot(proof: CrlProof) -> "tuple[int, bytes]":
     return snapshot.sequence, crl_blob
 
 
-class CrlProofAuditor:
-    """Stateful :class:`CrlProof` auditor that refuses CRL sequence rollback.
+class _CrlCheckpointAuditor:
+    """The checkpoint lifecycle shared by the CRL proof auditors.
 
-    ``root`` must be non-empty ``bytes`` — a non-bytes value raises
-    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
-    root the CRL snapshots, proofs and checkpoints are MAC'd with.
-    ``checkpoint`` is keyword-only: ``None`` (the default) starts from the
-    empty state; otherwise it must be a :class:`CrlState` or its canonical
-    :meth:`CrlState.to_bytes` encoding, and its MAC is recomputed with
-    ``root`` and compared in constant time (a malformed encoding or MAC
-    mismatch raises :class:`ValueError`). Across a restart the caller must
-    pass the value previously exported at :attr:`checkpoint`; nothing is
-    persisted by the auditor itself.
-
-    Each :meth:`audit` first runs the stateless :func:`audit_proof`; only
-    after it succeeds is the carried CRL snapshot examined. Its sequence
-    and ``SHA256`` over its canonical CRL bytes are compared against the
-    checkpoint under a lock: a lower sequence is rejected, an equal
-    sequence is accepted solely as a replay of the identical CRL digest
-    (a different digest at the same sequence is rejected), and a higher
-    sequence advances the checkpoint. The compare-and-update is atomic: a
-    rejected proof never changes the checkpoint and concurrent audits can
-    never move it backwards. Every failure other than a non-bytes ``root``
-    raises :class:`ValueError`.
+    :class:`CrlProofAuditor` and :class:`WeightedCrlProofAuditor` gate their
+    audited proofs against the same :class:`CrlState` frontier under the
+    same rules, so the checkpoint restore, the read-only
+    :attr:`checkpoint` view and the locked compare-and-update live here
+    exactly once. Each subclass keeps only its own proof type, stateless
+    audit entry and snapshot extraction in its :meth:`audit`.
     """
+
+    # Names the proof kind in the gating error messages; the subclasses
+    # override it so the wording matches their own proof type.
+    _proof_kind = "crl proof"
 
     def __init__(self, root: object, *, checkpoint: object = None) -> None:
         self._root = _require_root(root)
@@ -31677,6 +31666,78 @@ class CrlProofAuditor:
         and pass it back to a new auditor to survive a restart."""
         return self._state
 
+    def _advance(self, sequence: int, crl_blob: bytes) -> None:
+        """Gate one already audited CRL snapshot against the checkpoint.
+
+        Must only run after the proof carrying the snapshot passed its
+        stateless audit. Under the lock: a lower sequence is rejected, an
+        equal sequence is accepted solely as a replay of the identical CRL
+        digest (a different digest at the same sequence is rejected), and
+        a higher sequence advances the checkpoint, MAC'd as
+        ``HMAC-SHA256(root, b"NPCK1" + encoding)``. The compare-and-update
+        is atomic: a rejected snapshot never changes the checkpoint and
+        concurrent audits can never move it backwards.
+        """
+        digest = hashlib.sha256(crl_blob).digest()
+        with self._lock:
+            current = self._state
+            if current is not None:
+                if sequence < current.sequence:
+                    raise ValueError(
+                        f"{self._proof_kind} sequence is below the audited"
+                        " checkpoint"
+                    )
+                if sequence == current.sequence and not hmac.compare_digest(
+                    digest, current.digest
+                ):
+                    raise ValueError(
+                        f"{self._proof_kind} carries a different crl at the"
+                        " checkpoint sequence"
+                    )
+                if sequence == current.sequence:
+                    # Identical snapshot: an accepted replay, nothing to
+                    # advance.
+                    return
+            candidate = CrlState(
+                version=1,
+                sequence=sequence,
+                digest=digest,
+                mac=b"\x00" * 32,
+            )
+            self._state = replace(
+                candidate,
+                mac=_crl_state_mac(
+                    self._root, _crl_state_payload(candidate)
+                ),
+            )
+
+
+class CrlProofAuditor(_CrlCheckpointAuditor):
+    """Stateful :class:`CrlProof` auditor that refuses CRL sequence rollback.
+
+    ``root`` must be non-empty ``bytes`` — a non-bytes value raises
+    :class:`TypeError`, an empty value :class:`ValueError`; it is the same
+    root the CRL snapshots, proofs and checkpoints are MAC'd with.
+    ``checkpoint`` is keyword-only: ``None`` (the default) starts from the
+    empty state; otherwise it must be a :class:`CrlState` or its canonical
+    :meth:`CrlState.to_bytes` encoding, and its MAC is recomputed with
+    ``root`` and compared in constant time (a malformed encoding or MAC
+    mismatch raises :class:`ValueError`). Across a restart the caller must
+    pass the value previously exported at :attr:`checkpoint`; nothing is
+    persisted by the auditor itself.
+
+    Each :meth:`audit` first runs the stateless :func:`audit_proof`; only
+    after it succeeds is the carried CRL snapshot examined. Its sequence
+    and ``SHA256`` over its canonical CRL bytes are compared against the
+    checkpoint under a lock: a lower sequence is rejected, an equal
+    sequence is accepted solely as a replay of the identical CRL digest
+    (a different digest at the same sequence is rejected), and a higher
+    sequence advances the checkpoint. The compare-and-update is atomic: a
+    rejected proof never changes the checkpoint and concurrent audits can
+    never move it backwards. Every failure other than a non-bytes ``root``
+    raises :class:`ValueError`.
+    """
+
     def audit(self, proof: "CrlProof | bytes") -> "Consensus":
         """Audit ``proof`` and enforce monotone CRL progress.
 
@@ -31702,37 +31763,7 @@ class CrlProofAuditor:
         # run it outside the lock; only the compare-and-update is serialized.
         consensus = audit_proof(record, self._root)
         sequence, crl_blob = _crl_proof_snapshot(record)
-        digest = hashlib.sha256(crl_blob).digest()
-        with self._lock:
-            current = self._state
-            if current is not None:
-                if sequence < current.sequence:
-                    raise ValueError(
-                        "crl proof sequence is below the audited checkpoint"
-                    )
-                if sequence == current.sequence and not hmac.compare_digest(
-                    digest, current.digest
-                ):
-                    raise ValueError(
-                        "crl proof carries a different crl at the checkpoint"
-                        " sequence"
-                    )
-                if sequence == current.sequence:
-                    # Identical snapshot: an accepted replay, nothing to
-                    # advance.
-                    return consensus
-            candidate = CrlState(
-                version=1,
-                sequence=sequence,
-                digest=digest,
-                mac=b"\x00" * 32,
-            )
-            self._state = replace(
-                candidate,
-                mac=_crl_state_mac(
-                    self._root, _crl_state_payload(candidate)
-                ),
-            )
+        self._advance(sequence, crl_blob)
         return consensus
 
 
@@ -32478,7 +32509,7 @@ def _weighted_crl_proof_snapshot(proof: WeightedCrlProof) -> "tuple[int, bytes]"
     return snapshot.sequence, crl_blob
 
 
-class WeightedCrlProofAuditor:
+class WeightedCrlProofAuditor(_CrlCheckpointAuditor):
     """Stateful :class:`WeightedCrlProof` auditor that refuses CRL rollback.
 
     ``root`` must be non-empty ``bytes`` — a non-bytes value raises
@@ -32505,34 +32536,7 @@ class WeightedCrlProofAuditor:
     than a non-bytes ``root`` raises :class:`ValueError`.
     """
 
-    def __init__(self, root: object, *, checkpoint: object = None) -> None:
-        self._root = _require_root(root)
-        self._lock = threading.Lock()
-        self._state: "Optional[CrlState]" = None
-        if checkpoint is None:
-            return
-        if isinstance(checkpoint, CrlState):
-            state = checkpoint
-        elif isinstance(checkpoint, bytes):
-            state = CrlState.from_bytes(checkpoint)
-        else:
-            raise ValueError(
-                "checkpoint must be a CrlState instance, its canonical bytes,"
-                " or None"
-            )
-        if not hmac.compare_digest(
-            _crl_state_mac(self._root, _crl_state_payload(state)), state.mac
-        ):
-            raise ValueError("checkpoint mac does not match the root")
-        self._state = state
-
-    @property
-    def checkpoint(self) -> "Optional[CrlState]":
-        """The current frontier :class:`CrlState`, or ``None`` before the
-        first successfully audited proof. The returned object is frozen and
-        the property read-only; persist its :meth:`CrlState.to_bytes` output
-        and pass it back to a new auditor to survive a restart."""
-        return self._state
+    _proof_kind = "weighted crl proof"
 
     def audit(self, proof: "WeightedCrlProof | bytes") -> "WeightedConsensus":
         """Audit ``proof`` and enforce monotone CRL progress.
@@ -32564,38 +32568,7 @@ class WeightedCrlProofAuditor:
         # serialized.
         consensus = audit_weighted_crl_proof(record, self._root)
         sequence, crl_blob = _weighted_crl_proof_snapshot(record)
-        digest = hashlib.sha256(crl_blob).digest()
-        with self._lock:
-            current = self._state
-            if current is not None:
-                if sequence < current.sequence:
-                    raise ValueError(
-                        "weighted crl proof sequence is below the audited"
-                        " checkpoint"
-                    )
-                if sequence == current.sequence and not hmac.compare_digest(
-                    digest, current.digest
-                ):
-                    raise ValueError(
-                        "weighted crl proof carries a different crl at the"
-                        " checkpoint sequence"
-                    )
-                if sequence == current.sequence:
-                    # Identical snapshot: an accepted replay, nothing to
-                    # advance.
-                    return consensus
-            candidate = CrlState(
-                version=1,
-                sequence=sequence,
-                digest=digest,
-                mac=b"\x00" * 32,
-            )
-            self._state = replace(
-                candidate,
-                mac=_crl_state_mac(
-                    self._root, _crl_state_payload(candidate)
-                ),
-            )
+        self._advance(sequence, crl_blob)
         return consensus
 
 
