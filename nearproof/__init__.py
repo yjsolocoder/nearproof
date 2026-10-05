@@ -114,6 +114,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from types import MappingProxyType
 from typing import Callable, Optional
 
@@ -192,6 +193,7 @@ __all__ = [
     "ReceiptStream",
     "ReliabilityDecision",
     "ReliabilityEvidence",
+    "RegionConflict",
     "RegionDecision",
     "SPEED_OF_LIGHT_MPS",
     "SpanBundleReceipt",
@@ -289,6 +291,7 @@ __all__ = [
     "audit_weighted_cert_evidence_policy",
     "audit_weighted_crl_proof",
     "cert",
+    "diagnose_region",
     "locate",
     "locate_attested",
     "locate_bound_attested",
@@ -771,6 +774,24 @@ class RegionDecision:
     feasible: bool
     bounds: "tuple[float, float, float, float] | None"
     witness: "tuple[float, float] | None"
+
+
+@dataclass(frozen=True)
+class RegionConflict:
+    """The outcome of :func:`diagnose_region` over a set of :class:`Observation`.
+
+    ``feasible`` says whether the closed disks contributed by the
+    observations share at least one common point. When they do,
+    ``conflict`` is the empty tuple; otherwise it is a
+    minimum-cardinality tuple of observation ids whose disks alone
+    already have no common point — two ids when a disjoint pair exists,
+    three when every pair meets but no point lies in all three — sorted
+    lexicographically and chosen as the lexicographically smallest such
+    tuple.
+    """
+
+    feasible: bool
+    conflict: tuple[str, ...]
 
 
 _EVIDENCE_FIELDS = (
@@ -27999,6 +28020,217 @@ def locate_region(
         bounds=(min_x, min_y, max_x, max_y),
         witness=(wx, wy),
     )
+
+
+def _exact_disk_pair_intersects(
+    first: tuple[Fraction, Fraction, Fraction],
+    second: tuple[Fraction, Fraction, Fraction],
+) -> bool:
+    """Closed-disk intersection test on exact rational geometry."""
+    dx = first[0] - second[0]
+    dy = first[1] - second[1]
+    reach = first[2] + second[2]
+    return dx * dx + dy * dy <= reach * reach
+
+
+def _exact_disk_contained(
+    inner: tuple[Fraction, Fraction, Fraction],
+    outer: tuple[Fraction, Fraction, Fraction],
+) -> bool:
+    """Whether the closed ``inner`` disk lies entirely in the closed ``outer`` disk."""
+    margin = outer[2] - inner[2]
+    if margin < 0:
+        return False
+    dx = inner[0] - outer[0]
+    dy = inner[1] - outer[1]
+    return dx * dx + dy * dy <= margin * margin
+
+
+def _exact_boundary_point_in_disk(
+    first: tuple[Fraction, Fraction, Fraction],
+    second: tuple[Fraction, Fraction, Fraction],
+    third: tuple[Fraction, Fraction, Fraction],
+) -> bool:
+    """Whether a meeting point of the first two boundary circles lies in the third disk.
+
+    Every disk is a ``(center_x, center_y, radius)`` triple of exact
+    rationals. The meeting points are
+    ``p = c0 + lam*v ± sqrt(h2 / d2) * perp(v)`` with ``v = c1 - c0``,
+    so ``|p - c2|^2 = |u|^2 + h2 ± sqrt(h2 / d2) * 2 u·perp(v)`` for
+    ``u = c0 - c2 + lam*v``; the smaller sign decides, and the single
+    remaining square root is removed by one exact squaring step, so the
+    comparison is exact for every finite input.
+    """
+    vx = second[0] - first[0]
+    vy = second[1] - first[1]
+    d2 = vx * vx + vy * vy
+    if d2 == 0:
+        # Concentric circles share no isolated boundary point; coincident
+        # circles are covered by the containment cases.
+        return False
+    radius = first[2]
+    lam = (d2 + radius * radius - second[2] * second[2]) / (2 * d2)
+    h2 = radius * radius - lam * lam * d2
+    if h2 < 0:
+        # The circles do not meet (separate or strictly nested).
+        return False
+    ux = first[0] - third[0] + lam * vx
+    uy = first[1] - third[1] + lam * vy
+    base = ux * ux + uy * uy + h2
+    cross = 2 * (uy * vx - ux * vy)
+    delta = base - third[2] * third[2]
+    if delta <= 0:
+        return True
+    return cross * cross * h2 >= delta * delta * d2
+
+
+def _exact_triple_common_point(
+    disks: tuple[
+        tuple[Fraction, Fraction, Fraction],
+        tuple[Fraction, Fraction, Fraction],
+        tuple[Fraction, Fraction, Fraction],
+    ],
+) -> bool:
+    """Whether three closed disks (exact rational geometry) share a point.
+
+    The intersection, when non-empty, either has a vertex where two
+    boundary circles meet inside the third disk, or is one entire disk
+    contained in the other two; tangency, coincidence, containment and
+    zero radii all count as closed sets.
+    """
+    first, second, third = disks
+    for inner, outer_a, outer_b in (
+        (first, second, third),
+        (second, first, third),
+        (third, first, second),
+    ):
+        if _exact_disk_contained(inner, outer_a) and _exact_disk_contained(
+            inner, outer_b
+        ):
+            return True
+    for disk_a, disk_b, disk_c in (
+        (first, second, third),
+        (second, third, first),
+        (first, third, second),
+    ):
+        if _exact_boundary_point_in_disk(disk_a, disk_b, disk_c):
+            return True
+    return False
+
+
+def diagnose_region(
+    observations: object,
+    *,
+    tolerance: object = 0.0,
+) -> "RegionConflict":
+    """Explain which observations' distance bounds cannot all hold at once.
+
+    Each :class:`Observation` contributes the closed disk centered at
+    ``(x, y)`` with radius ``decision.upper_bound + tolerance`` (boundary
+    points count as covered) and the decision's ``accepted`` flag is
+    ignored, exactly as in :func:`locate`. When every disk shares at
+    least one common point the result is ``feasible=True`` with an empty
+    ``conflict``. Otherwise ``conflict`` is a minimum-cardinality tuple
+    of observation ids whose disks alone already have no common point:
+    two ids when a disjoint pair exists, or three ids when every pair
+    meets but no point lies in all three (the returned triple then has
+    every pair intersecting while the triple does not). Among
+    conflicting sets of the same size the ids are sorted
+    lexicographically within each set and the lexicographically smallest
+    tuple wins, so the result is independent of input order. A geometric
+    contradiction is reported through the result, never raised.
+
+    ``observations`` must be a non-empty iterable (a one-shot iterator
+    is fine, and one or two observations are allowed so a reported
+    conflict subset can be fed back in) of :class:`Observation` with
+    unique non-empty string ids, finite non-bool ``x``/``y`` coordinates
+    and a :class:`RangeDecision` whose ``upper_bound`` is finite and
+    non-negative; ``tolerance`` must be a finite non-bool non-negative
+    number. Every contract violation raises :class:`ValueError`, and
+    every observation is validated before any geometry is reported, so
+    an invalid trailing element is rejected even when earlier
+    observations already conflict.
+
+    Tangency, coincidence, containment and zero radii are all judged as
+    closed sets — a single shared boundary point is feasible. The
+    geometry is computed with exact rational arithmetic on the
+    represented values, so ``tolerance`` only enlarges the disks (no
+    further slack turns a real gap into an intersection) and huge or
+    tiny finite inputs cannot be misjudged through intermediate overflow
+    or underflow. The function does not mutate its inputs and keeps no
+    state.
+    """
+    slack = _slack_from_tolerance(tolerance)
+
+    raw_observations = _materialize_observations(observations)
+
+    if not raw_observations:
+        raise ValueError("need at least 1 observation, got 0")
+
+    exact_slack = Fraction(slack)
+    ids: list[str] = []
+    disks: list[tuple[Fraction, Fraction, Fraction]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        ids.append(ident)
+        disks.append((Fraction(ox), Fraction(oy), Fraction(bound) + exact_slack))
+
+    order = sorted(range(len(ids)), key=lambda index: ids[index])
+    sorted_ids = [ids[index] for index in order]
+    sorted_disks = [disks[index] for index in order]
+
+    # Helly's theorem for convex sets in the plane: the disks share a
+    # common point exactly when every pair and every triple does, so the
+    # smallest conflict is always a disjoint pair or, failing that, a
+    # pairwise-intersecting triple with no common point. Scanning the
+    # id-sorted combinations in lexicographic order and stopping at the
+    # first conflict yields the lexicographically smallest
+    # minimum-cardinality tuple, independent of input order.
+    count = len(sorted_ids)
+    for first in range(count):
+        for second in range(first + 1, count):
+            if not _exact_disk_pair_intersects(
+                sorted_disks[first], sorted_disks[second]
+            ):
+                return RegionConflict(
+                    feasible=False,
+                    conflict=(sorted_ids[first], sorted_ids[second]),
+                )
+    for first in range(count):
+        for second in range(first + 1, count):
+            for third in range(second + 1, count):
+                if not _exact_triple_common_point(
+                    (
+                        sorted_disks[first],
+                        sorted_disks[second],
+                        sorted_disks[third],
+                    )
+                ):
+                    return RegionConflict(
+                        feasible=False,
+                        conflict=(
+                            sorted_ids[first],
+                            sorted_ids[second],
+                            sorted_ids[third],
+                        ),
+                    )
+    return RegionConflict(feasible=True, conflict=())
 
 
 def locate_weighted_region(
