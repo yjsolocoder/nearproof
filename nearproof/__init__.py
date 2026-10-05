@@ -32,7 +32,7 @@ ObservationRevocationList / ObservationRevocationListAuditor /
 ObservationRevocationListState / Prover / RangeAuditor /
 RangeBatchReceipt /
 RangeDecision / RangeFrontier / RangeReceipt / RangeReceiptBatch /
-ReceiptStream / SPEED_OF_LIGHT_MPS / SpanBundleReceipt /
+ReceiptStream / ReliabilityEvidence / SPEED_OF_LIGHT_MPS / SpanBundleReceipt /
 SpanBundleReceiptAuditor / SpanBundleReceiptBatch /
 SpanBundleReceiptBatchReceipt /
 SpanBundleReceiptBatchReceiptAuditor /
@@ -73,6 +73,7 @@ audit_map_history_journal_receipt /
 audit_map_update /
 audit_proof / audit_range / audit_receipt /
 audit_batch_receipt / audit_bundle_receipt / audit_range_receipt_batch /
+audit_reliability /
 audit_span_bundle_receipt_batch /
 audit_span_bundle_receipt_batch_receipt_bundle /
 audit_span_bundle_receipt_batch_receipt_bundle_receipt /
@@ -92,6 +93,7 @@ seal_evidence_revocation_list_bundle /
 seal_evidence_revocation_list_bundle_receipt_batch /
 seal_map_history /
 seal_map_history_journal_bundle / seal_range / seal_range_receipt_batch /
+seal_reliability /
 seal_span_bundle_receipt_batch /
 seal_span_bundle_receipt_batch_receipt_bundle /
 seal_span_bundle_receipt_batch_receipt_bundle_receipt_bundle /
@@ -189,6 +191,7 @@ __all__ = [
     "RangeReceiptBatch",
     "ReceiptStream",
     "ReliabilityDecision",
+    "ReliabilityEvidence",
     "RegionDecision",
     "SPEED_OF_LIGHT_MPS",
     "SpanBundleReceipt",
@@ -267,6 +270,7 @@ __all__ = [
     "audit_range",
     "audit_range_receipt_batch",
     "audit_receipt",
+    "audit_reliability",
     "audit_span_bundle_receipt_batch",
     "audit_span_bundle_receipt_batch_receipt",
     "audit_span_bundle_receipt_batch_receipt_bundle",
@@ -314,6 +318,7 @@ __all__ = [
     "seal_map_history_journal_receipt_batch",
     "seal_range",
     "seal_range_receipt_batch",
+    "seal_reliability",
     "seal_span_bundle_receipt_batch",
     "seal_span_bundle_receipt_batch_receipt_bundle",
     "seal_span_bundle_receipt_batch_receipt_bundle_receipt_bundle",
@@ -384,6 +389,8 @@ _OBSERVATION_REVOCATION_LIST_STATE_PREFIX = b"NPORS1"
 _ASSESS_EVIDENCE_PREFIX = b"NPAE1"
 # Domain separation prefix for the confidence-evidence MAC.
 _CONFIDENCE_EVIDENCE_PREFIX = b"NPCE1"
+# Domain separation prefix for the reliability-evidence MAC.
+_RELIABILITY_EVIDENCE_PREFIX = b"NPRE1"
 # Domain separation prefixes for the bound-series evidence: the ordered
 # chain digest and the record MAC respectively.
 _BOUND_SERIES_CHAIN_PREFIX = b"NPBS1"
@@ -21320,6 +21327,24 @@ def assess_reliability(
     level = _check_unit_interval(confidence, "confidence")
 
     measurements = _coerce_assess_samples(samples, key)
+    return _assess_reliability_measurements(
+        measurements, bound, minimum, ceiling, level
+    )
+
+
+def _assess_reliability_measurements(
+    measurements: list,
+    bound: float,
+    minimum: int,
+    ceiling: float,
+    level: float,
+) -> "ReliabilityDecision":
+    """The exceedance-probability decision over validated measurements.
+
+    Shared by :func:`assess_reliability` and the reliability-evidence
+    seal/audit pair so all three compute the identical
+    :class:`ReliabilityDecision` from the same measurements and parameters.
+    """
     if len(measurements) < minimum:
         raise ValueError(
             f"need at least {minimum} samples, got {len(measurements)}"
@@ -22376,6 +22401,594 @@ def audit_confidence(x: object, key: object) -> "NoiseDecision":
     if decision.accepted is not recorded.accepted:
         raise ValueError(
             "confidence evidence decision accepted does not match the"
+            " recomputed decision"
+        )
+    return decision
+
+
+def _require_reliability_evidence_sample(value: bytes) -> None:
+    """Enforce the canonical-:class:`Evidence`-bytes contract of a carried
+    reliability-evidence sample.
+
+    ``value`` is already known to be ``bytes``; the record must satisfy the
+    full :class:`Evidence` field contract and its canonical re-encoding must
+    match the input byte for byte. Every violation raises
+    :class:`ValueError`.
+    """
+    try:
+        record = Evidence.from_bytes(value)
+    except ValueError as error:
+        raise ValueError(
+            "reliability evidence samples items must be the canonical"
+            " Evidence encoding"
+        ) from error
+    if record.to_bytes() != value:
+        raise ValueError(
+            "reliability evidence samples items must be the canonical"
+            " Evidence encoding"
+        )
+
+
+def _check_reliability_decision(decision: "ReliabilityDecision") -> None:
+    """Validate the fields of a carried :class:`ReliabilityDecision`.
+
+    Every violation raises :class:`ValueError`.
+    """
+    if type(decision.sample_count) is not int:
+        raise ValueError(
+            "reliability evidence decision sample_count must be an integer"
+        )
+    if decision.sample_count < 1:
+        raise ValueError(
+            "reliability evidence decision sample_count must be positive"
+        )
+    if type(decision.exceedance_count) is not int:
+        raise ValueError(
+            "reliability evidence decision exceedance_count must be an"
+            " integer"
+        )
+    if decision.exceedance_count < 0:
+        raise ValueError(
+            "reliability evidence decision exceedance_count must be"
+            " non-negative"
+        )
+    upper = decision.upper_probability
+    if isinstance(upper, bool) or not isinstance(upper, (int, float)):
+        raise ValueError(
+            "reliability evidence decision upper_probability must be a"
+            " finite number between 0 and 1"
+        )
+    if not math.isfinite(float(upper)) or not 0.0 <= float(upper) <= 1.0:
+        raise ValueError(
+            "reliability evidence decision upper_probability must be a"
+            " finite number between 0 and 1"
+        )
+    confidence = decision.confidence
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        raise ValueError(
+            "reliability evidence decision confidence must be a finite"
+            " number strictly between 0 and 1"
+        )
+    if not math.isfinite(float(confidence)) or not 0.0 < float(confidence) < 1.0:
+        raise ValueError(
+            "reliability evidence decision confidence must be a finite"
+            " number strictly between 0 and 1"
+        )
+    if not isinstance(decision.accepted, bool):
+        raise ValueError(
+            "reliability evidence decision accepted must be a bool"
+        )
+
+
+def _reliability_evidence_content(record: "ReliabilityEvidence") -> list:
+    """The JSON-ready reliability-evidence array without its ``mac``.
+
+    The samples are the lowercase hex strings of their canonical
+    :meth:`Evidence.to_bytes` encodings, in the record's own (canonical,
+    order-independent) order, and the decision is the array of the
+    :class:`ReliabilityDecision` fields in their public order.
+    """
+    decision = record.decision
+    return [
+        record.version,
+        [sample.hex() for sample in record.samples],
+        record.limit,
+        record.max_exceedance,
+        record.min_samples,
+        [
+            decision.sample_count,
+            decision.exceedance_count,
+            decision.upper_probability,
+            decision.confidence,
+            decision.accepted,
+        ],
+    ]
+
+
+def _reliability_evidence_content_bytes(record: "ReliabilityEvidence") -> bytes:
+    """The canonical compact encoding ``C`` of every field but ``mac``."""
+    return _encode_payload(_reliability_evidence_content(record))
+
+
+def _reliability_evidence_mac(key: bytes, content: bytes) -> bytes:
+    """``HMAC-SHA256(key, b"NPRE1" + C)`` where ``C`` is the canonical
+    compact encoding of every field but ``mac``. The prefix and ``C`` are
+    concatenated directly with no separator or length prefix."""
+    return hmac.new(
+        key, _RELIABILITY_EVIDENCE_PREFIX + content, hashlib.sha256
+    ).digest()
+
+
+@dataclass(frozen=True)
+class ReliabilityEvidence:
+    """A key-MAC'd, auditable snapshot of one :func:`assess_reliability`
+    decision.
+
+    Freezes the exact sample set one exceedance-probability decision was
+    made from together with its threshold, exceedance allowance and full
+    conclusion, so a third party holding the shared key can re-run the
+    whole determination independently with :func:`audit_reliability`.
+
+    The canonical encoding is a compact UTF-8 JSON array in field order::
+
+        [1, S, L, X, M, D, MAC]
+
+    ``version`` is always ``1``; ``S`` is a tuple of canonical
+    :meth:`Evidence.to_bytes` bytes sorted into one ascending canonical
+    order — only single-round evidence records are carried, never
+    :class:`Measurement` objects, which a third party could not re-verify;
+    ``L`` is the finite non-negative non-bool limit, canonicalized to a
+    ``float``; ``X`` the non-bool maximum tolerable exceedance probability,
+    strictly between ``0`` and ``1``; ``M`` the non-bool positive minimum
+    sample count; ``D`` the full :class:`ReliabilityDecision` conclusion,
+    encoded as the array of its public fields in order — total sample
+    count, exceedance count, upper probability bound, confidence and
+    accept flag; ``MAC`` is exactly 32 bytes —
+    ``HMAC-SHA256(key, b"NPRE1" + C)`` over the canonical compact encoding
+    of the first six fields, the prefix and the body concatenated directly
+    with no separator or length prefix. Instances are frozen, constructed
+    positionally in field order and compare equal by their fields. Every
+    contract violation — including a directly constructed record with an
+    illegal field — raises :class:`ValueError`. No key material is stored.
+    """
+
+    version: int
+    samples: tuple
+    limit: float
+    max_exceedance: float
+    min_samples: int
+    decision: ReliabilityDecision
+    mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int:
+            raise ValueError("reliability evidence version must be an integer")
+        if self.version != 1:
+            raise ValueError("reliability evidence version must be 1")
+        if not isinstance(self.samples, tuple):
+            raise ValueError("reliability evidence samples must be a tuple")
+        if not self.samples:
+            raise ValueError("reliability evidence samples must be non-empty")
+        for sample in self.samples:
+            if not isinstance(sample, bytes):
+                raise ValueError(
+                    "reliability evidence samples items must be bytes"
+                )
+            _require_reliability_evidence_sample(sample)
+        if list(self.samples) != sorted(self.samples):
+            raise ValueError(
+                "reliability evidence samples must be sorted ascending"
+            )
+        if isinstance(self.limit, bool) or not isinstance(
+            self.limit, (int, float)
+        ):
+            raise ValueError("reliability evidence limit must be a finite number")
+        if not math.isfinite(float(self.limit)) or float(self.limit) < 0:
+            raise ValueError(
+                "reliability evidence limit must be a finite non-negative"
+                " number"
+            )
+        # The limit is canonicalized to a float so equal limits compare and
+        # encode identically however they were spelled.
+        object.__setattr__(self, "limit", float(self.limit))
+        ceiling = self.max_exceedance
+        if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)):
+            raise ValueError(
+                "reliability evidence max_exceedance must be a finite number"
+                " strictly between 0 and 1"
+            )
+        if not math.isfinite(float(ceiling)) or not 0.0 < float(ceiling) < 1.0:
+            raise ValueError(
+                "reliability evidence max_exceedance must be a finite number"
+                " strictly between 0 and 1"
+            )
+        if type(self.min_samples) is not int:
+            raise ValueError(
+                "reliability evidence min_samples must be an integer"
+            )
+        if self.min_samples < 1:
+            raise ValueError("reliability evidence min_samples must be positive")
+        if not isinstance(self.decision, ReliabilityDecision):
+            raise ValueError(
+                "reliability evidence decision must be a ReliabilityDecision"
+            )
+        _check_reliability_decision(self.decision)
+        if not isinstance(self.mac, bytes):
+            raise ValueError("reliability evidence mac must be bytes")
+        if len(self.mac) != 32:
+            raise ValueError("reliability evidence mac must be exactly 32 bytes")
+
+    def to_bytes(self) -> bytes:
+        """Encode as compact UTF-8 JSON: the field-order array
+        ``[1, S, L, X, M, D, MAC]`` where ``S`` is the array of the
+        lowercase-hex canonical sample encodings, ``D`` the array of the
+        :class:`ReliabilityDecision` fields in their public order and
+        ``MAC`` the lowercase hex of the MAC, no whitespace, no
+        NaN/Infinity."""
+        return _encode_payload(
+            _reliability_evidence_content(self) + [self.mac.hex()]
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ReliabilityEvidence":
+        """Decode :meth:`to_bytes` output, enforcing the field contract.
+
+        Raises :class:`TypeError` for anything that is not ``bytes``;
+        raises :class:`ValueError` for anything that does not satisfy the
+        value contract: an array of exactly ``[version, samples, limit,
+        max_exceedance, min_samples, decision, mac]`` in that order —
+        extra or missing fields included — ``version == 1``, a non-empty
+        ``samples`` array of lowercase hex strings each decoding to the
+        canonical :class:`Evidence` encoding and sorted ascending, a
+        finite non-bool non-negative ``limit``, a non-bool
+        ``max_exceedance`` strictly between ``0`` and ``1``, a positive
+        non-bool integer ``min_samples``, a ``decision`` array of exactly
+        the :class:`ReliabilityDecision` fields satisfying their contract,
+        and a lowercase-hex ``mac`` decoding to exactly 32 bytes. After
+        parsing and field validation the record is re-encoded with
+        :meth:`to_bytes` and the result must equal the input byte for
+        byte, so formatted JSON, whitespace and any non-canonical spelling
+        are rejected too. The MAC is not verified here — pass the record
+        to :func:`audit_reliability` with the shared key for that.
+        """
+        if not isinstance(data, bytes):
+            raise TypeError("reliability evidence data must be bytes")
+        try:
+            outer = json.loads(data)
+        except ValueError as error:
+            raise ValueError(
+                f"reliability evidence is not valid JSON: {error}"
+            ) from error
+        if not isinstance(outer, list) or len(outer) != 7:
+            raise ValueError(
+                "reliability evidence must be a JSON array of exactly"
+                " version, samples, limit, max_exceedance, min_samples,"
+                " decision and mac"
+            )
+        (
+            raw_version,
+            raw_samples,
+            raw_limit,
+            raw_max_exceedance,
+            raw_min_samples,
+            raw_decision,
+            raw_mac,
+        ) = outer
+        if type(raw_version) is not int:
+            raise ValueError("reliability evidence version must be an integer")
+        if raw_version != 1:
+            raise ValueError("reliability evidence version must be 1")
+        if not isinstance(raw_samples, list):
+            raise ValueError("reliability evidence samples must be an array")
+        if not raw_samples:
+            raise ValueError("reliability evidence samples must be non-empty")
+        samples = tuple(
+            _parse_reliability_evidence_hex(raw_sample, "samples item")
+            for raw_sample in raw_samples
+        )
+        limit = _parse_reliability_evidence_number(raw_limit, "limit")
+        if limit < 0:
+            raise ValueError(
+                "reliability evidence limit must be a finite non-negative"
+                " number"
+            )
+        ceiling = _parse_reliability_evidence_number(
+            raw_max_exceedance, "max_exceedance"
+        )
+        if not 0.0 < ceiling < 1.0:
+            raise ValueError(
+                "reliability evidence max_exceedance must be a finite number"
+                " strictly between 0 and 1"
+            )
+        min_samples = _parse_reliability_evidence_int(
+            raw_min_samples, "min_samples"
+        )
+        if min_samples < 1:
+            raise ValueError("reliability evidence min_samples must be positive")
+        decision = _parse_reliability_decision(raw_decision)
+        mac = _parse_reliability_evidence_hex(raw_mac, "mac")
+        if len(mac) != 32:
+            raise ValueError(
+                "reliability evidence mac must decode to exactly 32 bytes"
+            )
+        record = cls(
+            version=1,
+            samples=samples,
+            limit=limit,
+            max_exceedance=ceiling,
+            min_samples=min_samples,
+            decision=decision,
+            mac=mac,
+        )
+        if record.to_bytes() != data:
+            raise ValueError("reliability evidence encoding is not canonical")
+        return record
+
+
+def _parse_reliability_evidence_hex(value: object, name: str) -> bytes:
+    """Lowercase round-tripping hex for reliability-evidence byte fields.
+
+    Every violation raises :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"reliability evidence {name} must be a lowercase hex string"
+        )
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(
+            f"reliability evidence {name} must be a lowercase hex string"
+        ) from error
+    if raw.hex() != value:
+        raise ValueError(
+            f"reliability evidence {name} must be a lowercase hex string"
+        )
+    return raw
+
+
+def _parse_reliability_evidence_int(value: object, name: str) -> int:
+    # bool is an int subclass but is not a number for the record contract.
+    if type(value) is not int:
+        raise ValueError(f"reliability evidence {name} must be an integer")
+    return value
+
+
+def _parse_reliability_evidence_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"reliability evidence {name} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"reliability evidence {name} must be a finite number")
+    return number
+
+
+def _parse_reliability_decision(value: object) -> "ReliabilityDecision":
+    """Parse the carried decision array into a :class:`ReliabilityDecision`.
+
+    The array must hold exactly the five public :class:`ReliabilityDecision`
+    fields in their public order; float fields are canonicalized to
+    ``float`` so the canonical re-encoding check rejects non-float
+    spellings. Range validation is left to the record contract. Every
+    violation raises :class:`ValueError`.
+    """
+    if not isinstance(value, list) or len(value) != 5:
+        raise ValueError(
+            "reliability evidence decision must be an array of exactly the"
+            " ReliabilityDecision fields"
+        )
+    (
+        raw_sample_count,
+        raw_exceedance_count,
+        raw_upper_probability,
+        raw_confidence,
+        raw_accepted,
+    ) = value
+    sample_count = _parse_reliability_evidence_int(
+        raw_sample_count, "decision sample_count"
+    )
+    exceedance_count = _parse_reliability_evidence_int(
+        raw_exceedance_count, "decision exceedance_count"
+    )
+    upper_probability = _parse_reliability_evidence_number(
+        raw_upper_probability, "decision upper_probability"
+    )
+    confidence = _parse_reliability_evidence_number(
+        raw_confidence, "decision confidence"
+    )
+    if not isinstance(raw_accepted, bool):
+        raise ValueError(
+            "reliability evidence decision accepted must be a bool"
+        )
+    return ReliabilityDecision(
+        sample_count=sample_count,
+        exceedance_count=exceedance_count,
+        upper_probability=upper_probability,
+        confidence=confidence,
+        accepted=raw_accepted,
+    )
+
+
+def _coerce_reliability_evidence(
+    x: object, name: str
+) -> "ReliabilityEvidence":
+    """Coerce a :class:`ReliabilityEvidence` or its canonical bytes: the
+    wrong kind of argument raises :class:`TypeError`, malformed byte
+    content of the right kind raises :class:`ValueError`."""
+    if isinstance(x, ReliabilityEvidence):
+        return x
+    if isinstance(x, bytes):
+        return ReliabilityEvidence.from_bytes(x)
+    raise TypeError(
+        f"{name} must be a ReliabilityEvidence instance or its canonical"
+        " bytes"
+    )
+
+
+def seal_reliability(
+    samples: object,
+    limit: object,
+    key: object,
+    *,
+    max_exceedance: object,
+    confidence: object = 0.95,
+    min_samples: object = 5,
+) -> "ReliabilityEvidence":
+    """Run :func:`assess_reliability` over evidence samples and freeze the
+    decision.
+
+    ``samples`` must be an iterable — a one-shot iterable is fine — whose
+    items are each an :class:`Evidence` instance or its canonical
+    :meth:`Evidence.to_bytes` encoding, freely mixed; :class:`Measurement`
+    objects are not accepted, since they carry nothing a third party could
+    re-verify. A non-iterable ``samples`` or an element of any other type
+    raises :class:`TypeError`. ``key`` must be non-empty ``bytes`` — a
+    non-``bytes`` value raises :class:`TypeError`, an empty value
+    :class:`ValueError`. ``limit``, the keyword-only ``max_exceedance``
+    (required) and ``confidence`` (default ``0.95``) and ``min_samples``
+    (default ``5``) follow the :func:`assess_reliability` contract
+    exactly: bools, non-numbers, non-finite or negative limits,
+    non-positive or non-integer minimum sample counts and
+    ``max_exceedance``/``confidence`` values outside the open interval
+    ``(0, 1)`` raise :class:`ValueError`.
+
+    Every sample is audited with :func:`audit` first and the
+    exceedance-probability decision is then computed with exactly the
+    :func:`assess_reliability` semantics — no outlier removal, a distance
+    equal to ``limit`` does not count as an exceedance and an upper
+    probability bound equal to ``max_exceedance`` accepts — so a bad MAC,
+    a malformed or non-canonical sample encoding, a duplicate
+    ``(round_index, nonce)`` pair or too few samples raises
+    :class:`ValueError` and no evidence is produced. Only on success —
+    whether the decision accepts or rejects — is the
+    :class:`ReliabilityEvidence` sealed: the carried sample encodings are
+    sorted into one canonical order (the input order never affects the
+    artifact bytes, and swapping an :class:`Evidence` object for its
+    canonical bytes does not either) and MAC'd as
+    ``HMAC-SHA256(key, b"NPRE1" + C)`` over the compact encoding of every
+    field but ``mac``. Sealing is pure computation: it reads no clock and
+    touches no challenge registry or consumption state.
+    """
+    try:
+        items = list(samples)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "samples must be an iterable of Evidence instances or their"
+            " canonical bytes"
+        ) from error
+    for item in items:
+        if not isinstance(item, (Evidence, bytes)):
+            raise TypeError(
+                "samples items must be Evidence instances or their canonical"
+                " bytes"
+            )
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    bound, minimum = _check_assess_params(limit, min_samples)
+    ceiling = _check_unit_interval(max_exceedance, "max_exceedance")
+    level = _check_unit_interval(confidence, "confidence")
+    sample_blobs = [_coerce_assess_evidence_sample(item) for item in items]
+    # Every evidence is verified exactly as a standalone audit() call would:
+    # MAC, response HMAC, elapsed and halved distance recomputation.
+    measurements = [audit(blob, key) for blob in sample_blobs]
+    decision = _assess_reliability_measurements(
+        measurements, bound, minimum, ceiling, level
+    )
+    # One canonical sample order makes the artifact independent of the input
+    # order; the decision itself is order-independent already.
+    ordered = tuple(sorted(sample_blobs))
+    record = ReliabilityEvidence(
+        version=1,
+        samples=ordered,
+        limit=bound,
+        max_exceedance=ceiling,
+        min_samples=minimum,
+        decision=decision,
+        mac=b"\x00" * 32,
+    )
+    return replace(
+        record,
+        mac=_reliability_evidence_mac(
+            key, _reliability_evidence_content_bytes(record)
+        ),
+    )
+
+
+def audit_reliability(x: object, key: object) -> "ReliabilityDecision":
+    """Independently re-verify a :class:`ReliabilityEvidence` against ``key``.
+
+    ``x`` must be a :class:`ReliabilityEvidence` or its canonical
+    :meth:`ReliabilityEvidence.to_bytes` encoding — anything else raises
+    :class:`TypeError`; ``key`` must be non-empty ``bytes`` — a non-bytes
+    value raises :class:`TypeError`, an empty value :class:`ValueError`.
+
+    The outer MAC is recomputed as
+    ``HMAC-SHA256(key, b"NPRE1" + C)`` and compared in constant time; then
+    every carried sample is re-verified with :func:`audit` — its MAC and
+    response HMAC checked and its elapsed time and halved distance
+    recomputed — and the whole exceedance-probability determination is
+    rerun with exactly the :func:`assess_reliability` semantics against
+    the carried ``limit``, ``max_exceedance``, ``min_samples`` and
+    decision ``confidence``. Every recomputed :class:`ReliabilityDecision`
+    field — total sample count, exceedance count, upper probability bound,
+    confidence and accept flag — must equal the recorded field, or
+    :class:`ValueError` is raised; a record re-signed under the right key
+    but whose statistical fields disagree with its samples fails the same
+    way. A bad outer or sample signature, non-canonical encoding, tampered
+    sample, threshold or conclusion, a duplicate sample or too few samples
+    all raise :class:`ValueError`; no partial result is returned. On
+    success the recomputed :class:`ReliabilityDecision` is returned —
+    identical to calling :func:`assess_reliability` on the same samples
+    with the carried parameters — whether it accepts or rejects. Auditing
+    is pure computation: it reads no clock, touches no challenge registry
+    or consumption state, persists nothing, and is no substitute for
+    verification-time replay protection or challenge expiry.
+    """
+    record = _coerce_reliability_evidence(x, "x")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if not key:
+        raise ValueError("key must be non-empty")
+    if not hmac.compare_digest(
+        _reliability_evidence_mac(
+            key, _reliability_evidence_content_bytes(record)
+        ),
+        record.mac,
+    ):
+        raise ValueError("reliability evidence mac does not match the key")
+    measurements = [audit(sample, key) for sample in record.samples]
+    bound, minimum = _check_assess_params(record.limit, record.min_samples)
+    ceiling = _check_unit_interval(record.max_exceedance, "max_exceedance")
+    level = _check_unit_interval(record.decision.confidence, "confidence")
+    decision = _assess_reliability_measurements(
+        measurements, bound, minimum, ceiling, level
+    )
+    recorded = record.decision
+    if decision.sample_count != recorded.sample_count:
+        raise ValueError(
+            "reliability evidence decision sample_count does not match the"
+            " recomputed decision"
+        )
+    if decision.exceedance_count != recorded.exceedance_count:
+        raise ValueError(
+            "reliability evidence decision exceedance_count does not match"
+            " the recomputed decision"
+        )
+    if decision.upper_probability != recorded.upper_probability:
+        raise ValueError(
+            "reliability evidence decision upper_probability does not match"
+            " the recomputed decision"
+        )
+    if decision.confidence != recorded.confidence:
+        raise ValueError(
+            "reliability evidence decision confidence does not match the"
+            " recomputed decision"
+        )
+    if decision.accepted is not recorded.accepted:
+        raise ValueError(
+            "reliability evidence decision accepted does not match the"
             " recomputed decision"
         )
     return decision
