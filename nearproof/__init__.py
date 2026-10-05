@@ -306,6 +306,7 @@ __all__ = [
     "make_observation_crl",
     "prove_crl",
     "prove_weighted_crl",
+    "reconcile_region",
     "revoke_bound",
     "revoke_context",
     "revoke_evidence",
@@ -28118,6 +28119,55 @@ def _exact_triple_common_point(
     return False
 
 
+def _exact_sqrt_combo_nonpositive(
+    base: Fraction, coeff: Fraction, radicand: Fraction
+) -> bool:
+    """Whether ``base + coeff * sqrt(radicand) <= 0`` on exact rationals.
+
+    ``radicand`` must be non-negative. The comparison is decided without
+    ever evaluating the square root: with a positive ``coeff`` the
+    inequality needs a non-positive ``base`` plus the squared comparison,
+    with a negative ``coeff`` a non-positive ``base`` decides at once and
+    a positive one flips the squared comparison.
+    """
+    if radicand == 0 or coeff == 0:
+        return base <= 0
+    if coeff > 0:
+        return base <= 0 and radicand * coeff * coeff <= base * base
+    if base <= 0:
+        return True
+    return radicand * coeff * coeff >= base * base
+
+
+def _exact_circle_meeting_frame(
+    first: tuple[Fraction, Fraction, Fraction],
+    second: tuple[Fraction, Fraction, Fraction],
+) -> "tuple[tuple[Fraction, Fraction], tuple[Fraction, Fraction], Fraction] | None":
+    """Parametrize the points where two boundary circles meet.
+
+    Each circle is a ``(center_x, center_y, radius)`` triple of exact
+    rationals. The meeting points are ``midpoint ± sqrt(radicand) * side``
+    with rational ``midpoint``, ``side`` and ``radicand`` (a zero
+    ``radicand`` means the circles are tangent); ``None`` is returned
+    when the circles are concentric or do not meet at all.
+    """
+    vx = second[0] - first[0]
+    vy = second[1] - first[1]
+    d2 = vx * vx + vy * vy
+    if d2 == 0:
+        # Concentric circles share no isolated boundary point; coincident
+        # circles are covered by the disk-center candidates.
+        return None
+    lam = (d2 + first[2] * first[2] - second[2] * second[2]) / (2 * d2)
+    h2 = first[2] * first[2] - lam * lam * d2
+    if h2 < 0:
+        # The circles do not meet (separate or strictly nested).
+        return None
+    midpoint = (first[0] + lam * vx, first[1] + lam * vy)
+    side = (-vy, vx)
+    return midpoint, side, h2 / d2
+
+
 def diagnose_region(
     observations: object,
     *,
@@ -28231,6 +28281,164 @@ def diagnose_region(
                         ),
                     )
     return RegionConflict(feasible=True, conflict=())
+
+
+def reconcile_region(
+    observations: object,
+    policy: object,
+    *,
+    tolerance: object = 0.0,
+) -> "WeightedConsensus":
+    """Keep the heaviest subset of observations whose disks share a point.
+
+    Each :class:`Observation` contributes the closed disk centered at
+    ``(x, y)`` with radius ``decision.upper_bound + tolerance`` (boundary
+    points count as covered) and the decision's ``accepted`` flag and
+    ``sample_count`` are ignored, exactly as in :func:`locate_weighted`;
+    unlike :func:`locate_weighted` no candidate point is required from
+    the caller. The result keeps a non-empty subset of observations
+    whose disks share at least one common point and whose total declared
+    weight is maximal among all such subsets. ``total_weight`` is the
+    sum of every declared weight, ``support_weight`` the sum over the
+    kept subset, and ``rejected`` the lexicographically sorted tuple of
+    the excluded observation ids. When several feasible subsets reach
+    the same maximal weight, the one whose ``rejected`` tuple compares
+    smallest under Python tuple ordering wins — there is deliberately no
+    secondary preference for excluding fewer observations. ``accepted``
+    only reports whether ``support_weight`` reaches
+    ``policy.threshold``; the threshold never influences which subset is
+    chosen and the search never stops at the first subset that reaches
+    it.
+
+    ``observations`` must be a non-empty iterable (a one-shot iterator
+    is fine, and one or two observations are allowed) of
+    :class:`Observation` with unique non-empty string ids, finite
+    non-bool ``x``/``y`` coordinates and a :class:`RangeDecision` whose
+    ``upper_bound`` is finite and non-negative; ``policy`` must be a
+    :class:`ConsensusPolicy` whose weight ids match the observation ids
+    exactly; ``tolerance`` must be a finite non-bool non-negative
+    number. Every contract violation raises :class:`ValueError`, and
+    every observation is validated before any geometry is computed, so
+    an invalid trailing element is rejected even when earlier
+    observations already conflict.
+
+    Tangency, coincidence, containment, zero radii and triples that meet
+    pairwise but not jointly are all judged as closed sets — a single
+    shared boundary point is enough, and a geometric contradiction is
+    reported through the result, never raised. The geometry is computed
+    with exact rational arithmetic on the represented values (circle
+    meeting points are compared through one exact squaring step, never
+    evaluated), so ``tolerance`` only enlarges the disks and huge or
+    tiny finite inputs cannot be misjudged through intermediate overflow
+    or underflow. When every disk shares a common point the ``rejected``
+    tuple is empty; when even the best subset cannot reach the threshold
+    the result still reports that subset with ``accepted=False``. The
+    result is independent of input order (of both the observations and
+    the weight mapping), the function does not mutate its inputs, reads
+    no clock and keeps no state.
+    """
+    slack = _slack_from_tolerance(tolerance)
+
+    if not isinstance(policy, ConsensusPolicy):
+        raise ValueError("policy must be a ConsensusPolicy")
+
+    raw_observations = _materialize_observations(observations)
+
+    if not raw_observations:
+        raise ValueError("need at least 1 observation, got 0")
+
+    exact_slack = Fraction(slack)
+    ids: list[str] = []
+    disks: list[tuple[Fraction, Fraction, Fraction]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        ids.append(ident)
+        disks.append((Fraction(ox), Fraction(oy), Fraction(bound) + exact_slack))
+
+    weights = policy.weights
+    if set(ids) != set(weights):
+        raise ValueError("policy weight ids must match the observation ids")
+
+    disk_weights = [weights[ident] for ident in ids]
+
+    best_support = 0
+    best_rejected: "tuple[str, ...] | None" = None
+
+    def consider(covered: list[bool]) -> None:
+        nonlocal best_support, best_rejected
+        support = 0
+        rejected: list[str] = []
+        for index, covers in enumerate(covered):
+            if covers:
+                support += disk_weights[index]
+            else:
+                rejected.append(ids[index])
+        rejected_tuple = tuple(sorted(rejected))
+        if (
+            best_rejected is None
+            or support > best_support
+            or (support == best_support and rejected_tuple < best_rejected)
+        ):
+            best_support = support
+            best_rejected = rejected_tuple
+
+    # A kept set with a common point can always be extended to every disk
+    # covering that point, so the optimum is the heaviest disk coverage of
+    # a single point. With closed disks that maximum is attained either at
+    # a meeting point of two boundary circles or, when no two boundaries
+    # meet (a laminar family of nested or disjoint disks), at an innermost
+    # disk's center, so scanning both kinds of candidates finds it.
+    count = len(ids)
+    for center in range(count):
+        cx, cy, _radius = disks[center]
+        consider(
+            [
+                (cx - ox) * (cx - ox) + (cy - oy) * (cy - oy) <= radius * radius
+                for ox, oy, radius in disks
+            ]
+        )
+    for first in range(count):
+        for second in range(first + 1, count):
+            frame = _exact_circle_meeting_frame(disks[first], disks[second])
+            if frame is None:
+                continue
+            (mx, my), (qx, qy), radicand = frame
+            q2 = qx * qx + qy * qy
+            for sign in (1, -1):
+                covered = []
+                for ox, oy, radius in disks:
+                    ux = mx - ox
+                    uy = my - oy
+                    base = ux * ux + uy * uy + radicand * q2 - radius * radius
+                    coeff = 2 * sign * (ux * qx + uy * qy)
+                    covered.append(
+                        _exact_sqrt_combo_nonpositive(base, coeff, radicand)
+                    )
+                consider(covered)
+
+    assert best_rejected is not None  # the disk centers were considered
+    return WeightedConsensus(
+        total_weight=sum(disk_weights),
+        support_weight=best_support,
+        rejected=best_rejected,
+        accepted=best_support >= policy.threshold,
+    )
 
 
 def locate_weighted_region(
