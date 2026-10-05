@@ -164,12 +164,12 @@ python3 -m nearproof
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 为嵌套对象且键同样依字段顺序，`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）：外层与嵌套 `decision` 对象的键都必须恰好是各自字段、各出现一次且依字段顺序（缺、多、重复或乱序即拒绝），`mac` 必须解码为恰好 32 字节
 - `attest_observation(id, x, y, decision, issued_at, key) -> AttestedObservation` — 用非空 key 对观察签名（见下）
-- `locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, revocations=None, revocation_list=None, root=None, min=0) -> Consensus` — 先验签/验时效/验撤销再按 `locate` 规则聚合（见下）
+- `locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, max_skew=None, revocations=None, revocation_list=None, root=None, min=0) -> Consensus` — 先验签/验时效/验同批时间跨度/验撤销再按 `locate` 规则聚合（见下）
 - `BoundAttestedObservation(version, id, x, y, decision, point, context, issued_at, mac)` — 签名额外绑定候选点与用途的冻结观察（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`decision` 嵌套对象键依字段顺序，`point` 为裸二元 JSON 数组（无类型标签、无长度前缀），`mac` 为小写十六进制；整份即单个 JSON 文档，域标签为空、无任何长度前缀或额外定界
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
 - `attest_observation_for_point(id, x, y, decision, point, context, issued_at, key) -> BoundAttestedObservation` — 用非空 key 签名一条绑定点与用途的观察（见下）
-- `locate_bound_attested(observations, point, context, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, revocations=None, revocation_list=None, root=None, min=0) -> Consensus` — 恒时验签后还要求点逐项相等、用途精确相等，其余同 `locate_attested`（见下）
+- `locate_bound_attested(observations, point, context, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, max_skew=None, revocations=None, revocation_list=None, root=None, min=0) -> Consensus` — 恒时验签后还要求点逐项相等、用途精确相等，同批时间跨度等其余规则同 `locate_attested`（见下）
 - `ObservationRevocation(version, id, revoked_at, mac)` — 带 HMAC 签名的冻结撤销记录（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON 编码：键依字段顺序，`mac` 为小写十六进制
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或不合契约一律抛 `ValueError`（不校验 MAC）
@@ -911,11 +911,12 @@ consensus.accepted          # False（按条数 quorum=2 本会接受）
 
 `attest_observation(id, x, y, decision, issued_at, key)` 用非空 `key` 签名一条观察（`version` 固定为 1），字段违约或空 key 均抛 `ValueError`；签名是纯计算，不触碰任何验证者状态。
 
-`locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, revocations=None, revocation_list=None, root=None, min=0)` 在验签之后按 `locate` 的精确规则聚合：
+`locate_attested(observations, point, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, max_skew=None, revocations=None, revocation_list=None, root=None, min=0)` 在验签之后按 `locate` 的精确规则聚合：
 
 - `observations` 可混用 `AttestedObservation` 对象与其 `to_bytes()` 字节编码；其他类型一律抛 `ValueError`。
 - `keys` 必须是非空映射，把观察 id 映射到该验证者的非空共享密钥字节。每条记录用 `keys[id]` 恒时复核 MAC；**未知 id、重复 id、错误的 key 或任何篡改均抛 `ValueError`**。
 - `max_age=None`（默认）不做时效检查；否则 `max_age` 必须是非布尔、有限、非负的数，且每条记录须满足 `0 <= now - issued_at <= max_age`（闭区间），`now` 缺省为 `time.time()`，显式传入时必须是非布尔有限数；过期或“来自未来”的记录抛 `ValueError`。
+- `max_skew=None`（默认）不做同批时间跨度检查；否则 `max_skew` 必须是以秒为单位的非布尔、有限、非负 `int` 或 `float`——类型不符、负数、`NaN`、无穷大及无法表示为有限浮点数的整数（如 `10**400`）一律抛 `ValueError`。启用时，在全部记录通过上述各项检查之后，以**本批所有记录**（含磁盘不覆盖候选点的观察，不能只看支持者，也不能删除较早记录或挑选满足约束的子集）的 `max(issued_at) - min(issued_at)` 得到跨度，`跨度 <= max_skew`（闭区间，`0` 只允许签发时间完全相同）才进入几何共识，超过则整次调用抛 `ValueError`。该约束只比较已签名时间：单独启用时**不读取系统时钟**，`now` 被完全忽略，也不改变 `now` 在时效/撤销路径下原有的使用与缺省规则；与 `max_age`、撤销或快照同时使用时各项约束都须满足。通过跨度检查不等于几何共识通过：票数不足仍返回 `accepted=False`。
 - `revocations=None`（默认）不做撤销检查，行为与之前完全一致。否则 `revocations` 必须是可迭代对象，可混用 `ObservationRevocation` 对象与其规范字节编码：每条撤销用 `keys[id]` 恒时复核 MAC，**未知或重复 id、错误 key、篡改、非法项一律抛 `ValueError`**；此时 `now` 同样必需（非布尔有限数，缺省时仅读一次 `time.time()`），`revoked_at > now` 的“未来撤销”抛 `ValueError`。若某观察的 `issued_at <=` 同 id 撤销的 `revoked_at`，抛 `ValueError`；**严格晚于撤销时刻**签发的观察不受影响，沿用原时效与几何规则。
 - `revocation_list=None`（默认）不做快照检查，`root`/`min` 被忽略，行为与之前完全一致。否则 `revocation_list` 必须是一个 `ObservationRevocationList`（对象或其 `to_bytes()` 规范字节），`root` 必须是非空 `bytes`（非 bytes 抛 `TypeError`、空 bytes 抛 `ValueError`），且 **`now` 必须显式传入**（非布尔有限数；缺省抛 `ValueError`，此路径绝不读时钟）。快照整体经 `audit_observation_crl(revocation_list, root, keys, now=now, min=min)` 审核：列表层与每条 entry 的 MAC 都必须验过，未知或重复 id、清单过期（`issued_at > now`）、序号过低（`sequence < min`，`min` 为非布尔整数、默认 `0`）、未来撤销（`revoked_at > now`）一律抛 `ValueError`。单条 `revocations` 与快照可同时提供：任一来源命中同一 id 且观察的 `issued_at` 不严格晚于其 `revoked_at` 即拒绝该轮；严格晚于全部命中撤销时刻的观察仍按原几何、`quorum`、`tolerance` 与绑定规则计算。
 - 验签通过的记录转为 `Observation` 后交给 `locate`（含 `quorum`/`tolerance` 校验与至少三条观察等全部规则），返回其 `Consensus`。`locate_attested` 是纯函数，除缺省读取一次 `time.time()` 外无副作用。
@@ -944,7 +945,7 @@ consensus.accepted                     # True
 
 `attest_observation_for_point(id, x, y, decision, point, context, issued_at, key)` 用非空 `key` 签名一条绑定点与用途的观察（`version` 固定为 1），字段违约或空 key 均抛 `ValueError`；纯计算，不触碰任何验证者状态。
 
-`locate_bound_attested(observations, point, context, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, revocations=None, revocation_list=None, root=None, min=0) -> Consensus` 的对象/字节混输、`keys` 映射、恒时验签、重复 id、时效（`now`/`max_age`）、撤销（含 `revocation_list` 快照路径）、几何与 quorum 规则与 `locate_attested` **完全一致**（未达 quorum 同样不抛异常），在此之上增加绑定校验：每条记录 MAC 验证通过后，其 `point` 必须与查询 `point` **逐项相等**、其 `context` 必须与查询 `context` **精确相等**，否则抛 `ValueError`——绑定其他点或其他用途的签名不能拿到本次查询重放。查询参数本身也受契约约束：`point` 必须是恰含两个非布尔有限数的 tuple，`context` 必须是非空字符串。契约违约抛 `ValueError`；调用形状错误（缺参数、关键字选项按位置传入等）抛 `TypeError`。
+`locate_bound_attested(observations, point, context, keys, *, quorum=3, tolerance=0.0, now=None, max_age=None, max_skew=None, revocations=None, revocation_list=None, root=None, min=0) -> Consensus` 的对象/字节混输、`keys` 映射、恒时验签、重复 id、时效（`now`/`max_age`）、同批时间跨度（`max_skew`，含全部记录、只用已签名时间且不读时钟、超限抛 `ValueError` 等全部语义）、撤销（含 `revocation_list` 快照路径）、几何与 quorum 规则与 `locate_attested` **完全一致**（未达 quorum 同样不抛异常），在此之上增加绑定校验：每条记录 MAC 验证通过后，其 `point` 必须与查询 `point` **逐项相等**、其 `context` 必须与查询 `context` **精确相等**，否则抛 `ValueError`——绑定其他点或其他用途的签名不能拿到本次查询重放。查询参数本身也受契约约束：`point` 必须是恰含两个非布尔有限数的 tuple，`context` 必须是非空字符串。契约违约抛 `ValueError`；调用形状错误（缺参数、关键字选项按位置传入等）抛 `TypeError`。
 
 ```python
 from nearproof import RangeDecision, attest_observation_for_point, locate_bound_attested
