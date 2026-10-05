@@ -68,6 +68,7 @@ python3 -m nearproof
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 抛 `TypeError`，额外字段、非规范编码及其余不合契约（不校验 MAC）抛 `ValueError`
 - `seal_confidence(samples, limit, key, *, min_samples=5, coverage=0.95) -> ConfidenceEvidence` — 逐份按 `audit` 验样本（`Evidence` 对象与规范字节可混用，支持一次性可迭代对象，不收 `Measurement`），再按 `assess_confidence` 的参数约束与统计口径重算判定，接受或拒绝均可封存；样本换序、对象与字节互换不改变产物字节（见下）
 - `audit_confidence(x, key) -> NoiseDecision` — 用共享密钥复核 `ConfidenceEvidence`（对象或规范字节），恒时验外层 `NPCE1` MAC 并逐份复核样本后重算，逐字段比对 `decision`，成功返回 `NoiseDecision`；即使重新签名，统计字段与样本不一致仍抛 `ValueError`（见下）
+- `audit_confidence_policy(x, key, *, now=None, max_age=None, revocations=None) -> NoiseDecision` — 先按 `audit_confidence` 完整复核（全部样本验签与统计字段重算），再可选做时效/逐轮撤销复核；`revocations` 仅收逐轮撤销记录的一次性可迭代对象（可混用 `BoundEvidenceRevocation` 对象与规范字节），**不收撤销快照、也不收单条记录**（见下）
 - `EvidenceRevocationList(version, sequence, issued_at, entries, mac)` — 共享密钥 MAC 的冻结逐轮证据撤销快照（`version=1`，`sequence` 为非布尔 u64，`issued_at` 存为 `float`，`entries` 为按 `(round_index, nonce)` 升序且无重复的 `BoundEvidenceRevocation` 元组，`mac` 恰 32 字节，不含密钥；见下）；字段类型错（形状错）抛 `TypeError`，值违约（含未排序/重复条目）抛 `ValueError`
   - `to_bytes()` / `from_bytes(data)` — 紧凑 UTF-8 JSON **对象**（键序 `version, sequence, issued_at, entries, mac`，各一次；`entries` 为对象数组，每条带 `BoundEvidenceRevocation` 键序，bytes 小写 hex；`issued_at` 恒为 float 拼写，无空白、无长度前缀）；`from_bytes` 仅收 bytes（非 bytes 抛 `TypeError`），缺/多/重复/乱序键、entries 非数组、某条 entry 不合契约、u64/时刻违约及任何非规范拼写均抛 `ValueError`，重编码须逐字节相等，不验任何 MAC
 - `make_evidence_revocation_list(entries, sequence, issued_at, key) -> EvidenceRevocationList` — 用非空 key 对一批 `BoundEvidenceRevocation`（可为空；不接受字节）签快照：先按 `(round_index, nonce)` 排序、重复对抛 `ValueError`，各条目自带 `NPBR1` MAC 原样携带，列表层 `mac = HMAC-SHA256(key, b"NPERL1" + 去mac规范JSON)`，直拼无长度前缀；`sequence`/`issued_at`/条目形状错抛 `TypeError`，值违约与空 key 抛 `ValueError`（见下）
@@ -698,6 +699,40 @@ if noise.accepted:
 - 两项同时启用时各自独立生效：时效超龄或含被撤销样本都会拒绝；二者皆满足才返回与既有复核相同的 `RangeDecision`。
 
 与既有复核一样，策略复核是纯计算：不触碰挑战登记与消费状态，也不替代验证时的重放防护。
+
+### 区间证据的时效与撤销复核 `audit_confidence_policy`
+
+`audit_confidence_policy(x, key, *, now=None, max_age=None, revocations=None)` 在 `audit_confidence` 的全部密码学、规范编码与统计字段重算（及其 `TypeError`/`ValueError` 语义）完全不变的基础上，为长期保存的 `ConfidenceEvidence` 增加可选的时效与逐轮撤销复核：`x` 收 `ConfidenceEvidence` 对象或其规范字节，`key` 为非空 bytes；证据或密钥类型错抛 `TypeError`，空密钥、非规范编码、签名错误或重算结论与携带结论不符抛 `ValueError`。`max_age=None` 且 `revocations=None`（均为默认）时不做任何额外检查——与既有 `audit_confidence` **逐项一致**、返回同样的 `NoiseDecision`，`now` 被完全忽略且不读取任何时钟；原结论 `accepted` 为假也照常返回该结论。启用任一选项后仍然**先完成既有复核**（外层 `NPCE1` MAC、逐份样本验签与全部统计字段重算）：密码学、编码或结论失败先抛错，再查策略。
+
+- `max_age` 启用时必须是非布尔、有限、非负数，且 `now` 必传——非布尔有限数（可 int/float），缺省、布尔、非有限数均抛 `ValueError`。时效基准取**全部样本 `end` 的最大值**（离群样本同样参与），须满足闭区间 `0 <= now - 基准 <= max_age`：基准落在未来或超出有效期一律抛 `ValueError`；闭区间两端相等（`now == 基准`、`now - 基准 == max_age`）仍然有效。
+- `revocations` 启用时收一个**一次性可迭代对象**（生成器等只迭代一次的对象即可），条目可混用 `BoundEvidenceRevocation` 对象与其规范字节（即 `revoke_bound`/`revoke_evidence` 签出的逐轮撤销记录）；**空集合表示启用检查但没有任何撤销**，此时 `now` 仍必传。每条记录都用同一 `key` **恒时**验签，按 `round_index` 与 `nonce` 与**全部携带样本**（含离群样本）匹配：
+  - 不可迭代输入、非法条目（既非对象也非字节、类型不对）、坏编码、坏签名、同一 `(round_index, nonce)` 对重复出现，或某条 `revoked_at > now`（撤销时刻来自未来）一律抛 `ValueError`——**即使该条目未命中任何样本也不能跳过**，无关条目必须先通过验签与时间检查才被忽略。
+  - 命中样本且该样本 `end <= revoked_at`（含两端相等）时**整份证据抛 `ValueError`**；完成时刻严格晚于撤销时刻（`end > revoked_at`）的样本不受影响。命中的即使是离群样本也同样拒绝整份证据——**不删除该样本、不重算结论**。
+  - 本入口**不接收撤销快照**：直接传单个 `EvidenceRevocationList`（对象或其规范字节）抛 `ValueError`；直接传单条 `BoundEvidenceRevocation`（对象或裸字节，而非包一层可迭代对象）同样抛 `ValueError`。
+- 两项策略同时启用时，时效与撤销检查**全部通过**才返回与 `audit_confidence` 相同的 `NoiseDecision`；任一失败都不返回部分结果。
+
+与 `audit_confidence` 一样，策略复核是纯计算：不修改挑战或重放状态、不持久化数据，也不替代验证时的重放防护或挑战有效期。
+
+```python
+evidence = seal_confidence(records, limit=300.0, key=key)
+blob = evidence.to_bytes()
+decision = audit_confidence(blob, key)             # 与 audit_confidence 逐项一致
+
+latest_end = max(record.end for record in records)  # 含离群样本
+fresh = audit_confidence_policy(
+    blob, key, now=latest_end + 60.0, max_age=300.0
+)
+
+revocation = revoke_evidence(records[0], revoked_at=latest_end + 10.0, key=key)
+# 命中且 end <= revoked_at 时整份证据抛 ValueError；严格晚于撤销时刻则不受影响
+audit_confidence_policy(
+    blob,
+    key,
+    now=latest_end + 60.0,
+    max_age=300.0,
+    revocations=iter([revocation.to_bytes()]),     # 一次性可迭代对象
+)
+```
 
 ### 连续绑定测距序列 `BoundSeriesEvidence`、`seal_bound_series` 与 `audit_bound_series`
 
