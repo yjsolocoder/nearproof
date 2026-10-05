@@ -306,6 +306,7 @@ __all__ = [
     "make_observation_crl",
     "prove_crl",
     "prove_weighted_crl",
+    "reconcile_region",
     "revoke_bound",
     "revoke_context",
     "revoke_evidence",
@@ -28231,6 +28232,162 @@ def diagnose_region(
                         ),
                     )
     return RegionConflict(feasible=True, conflict=())
+
+
+def reconcile_region(
+    observations: object,
+    policy: object,
+    *,
+    tolerance: object = 0.0,
+) -> "WeightedConsensus":
+    """Keep the maximum-weight observation subset whose disks share a point.
+
+    Each :class:`Observation` contributes the closed disk centered at
+    ``(x, y)`` with radius ``decision.upper_bound + tolerance`` (boundary
+    points count as covered) and the decision's ``accepted`` flag and
+    ``sample_count`` are ignored, exactly as in :func:`diagnose_region`.
+    No candidate point is required: the entry searches for a non-empty
+    kept subset of the observations whose disks have at least one common
+    point and whose summed :class:`ConsensusPolicy` weight is maximal
+    among all such subsets. The result reports ``total_weight`` as the
+    sum of every declared weight, ``support_weight`` as the sum over the
+    kept subset, and ``rejected`` as the lexicographically sorted tuple
+    of the excluded observation ids. When several feasible subsets reach
+    the maximal weight, the one whose ``rejected`` tuple is smallest by
+    Python tuple comparison wins — there is no separate preference for
+    fewer exclusions. When every disk shares a common point the kept
+    subset is the whole set and ``rejected`` is empty.
+
+    ``accepted`` only reports whether the optimal ``support_weight``
+    reaches ``policy.threshold``; the threshold never influences which
+    subset is chosen, the search never stops early at the first
+    threshold-reaching subset, and a sub-threshold optimum is still
+    returned with ``accepted=False``.
+
+    ``observations`` must be a non-empty iterable (a one-shot iterator
+    is fine, and one or two observations are allowed) of
+    :class:`Observation` with unique non-empty string ids, finite
+    non-bool ``x``/``y`` coordinates and a :class:`RangeDecision` whose
+    ``upper_bound`` is finite and non-negative; ``policy`` must be a
+    :class:`ConsensusPolicy` whose weight ids match the observation ids
+    exactly; ``tolerance`` must be a finite non-bool non-negative
+    number. Every contract violation raises :class:`ValueError`, and
+    every observation is validated before any geometry is considered, so
+    an invalid trailing element is rejected even when earlier
+    observations already contradict each other.
+
+    Tangency, coincidence, containment, zero radii and pairwise
+    intersecting triples without a common point are all judged as
+    closed sets by the same exact rational arithmetic as
+    :func:`diagnose_region` — ``tolerance`` only enlarges the disks (no
+    further slack is added) and huge or tiny finite inputs cannot be
+    misjudged through intermediate overflow or underflow. A geometric
+    contradiction selects a smaller kept subset; it is never raised.
+    The result is independent of input order and of the weight mapping's
+    order, the function does not mutate its inputs, reads no clock and
+    keeps no state.
+    """
+    slack = _slack_from_tolerance(tolerance)
+
+    if not isinstance(policy, ConsensusPolicy):
+        raise ValueError("policy must be a ConsensusPolicy")
+
+    raw_observations = _materialize_observations(observations)
+
+    if not raw_observations:
+        raise ValueError("need at least 1 observation, got 0")
+
+    exact_slack = Fraction(slack)
+    ids: list[str] = []
+    disks: list[tuple[Fraction, Fraction, Fraction]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        ids.append(ident)
+        disks.append((Fraction(ox), Fraction(oy), Fraction(bound) + exact_slack))
+
+    weights = policy.weights
+    if set(ids) != set(weights):
+        raise ValueError("policy weight ids must match the observation ids")
+
+    # Sort by id so the search order, and thereby the result, is
+    # independent of the input and weight-mapping order; rejected ids
+    # are then collected in lexicographic order for free.
+    order = sorted(range(len(ids)), key=lambda index: ids[index])
+    sorted_ids = [ids[index] for index in order]
+    sorted_disks = [disks[index] for index in order]
+    sorted_weights = [weights[ident] for ident in sorted_ids]
+
+    count = len(sorted_ids)
+    suffix_weight = [0] * (count + 1)
+    for index in range(count - 1, -1, -1):
+        suffix_weight[index] = suffix_weight[index + 1] + sorted_weights[index]
+
+    # Branch and bound over kept/excluded choices, keeping the disk
+    # branch first so a high weight bound is found early. By Helly's
+    # theorem a disk set shares a common point exactly when every pair
+    # intersects and every triple has a common point, so a new disk can
+    # be checked incrementally against the already-kept ones with the
+    # exact predicates of diagnose_region. A branch is pruned only when
+    # it cannot even tie the best weight, so equal-weight candidates
+    # are still compared by their rejected tuple.
+    best_weight = -1
+    best_rejected: "tuple[str, ...] | None" = None
+    kept: list[tuple[Fraction, Fraction, Fraction]] = []
+    rejected: list[str] = []
+
+    def search(index: int, kept_weight: int) -> None:
+        nonlocal best_weight, best_rejected
+        if index == count:
+            candidate = tuple(rejected)
+            if kept_weight > best_weight or (
+                kept_weight == best_weight
+                and (best_rejected is None or candidate < best_rejected)
+            ):
+                best_weight = kept_weight
+                best_rejected = candidate
+            return
+        if kept_weight + suffix_weight[index] < best_weight:
+            return
+        disk = sorted_disks[index]
+        compatible = all(
+            _exact_disk_pair_intersects(disk, other) for other in kept
+        ) and all(
+            _exact_triple_common_point((disk, kept[first], kept[second]))
+            for first in range(len(kept))
+            for second in range(first + 1, len(kept))
+        )
+        if compatible:
+            kept.append(disk)
+            search(index + 1, kept_weight + sorted_weights[index])
+            kept.pop()
+        rejected.append(sorted_ids[index])
+        search(index + 1, kept_weight)
+        rejected.pop()
+
+    search(0, 0)
+    assert best_rejected is not None
+    return WeightedConsensus(
+        total_weight=suffix_weight[0],
+        support_weight=best_weight,
+        rejected=best_rejected,
+        accepted=best_weight >= policy.threshold,
+    )
 
 
 def locate_weighted_region(
