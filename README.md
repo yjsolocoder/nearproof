@@ -42,6 +42,7 @@ python3 -m nearproof
 - `Prover(shared_key)` — `respond(challenge) -> bytes`（HMAC-SHA256 应答）；`reveal(challenge, context, opening) -> bytes` 用于上下文绑定轮次（见下）；`bit(t, d, i, b) -> bytes` 用于位挑战轮次（`t` 16 字节、`d` 32 字节、`i` 非布尔 u32、`b` 仅 0/1；见下）
 - `RangeDecision(sample_count, upper_bound, accepted)` — `assess` 的冻结结果：`sample_count` 统计全部输入样本（含离群点），`upper_bound` 为内点最大距离，`accepted` 表示其不超过 limit
 - `NoiseDecision(sample_count, inlier_count, center, mad, coverage, lower_bound, upper_bound, accepted)` — `assess_confidence` 的冻结结果：`sample_count` 统计全部输入样本（含离群点），`inlier_count` 只计中位数/MAD 内点，`center`/`mad` 由全部合法距离计算，`lower_bound`/`upper_bound` 为按 `coverage` 取的内点距离次序统计量，`accepted` 当且仅当 `upper_bound <= limit`
+- `ReliabilityDecision(sample_count, exceedance_count, upper_probability, confidence, accepted)` — `assess_reliability` 的冻结结果：`sample_count` 为全部合法样本数 `n`，`exceedance_count` 为距离严格大于 limit 的次数 `k`（不剔除离群点），`upper_probability` 为指定 `confidence` 的单侧 Clopper-Pearson 超限概率上界，`accepted` 当且仅当 `upper_probability <= max_exceedance`
 - `Verifier(shared_key, *, speed_mps=SPEED_OF_LIGHT_MPS, clock=time.perf_counter, replay_protection=False, challenge_ttl_seconds=None)`
   - `new_challenge(*, context=None, digest=None)` — 默认（均为 `None`）生成 16 字节随机 nonce，行为与旧版一致；成对传入 32 字节 `context`/`digest` 则签发上下文绑定挑战（要求 `replay_protection=True`，只传一个抛 `ValueError`）；配置有效期时按 `clock()` 记录签发时刻
   - `verify(challenge, response, started_at, *, opening=None) -> Measurement` — 校验应答并把往返时间折半换算为距离；`opening=None` 为旧行为，传入 32 字节 `opening` 则走上下文绑定协议（见下）
@@ -57,6 +58,7 @@ python3 -m nearproof
   - `clock` — 只读属性，暴露计时函数
 - `assess(samples, limit, *, key=None, min_samples=5) -> RangeDecision` — 基于一批轮次的稳健距离判定（见下）
 - `assess_confidence(samples, limit, *, key=None, min_samples=5, coverage=0.95) -> NoiseDecision` — 沿用 `assess` 的样本/证据/参数契约与中位数-MAD 内点规则，再对内点距离按覆盖度取双侧次序统计量给出区间估计（见下）
+- `assess_reliability(samples, limit, *, max_exceedance, confidence=0.95, key=None, min_samples=5) -> ReliabilityDecision` — 沿用 `assess` 的样本/证据/参数契约，但不剔除离群点：按全部合法样本数 `n` 与距离严格大于 `limit` 的次数 `k` 给出超限概率的单侧 Clopper-Pearson 上界，据 `max_exceedance` 判定（见下）
 - `AssessEvidence(version, samples, limit, min_samples, sample_count, upper_bound, accepted, mac)` — 把一次 `assess` 判定连同其样本集、阈值、最少样本数与结论冻结的共享密钥签名记录（`version=1`，不含密钥；见下）
   - `to_bytes()` — 无空白 UTF-8 JSON **数组**，字段序 `[1, S, L, M, C, U, A, MAC]`，`S` 为各样本规范 `Evidence` 字节的小写 hex 数组，`MAC` 小写 hex
   - `from_bytes(data)` — 按字段契约解码并重编码逐字节比对，非 bytes 或结构字段错型抛 `TypeError`，其余不合契约（含非规范编码）抛 `ValueError`（不校验 MAC）
@@ -672,6 +674,22 @@ if decision.accepted:
 noise = assess_confidence(measurements, limit=300.0, coverage=0.95)
 if noise.accepted:
     print(noise.inlier_count, noise.lower_bound, noise.upper_bound, noise.mad)
+```
+
+### 全样本超限概率判定 `assess_reliability`
+
+`assess_reliability(samples, limit, *, max_exceedance, confidence=0.95, key=None, min_samples=5)` 沿用 `assess` 的整套样本契约（`Measurement` 或 `Evidence`/规范 bytes、证据先逐份 `audit`、重复 `(round_index, nonce)` 对与坏数值抛 `ValueError`、`limit`/`min_samples` 约束不变、测量输入忽略 `key`、支持一次性可迭代对象），但**不做中位数/MAD 离群点剔除**：以全部合法样本数 `n` 与距离**严格大于** `limit` 的次数 `k` 统计，返回冻结的 `ReliabilityDecision(sample_count, exceedance_count, upper_probability, confidence, accepted)`，前两字段即 `n`、`k`。
+
+- `max_exceedance` 与 `confidence` 都必须是**非 bool 且严格位于 0 与 1 之间的有限数**（`0`、`1`、`True`/`False`、负数、`inf`、`nan`、非数值一律抛 `ValueError`）；`confidence` 缺省 `0.95` 并原样回填。
+- 在独立同分布前提下，`upper_probability` 是指定置信度的**单侧 Clopper-Pearson 上界**：`k == n` 时为 `1.0`，否则为满足 `sum(comb(n,j)*p**j*(1-p)**(n-j), j=0..k) == 1 - confidence` 的唯一 `p`。零超限仍有非零上界；全部超限恒被拒绝。`n <= 10000` 且 `confidence` 为 `0.9`、`0.95`、`0.999` 时上界绝对误差不超过 `1e-10`，且上界始终有限并落在 `[0, 1]` 内。
+- `accepted` 当且仅当 `upper_probability <= max_exceedance`（等号接受）。
+
+结果与输入顺序无关；本入口是纯计算：不读时钟，也不读取或修改任何验证者状态。
+
+```python
+decision = assess_reliability(measurements, limit=300.0, max_exceedance=0.01)
+if decision.accepted:
+    print(decision.sample_count, decision.exceedance_count, decision.upper_probability)
 ```
 
 ### 判定证据封存与复核 `AssessEvidence`、`seal_assess_evidence` 与 `audit_assess_evidence`
