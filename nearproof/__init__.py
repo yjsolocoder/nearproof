@@ -29598,6 +29598,36 @@ def _attested_age_limit(max_age: object) -> "tuple[bool, float]":
     return check_age, age_limit
 
 
+def _attested_skew_limit(max_skew: object) -> "tuple[bool, float]":
+    """Validate ``max_skew``, returning ``(check_skew, skew_limit)``."""
+    check_skew = max_skew is not None
+    skew_limit = 0.0
+    if check_skew:
+        if isinstance(max_skew, bool) or not isinstance(max_skew, (int, float)):
+            raise ValueError("max_skew must be a finite non-negative number")
+        try:
+            skew_limit = float(max_skew)
+        except OverflowError:
+            # An int too large to represent as a finite float.
+            raise ValueError(
+                "max_skew must be a finite non-negative number"
+            ) from None
+        if not math.isfinite(skew_limit) or skew_limit < 0:
+            raise ValueError("max_skew must be a finite non-negative number")
+    return check_skew, skew_limit
+
+
+def _attested_check_skew(issued_ats: "list[float]", skew_limit: float) -> None:
+    """Enforce the batch issuance-span limit over signed ``issued_at`` values.
+
+    The span is the latest minus the earliest signed ``issued_at`` of the
+    whole batch — supporters and non-supporters alike; a span greater than
+    ``skew_limit`` raises :class:`ValueError`.
+    """
+    if issued_ats and max(issued_ats) - min(issued_ats) > skew_limit:
+        raise ValueError("attested observation issued_at span exceeds max_skew")
+
+
 def _attested_now(
     check_age: bool,
     revocations: object,
@@ -29720,7 +29750,7 @@ def _verify_attested_records(
     current: float,
     age_limit: float,
     binding: "Optional[tuple[float, float, str]]",
-) -> "list[Observation]":
+) -> "tuple[list[Observation], list[float]]":
     """Authenticate the observation records of the attested locate flow and
     project them to plain :class:`Observation` values.
 
@@ -29728,7 +29758,8 @@ def _verify_attested_records(
     its MAC and the wording of the type-specific errors. ``binding`` is
     ``None`` for the plain flow and ``(px, py, context)`` for the
     point-bound flow, where the binding is checked only after the MAC
-    verifies.
+    verifies. Returns the projected observations together with each
+    record's signed ``issued_at`` as a float, in input order.
     """
     try:
         raw_observations = list(observations)  # type: ignore[arg-type]
@@ -29738,6 +29769,7 @@ def _verify_attested_records(
         ) from error
 
     verified: list[Observation] = []
+    issued_ats: list[float] = []
     seen_ids: set[str] = set()
     for item in raw_observations:
         if isinstance(item, bytes):
@@ -29785,7 +29817,8 @@ def _verify_attested_records(
         verified.append(
             Observation(id=ident, x=item.x, y=item.y, decision=item.decision)
         )
-    return verified
+        issued_ats.append(float(item.issued_at))
+    return verified, issued_ats
 
 
 def locate_attested(
@@ -29797,6 +29830,7 @@ def locate_attested(
     tolerance: object = 0.0,
     now: object = None,
     max_age: object = None,
+    max_skew: object = None,
     revocations: object = None,
     revocation_list: object = None,
     root: object = None,
@@ -29817,6 +29851,17 @@ def locate_attested(
     every record must satisfy ``0 <= now - issued_at <= max_age``, where
     ``now`` defaults to ``time.time()`` and, when given, must be a finite
     non-bool number; stale or future-dated records raise :class:`ValueError`.
+
+    With ``max_skew=None`` (the default) no issuance-span check is
+    performed. Otherwise ``max_skew`` must be a finite non-bool
+    non-negative number of seconds and, after every record passes the
+    usual validation, the span of the whole batch — the latest signed
+    ``issued_at`` minus the earliest, counting every record whether or not
+    it supports the candidate point — must not exceed ``max_skew``; a
+    wider span raises :class:`ValueError` for the whole call. The check
+    compares only signed timestamps and never reads the clock, and it
+    combines with ``max_age`` and the revocation checks: every enabled
+    constraint must hold.
 
     With ``revocations=None`` (the default) no revocation check is performed
     and the behaviour is exactly as before. Otherwise ``revocations`` must be
@@ -29861,6 +29906,7 @@ def locate_attested(
     """
     key_map = _require_attested_keys(keys)
     check_age, age_limit = _attested_age_limit(max_age)
+    check_skew, skew_limit = _attested_skew_limit(max_skew)
     if revocation_list is not None:
         # A snapshot is authenticated under the root key and an explicit
         # caller-supplied now; the clock is never read for it.
@@ -29869,7 +29915,7 @@ def locate_attested(
     revoked_at_by_id = _attested_revoked_at_by_id(
         revocations, revocation_list, key_map, root, current, min
     )
-    verified = _verify_attested_records(
+    verified, issued_ats = _verify_attested_records(
         observations,
         AttestedObservation,
         _attested_record_mac,
@@ -29881,6 +29927,8 @@ def locate_attested(
         age_limit,
         None,
     )
+    if check_skew:
+        _attested_check_skew(issued_ats, skew_limit)
 
     return locate(verified, point, quorum=quorum, tolerance=tolerance)
 
@@ -29895,6 +29943,7 @@ def locate_bound_attested(
     tolerance: object = 0.0,
     now: object = None,
     max_age: object = None,
+    max_skew: object = None,
     revocations: object = None,
     revocation_list: object = None,
     root: object = None,
@@ -29906,13 +29955,13 @@ def locate_bound_attested(
     ``observations`` is an iterable of :class:`BoundAttestedObservation`
     instances and/or their :meth:`BoundAttestedObservation.to_bytes`
     encodings (mixing is allowed). ``keys``, ``now``, ``max_age``,
-    ``revocations``, ``revocation_list``, ``root`` and ``min`` follow the
-    exact same rules as in :func:`locate_attested`: each record's MAC is
-    recomputed with ``keys[id]`` and compared in constant time, and
-    freshness/revocation checks are identical — including the signed
-    :class:`ObservationRevocationList` snapshot form, which requires
-    non-empty ``root`` bytes and an explicit finite ``now`` and is
-    authenticated wholesale with :func:`audit_observation_crl`.
+    ``max_skew``, ``revocations``, ``revocation_list``, ``root`` and
+    ``min`` follow the exact same rules as in :func:`locate_attested`:
+    each record's MAC is recomputed with ``keys[id]`` and compared in
+    constant time, freshness/span/revocation checks are identical —
+    including the signed :class:`ObservationRevocationList` snapshot form,
+    which requires non-empty ``root`` bytes and an explicit finite ``now``
+    and is authenticated wholesale with :func:`audit_observation_crl`.
 
     In addition, after its MAC verifies, every record must be bound to the
     query: its ``point`` must equal ``point`` coordinate by coordinate and
@@ -29931,6 +29980,7 @@ def locate_bound_attested(
     """
     key_map = _require_attested_keys(keys)
     check_age, age_limit = _attested_age_limit(max_age)
+    check_skew, skew_limit = _attested_skew_limit(max_skew)
     if revocation_list is not None:
         # A snapshot is authenticated under the root key and an explicit
         # caller-supplied now; the clock is never read for it.
@@ -29949,7 +29999,7 @@ def locate_bound_attested(
     revoked_at_by_id = _attested_revoked_at_by_id(
         revocations, revocation_list, key_map, root, current, min
     )
-    verified = _verify_attested_records(
+    verified, issued_ats = _verify_attested_records(
         observations,
         BoundAttestedObservation,
         _bound_attested_record_mac,
@@ -29961,6 +30011,8 @@ def locate_bound_attested(
         age_limit,
         (px, py, context),
     )
+    if check_skew:
+        _attested_check_skew(issued_ats, skew_limit)
 
     return locate(verified, point, quorum=quorum, tolerance=tolerance)
 
