@@ -189,6 +189,7 @@ __all__ = [
     "RangeReceiptBatch",
     "ReceiptStream",
     "RegionDecision",
+    "ReliabilityDecision",
     "SPEED_OF_LIGHT_MPS",
     "SpanBundleReceipt",
     "SpanBundleReceiptAuditor",
@@ -231,6 +232,7 @@ __all__ = [
     "WeightedCrlProofAuditor",
     "assess",
     "assess_confidence",
+    "assess_reliability",
     "attest_observation",
     "attest_observation_for_point",
     "audit",
@@ -614,6 +616,25 @@ class NoiseDecision:
     coverage: float
     lower_bound: float
     upper_bound: float
+    accepted: bool
+
+
+@dataclass(frozen=True)
+class ReliabilityDecision:
+    """The result of :func:`assess_reliability` over a batch of rounds.
+
+    ``sample_count`` counts every valid input sample and
+    ``exceedance_count`` how many of their distances are strictly greater
+    than the configured limit — no outlier removal is applied.
+    ``upper_probability`` is the one-sided Clopper-Pearson upper bound on
+    the true exceedance probability at the requested ``confidence``, and
+    ``accepted`` says whether that bound is at most ``max_exceedance``.
+    """
+
+    sample_count: int
+    exceedance_count: int
+    upper_probability: float
+    confidence: float
     accepted: bool
 
 
@@ -21201,6 +21222,117 @@ def _assess_confidence_measurements(
         lower_bound=lower_bound,
         upper_bound=upper_bound,
         accepted=upper_bound <= bound,
+    )
+
+
+def _check_unit_interval(value: object, name: str) -> float:
+    """Validate a non-bool finite number strictly between ``0`` and ``1``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"{name} must be a finite number strictly between 0 and 1"
+        )
+    number = float(value)
+    if not math.isfinite(number) or not 0.0 < number < 1.0:
+        raise ValueError(
+            f"{name} must be a finite number strictly between 0 and 1"
+        )
+    return number
+
+
+def _binomial_upper_bound(n: int, k: int, confidence: float) -> float:
+    """One-sided Clopper-Pearson upper bound for ``k`` successes in ``n``.
+
+    Returns ``1.0`` when ``k == n``; otherwise the unique ``p`` in
+    ``(0, 1)`` satisfying
+    ``sum(comb(n, j) * p**j * (1 - p)**(n - j), j=0..k) == 1 - confidence``.
+    The binomial sum is evaluated in log space (via ``lgamma`` and
+    ``fsum``) so it stays finite and accurate for any ``n``, and the root
+    is bracketed by bisection, so the result always lies in ``[0, 1]``.
+    """
+    if k >= n:
+        return 1.0
+    alpha = 1.0 - confidence
+    log_coeffs = [
+        math.lgamma(n + 1) - math.lgamma(j + 1) - math.lgamma(n - j + 1)
+        for j in range(k + 1)
+    ]
+
+    def cdf(p: float) -> float:
+        log_p = math.log(p)
+        log_q = math.log1p(-p)
+        return math.fsum(
+            math.exp(log_coeffs[j] + j * log_p + (n - j) * log_q)
+            for j in range(k + 1)
+        )
+
+    # The cdf is strictly decreasing in p on (0, 1) and spans (0, 1), so
+    # the root is unique; 64 halvings pin it well below 1e-10.
+    low, high = 0.0, 1.0
+    for _ in range(64):
+        mid = (low + high) / 2.0
+        if cdf(mid) > alpha:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
+def assess_reliability(
+    samples: object,
+    limit: object,
+    *,
+    max_exceedance: object,
+    confidence: object = 0.95,
+    key: object = None,
+    min_samples: object = 5,
+) -> "ReliabilityDecision":
+    """Decide whether the exceedance rate over ``limit`` is bounded.
+
+    Samples and parameters follow the :func:`assess` contract exactly:
+    ``samples`` must be all :class:`Measurement` or all
+    :class:`Evidence`/canonical bytes (mixed families or other types raise
+    :class:`ValueError`); evidence samples need a non-empty ``key`` and
+    every record is verified with :func:`audit` before anything else;
+    duplicate ``(round_index, nonce)`` pairs and bool, non-numeric,
+    negative or non-finite elapsed times/distances raise
+    :class:`ValueError`, as do fewer than ``min_samples`` samples in
+    total. ``limit`` must be a non-bool, finite, non-negative number and
+    ``min_samples`` a non-bool positive integer; ``max_exceedance`` and
+    ``confidence`` must be non-bool finite numbers strictly between ``0``
+    and ``1``.
+
+    Unlike :func:`assess`, no outlier removal is applied: ``n`` is the
+    total number of valid samples and ``k`` the count whose distance is
+    strictly greater than ``limit``. Under i.i.d. sampling,
+    ``upper_probability`` is the one-sided Clopper-Pearson upper bound at
+    level ``confidence`` — ``1.0`` when ``k == n``, otherwise the unique
+    ``p`` with ``sum(comb(n, j) * p**j * (1 - p)**(n - j), j=0..k)`` equal
+    to ``1 - confidence``. The bound is always finite and in ``[0, 1]``;
+    zero exceedances still yield a non-zero bound, and ``k == n`` is
+    always rejected. ``accepted`` is ``True`` exactly when
+    ``upper_probability <= max_exceedance`` (equality accepts).
+
+    The result does not depend on input order and no clock is read and no
+    verifier state is read or mutated.
+    """
+    bound, minimum = _check_assess_params(limit, min_samples)
+    ceiling = _check_unit_interval(max_exceedance, "max_exceedance")
+    level = _check_unit_interval(confidence, "confidence")
+
+    measurements = _coerce_assess_samples(samples, key)
+    if len(measurements) < minimum:
+        raise ValueError(f"need at least {minimum} samples, got {len(measurements)}")
+
+    distances = _assess_distances(measurements)
+    count = len(distances)
+    exceedances = sum(1 for distance in distances if distance > bound)
+    upper = _binomial_upper_bound(count, exceedances, level)
+    return ReliabilityDecision(
+        sample_count=count,
+        exceedance_count=exceedances,
+        upper_probability=upper,
+        confidence=level,
+        accepted=upper <= ceiling,
     )
 
 
