@@ -32,7 +32,7 @@ ObservationRevocationList / ObservationRevocationListAuditor /
 ObservationRevocationListState / Prover / RangeAuditor /
 RangeBatchReceipt /
 RangeDecision / RangeFrontier / RangeReceipt / RangeReceiptBatch /
-ReceiptStream / ReliabilityEvidence / SPEED_OF_LIGHT_MPS / SpanBundleReceipt /
+ReceiptStream / ReliabilityEvidence / RegionConflict / SPEED_OF_LIGHT_MPS / SpanBundleReceipt /
 SpanBundleReceiptAuditor / SpanBundleReceiptBatch /
 SpanBundleReceiptBatchReceipt /
 SpanBundleReceiptBatchReceiptAuditor /
@@ -84,7 +84,7 @@ audit_stream_commit_receipt_bundle /
 audit_stream_commit_receipt_span /
 audit_stream_commit_receipt_span_receipt /
 audit_stream_receipt / audit_stream_receipt_batch_commit_receipt /
-cert / locate /
+cert / diagnose_region / locate /
 locate_attested / locate_bound_attested / locate_cert /
 locate_cert_evidence / locate_weighted / make_crl / make_evidence_revocation_list / prove_crl / revoke_bound /
 revoke_context / revoke_evidence / revoke_observation / revoke_trust / seal_assess_evidence /
@@ -193,6 +193,7 @@ __all__ = [
     "ReliabilityDecision",
     "ReliabilityEvidence",
     "RegionDecision",
+    "RegionConflict",
     "SPEED_OF_LIGHT_MPS",
     "SpanBundleReceipt",
     "SpanBundleReceiptAuditor",
@@ -289,6 +290,7 @@ __all__ = [
     "audit_weighted_cert_evidence_policy",
     "audit_weighted_crl_proof",
     "cert",
+    "diagnose_region",
     "locate",
     "locate_attested",
     "locate_bound_attested",
@@ -771,6 +773,25 @@ class RegionDecision:
     feasible: bool
     bounds: "tuple[float, float, float, float] | None"
     witness: "tuple[float, float] | None"
+
+
+@dataclass(frozen=True)
+class RegionConflict:
+    """The outcome of :func:`diagnose_region` over a set of :class:`Observation`.
+
+    ``feasible`` says whether the closed disks contributed by the
+    observations share at least one common point. When they do,
+    ``conflict`` is the empty tuple; otherwise it is a
+    minimum-cardinality tuple of observation ids whose disks alone
+    already have no common point — two ids when some pair of disks is
+    disjoint, three ids when every pair meets but the whole family does
+    not. The ids are sorted lexicographically and, among equally small
+    conflicts, the lexicographically smallest tuple is reported, so the
+    result is independent of input order.
+    """
+
+    feasible: bool
+    conflict: tuple[str, ...]
 
 
 _EVIDENCE_FIELDS = (
@@ -27999,6 +28020,166 @@ def locate_region(
         bounds=(min_x, min_y, max_x, max_y),
         witness=(wx, wy),
     )
+
+
+def diagnose_region(
+    observations: object,
+    *,
+    tolerance: object = 0.0,
+) -> "RegionConflict":
+    """Diagnose which observations' disks cannot all hold at once.
+
+    Each :class:`Observation` contributes the closed disk centered at
+    ``(x, y)`` with radius ``decision.upper_bound + tolerance`` (boundary
+    points count as covered) and the decision's ``accepted`` flag is
+    ignored, exactly as in :func:`locate_region` — but no candidate point
+    is queried. When all disks share at least one common point the result
+    is ``RegionConflict(feasible=True, conflict=())``. Otherwise
+    ``feasible`` is ``False`` and ``conflict`` is a minimum-cardinality
+    tuple of observation ids whose disks alone already have no common
+    point: two ids when some pair of disks is disjoint, three ids when
+    every pair meets but the whole family does not (by Helly's theorem a
+    larger minimum cannot occur for disks in the plane). Among equally
+    small conflicts the ids within each are sorted lexicographically and
+    the lexicographically smallest tuple is reported, so the result is
+    independent of input order and a returned conflict subset can be fed
+    back into this entry point to reproduce the verdict. A geometric
+    contradiction is reported through the result, never as an exception.
+
+    Tangency, coincidence, containment and zero-radius disks are all
+    judged as closed sets — a single shared boundary point is feasible —
+    and ``tolerance`` only enlarges the disks; no additional slack is
+    added that would report a genuine gap as an intersection. Finite
+    inputs are judged by the values they represent: the geometry is
+    computed on a power-of-two-scaled copy of the disks (exactly as in
+    :func:`locate_weighted_region`), so huge or tiny finite scales cannot
+    cause a spurious conflict through intermediate overflow or
+    underflow.
+
+    ``observations`` must be a non-empty iterable (a one-shot iterator is
+    fine) of :class:`Observation` with unique non-empty string ids,
+    finite non-bool ``x``/``y`` coordinates and a :class:`RangeDecision`
+    whose ``upper_bound`` is finite and non-negative; ``tolerance`` must
+    be a finite non-bool non-negative number. Every contract violation
+    raises :class:`ValueError`, and every observation is validated before
+    any geometry is examined, so an invalid element is rejected even when
+    earlier observations already conflict.
+
+    The function does not mutate its inputs, reads no clock and keeps no
+    state between calls.
+    """
+    slack = _slack_from_tolerance(tolerance)
+
+    raw_observations = _materialize_observations(observations)
+
+    if not raw_observations:
+        raise ValueError("need at least 1 observation, got 0")
+
+    ids: list[str] = []
+    disks: list[tuple[float, float, float]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        ids.append(ident)
+        disks.append((ox, oy, bound))
+
+    # The geometry is computed on a power-of-two-scaled copy of the disks
+    # so no intermediate (radius sums, squared distances, circle-meeting
+    # formulas) can overflow or underflow for huge or tiny finite inputs.
+    # Scaling by a power of two is exact, so the scaled disks meet
+    # precisely when the original ones do.
+    raw_scale = slack
+    for ox, oy, bound in disks:
+        raw_scale = max(raw_scale, abs(ox), abs(oy), bound)
+    shift = 0
+    if raw_scale > 0.0:
+        exponent = math.frexp(raw_scale)[1]
+        if exponent > 500:
+            shift = exponent - 500
+        elif exponent < -500:
+            shift = exponent + 500
+
+    scaled = [
+        (
+            math.ldexp(ox, -shift),
+            math.ldexp(oy, -shift),
+            math.ldexp(bound, -shift) + math.ldexp(slack, -shift),
+        )
+        for ox, oy, bound in disks
+    ]
+
+    def pair_meets(first: int, second: int) -> bool:
+        ax, ay, ar = scaled[first]
+        bx, by, br = scaled[second]
+        return math.hypot(ax - bx, ay - by) <= ar + br
+
+    def triple_meets(first: int, second: int, third: int) -> bool:
+        # Three disks share a point exactly when one of them is contained
+        # in the other two (its center is then a common point) or a point
+        # where two circle boundaries meet lies in the third disk. Both
+        # checks are exact closed-set comparisons — no slack beyond
+        # ``tolerance`` itself.
+        for inner, outer_a, outer_b in (
+            (first, second, third),
+            (second, first, third),
+            (third, first, second),
+        ):
+            ix, iy, ir = scaled[inner]
+            if all(
+                math.hypot(ix - ox, iy - oy) + ir <= outer_radius
+                for ox, oy, outer_radius in (scaled[outer_a], scaled[outer_b])
+            ):
+                return True
+        for pair, other in (
+            ((first, second), third),
+            ((first, third), second),
+            ((second, third), first),
+        ):
+            ox, oy, outer_radius = scaled[other]
+            for px, py in _circle_boundary_intersections(
+                scaled[pair[0]], scaled[pair[1]], 0.0
+            ):
+                if math.hypot(px - ox, py - oy) <= outer_radius:
+                    return True
+        return False
+
+    count = len(ids)
+
+    # By Helly's theorem a family of disks with no common point always
+    # contains a subfamily of at most three disks that already has no
+    # common point, so the minimum-cardinality conflict is a disjoint
+    # pair when one exists and an infeasible triple otherwise.
+    conflicts: list[tuple[str, ...]] = []
+    for first in range(count):
+        for second in range(first + 1, count):
+            if not pair_meets(first, second):
+                conflicts.append(tuple(sorted((ids[first], ids[second]))))
+    if not conflicts and count >= 3:
+        for first in range(count):
+            for second in range(first + 1, count):
+                for third in range(second + 1, count):
+                    if not triple_meets(first, second, third):
+                        conflicts.append(
+                            tuple(sorted((ids[first], ids[second], ids[third])))
+                        )
+    if conflicts:
+        return RegionConflict(feasible=False, conflict=min(conflicts))
+    return RegionConflict(feasible=True, conflict=())
 
 
 def locate_weighted_region(
