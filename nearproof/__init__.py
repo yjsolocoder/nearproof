@@ -236,6 +236,7 @@ __all__ = [
     "WeightedCrlProof",
     "WeightedCrlProofAuditor",
     "assess",
+    "assess_attested_geofence",
     "assess_confidence",
     "assess_geofence",
     "assess_reliability",
@@ -29221,6 +29222,115 @@ def assess_geofence(
     if has_inside:
         return "mixed" if has_outside else "inside"
     return "outside" if has_outside else "empty"
+
+
+def assess_attested_geofence(
+    observations: object,
+    policy: object,
+    bounds: object,
+    keys: object,
+    *,
+    tolerance: object = 0.0,
+    now: object = None,
+    max_age: object = None,
+    max_skew: object = None,
+    revocations: object = None,
+    revocation_list: object = None,
+    root: object = None,
+    min: object = 0,
+) -> str:
+    """Like :func:`assess_geofence`, but over MAC'd
+    :class:`AttestedObservation` records.
+
+    ``observations`` is a one-shot-consumable iterable of
+    :class:`AttestedObservation` instances and/or their
+    :meth:`AttestedObservation.to_bytes` encodings (mixing is allowed; a
+    single observation is fine). ``keys`` follows the exact same rules as
+    in :func:`locate_attested`: a non-empty mapping of observation id to
+    that verifier's non-empty key bytes, and every record's MAC is
+    recomputed with ``keys[id]`` and compared in constant time. An id
+    missing from ``keys``, an unknown or duplicated observation id, a
+    wrong key, any tampering, a non-canonical encoding, or an item that
+    is neither an attested observation nor its canonical bytes raises
+    :class:`ValueError`.
+
+    ``policy`` must be a :class:`ConsensusPolicy` whose weight ids match
+    the authenticated observation ids exactly (a mismatch raises
+    :class:`ValueError`); unlike the count-based entries a single
+    verifier is allowed — the policy weights bound the batch instead of a
+    minimum count. ``bounds`` must be a tuple of exactly four finite
+    non-bool numbers ``(min_x, min_y, max_x, max_y)`` with
+    ``min_x <= max_x`` and ``min_y <= max_y``; degenerate fences (a line
+    segment or a single point) are allowed. ``tolerance`` follows the
+    :func:`assess_geofence` rule: a finite non-bool non-negative number
+    that only enlarges the measuring disks and never blurs the fence
+    boundary; an illegal tolerance raises :class:`ValueError`. The
+    decision's ``accepted`` flag is ignored.
+
+    Every observation and every supplied revocation record is
+    authenticated under the exact :func:`locate_attested` rules before
+    any geometry runs — invalid or stale records are never dropped and
+    re-tallied, and trailing material is checked even when the geometric
+    outcome is already decided. The freshness (``now``/``max_age``) rules
+    are identical, including the closed interval
+    ``0 <= now - issued_at <= max_age`` and the single clock reading. The
+    ``max_skew`` batch time-span check is identical as well: it is
+    computed over every record of the batch, uses only the signed
+    timestamps (the clock is never read for this check, so a call that
+    enables only the span check reads no clock), and an over-limit batch
+    raises :class:`ValueError`.
+
+    The ``revocations`` iterable and the ``revocation_list`` snapshot
+    follow the exact same rules as in :func:`locate_attested`: per-call
+    revocations are MAC'd with ``keys[id]`` and may not be future-dated,
+    duplicated or unknown; when both sources name the same id the
+    observation must be issued strictly after the latest ``revoked_at``
+    of the two. A snapshot requires non-empty ``root`` bytes (a
+    non-bytes value raises :class:`TypeError`, an empty value
+    :class:`ValueError`) and an explicit finite non-bool ``now`` (the
+    clock is never read for it) and is authenticated wholesale with
+    :func:`audit_observation_crl`; expired or future-dated records, a
+    revocation hit, or a snapshot authentication or sequence failure
+    raises :class:`ValueError`.
+
+    The authenticated records are projected to plain :class:`Observation`
+    values and fed to :func:`assess_geofence` with the same ``policy``,
+    ``bounds`` and ``tolerance``; its classification string is returned
+    unchanged: ``"empty"`` when no point reaches the weight threshold,
+    ``"inside"`` when the feasible set is non-empty and lies entirely in
+    the closed fence, ``"outside"`` when it shares no point with the
+    fence, and ``"mixed"`` when feasible points exist both inside and
+    outside. The result is independent of input order and of objects
+    versus their canonical bytes, and neither the inputs nor any verifier
+    state are mutated.
+    """
+    key_map = _require_attested_keys(keys)
+    check_age, age_limit = _attested_age_limit(max_age)
+    check_skew, skew_limit = _attested_skew_limit(max_skew)
+    if revocation_list is not None:
+        # A snapshot is authenticated under the root key and an explicit
+        # caller-supplied now; the clock is never read for it.
+        root = _require_root(root)
+    current = _attested_now(check_age, revocations, revocation_list, now)
+    revoked_at_by_id = _attested_revoked_at_by_id(
+        revocations, revocation_list, key_map, root, current, min
+    )
+    verified = _verify_attested_records(
+        observations,
+        AttestedObservation,
+        _attested_record_mac,
+        "attested observation",
+        key_map,
+        revoked_at_by_id,
+        check_age,
+        current,
+        age_limit,
+        None,
+        check_skew,
+        skew_limit,
+    )
+
+    return assess_geofence(verified, policy, bounds, tolerance=tolerance)
 
 
 _ATTESTED_FIELDS = (
