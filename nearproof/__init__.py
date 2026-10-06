@@ -59,7 +59,7 @@ TrustRevocationList / Verifier /
 VerifierTrust / WeightedConsensus / assess / attest_observation /
 attest_observation_for_point / audit / audit_assess_evidence / audit_assess_evidence_policy /
 audit_b / audit_bound /
-audit_bound_policy / audit_bound_series /
+audit_bound_policy / audit_bound_series / audit_bound_series_policy /
 audit_cert_evidence / audit_cert_evidence_policy / audit_confidence /
 audit_confidence_policy / audit_crl / audit_delay_bound /
 audit_evidence_revocation_list /
@@ -249,6 +249,7 @@ __all__ = [
     "audit_bound",
     "audit_bound_policy",
     "audit_bound_series",
+    "audit_bound_series_policy",
     "audit_bundle_receipt",
     "audit_cert_evidence",
     "audit_cert_evidence_policy",
@@ -23491,6 +23492,183 @@ def audit_bound_series(x: object, key: object) -> "RangeDecision":
             "bound series evidence accepted does not match the recomputed"
             " decision"
         )
+    return decision
+
+
+def audit_bound_series_policy(
+    x: object,
+    key: object,
+    *,
+    now: object = None,
+    max_age: object = None,
+    revocations: object = None,
+) -> "RangeDecision":
+    """Re-verify a :class:`BoundSeriesEvidence` and enforce an optional
+    freshness and revocation policy.
+
+    ``x`` may be the record itself or its canonical
+    :meth:`BoundSeriesEvidence.to_bytes` encoding. The cryptographic,
+    canonical-encoding, chain, ordering and robust-decision checks are
+    exactly those of :func:`audit_bound_series`, which runs first; every
+    check it performs (and its :class:`TypeError`/:class:`ValueError`
+    split) applies unchanged and surfaces before any policy check.
+
+    With ``max_age=None`` and ``revocations=None`` (both the default) no
+    policy is enforced: the call is item-for-item the existing
+    :func:`audit_bound_series` review, returns the same
+    :class:`RangeDecision` and never reads a clock — ``now`` is ignored.
+
+    With ``max_age`` set it must be a non-bool finite non-negative number
+    and ``now`` is required — a non-bool finite number; omitting it or
+    violating either contract raises :class:`ValueError`. Freshness is
+    enforced per round over every carried sample — including rounds the
+    robust statistics discarded as outliers: each sample's nested
+    ``evidence.end`` must satisfy the closed interval
+    ``0 <= now - end <= max_age``, equality at either boundary staying
+    valid. A single future-dated or over-age round rejects the whole
+    series with :class:`ValueError`; checking only the last round is not
+    sufficient.
+
+    With ``revocations`` set it must be an iterable (a one-shot iterable
+    is fine) of :class:`BoundEvidenceRevocation` and/or
+    :class:`ContextRevocation` instances and/or their canonical
+    :meth:`to_bytes` encodings (mixing is allowed); a single revocation
+    object or bare bytes passed directly, a non-iterable, an item of any
+    other kind or bytes that do not parse canonically all raise
+    :class:`ValueError`. The empty iterable is valid and checks nothing.
+    Every entry — relevant or not — is parsed, its MAC recomputed under
+    the same ``key`` and compared in constant time, and its
+    ``revoked_at`` must not be later than ``now`` (so ``now`` is required
+    exactly as under ``max_age``); a parse failure, a wrong key, any
+    tampering or a future-dated entry raises :class:`ValueError`. Two
+    bound-evidence revocations carrying the same ``(round_index, nonce)``
+    pair, or two context revocations carrying the same ``context``, are
+    likewise rejected. A bound-evidence revocation matches each carried
+    sample whose nested ``(round_index, nonce)`` it names; a context
+    revocation matches every carried sample when its ``context`` equals
+    the series context. Any matching revocation whose ``revoked_at`` is
+    not earlier than the matched sample's completion time (``end <=
+    revoked_at``) rejects the whole series with :class:`ValueError` —
+    the sample is never dropped and the statistics never rerun — while a
+    sample completed strictly after its revocation survives, and entries
+    matching no carried sample are ignored beyond the checks above.
+
+    Only when the baseline review and every enabled policy check pass is
+    the :class:`RangeDecision` returned — with ``accepted=False`` when
+    the robust statistics themselves rejected the series. Like
+    :func:`audit_bound_series` this is a pure check: it reads no clock,
+    mutates no evidence or verifier state and persists nothing.
+    """
+    decision = audit_bound_series(x, key)
+    if max_age is None and revocations is None:
+        # No policy at all: `now` is ignored entirely and no clock read.
+        return decision
+    check_age = max_age is not None
+    age_limit = 0.0
+    if check_age:
+        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+            raise ValueError("max_age must be a finite non-negative number")
+        age_limit = float(max_age)
+        if not math.isfinite(age_limit) or age_limit < 0:
+            raise ValueError("max_age must be a finite non-negative number")
+    if now is None:
+        raise ValueError("now is required when max_age or revocations are set")
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValueError("now must be a finite number")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be a finite number")
+    record = _coerce_bound_series(x, "x")
+    # The baseline review above already proved each carried sample is the
+    # canonical BoundEvidence encoding, so every parse here succeeds.
+    bounds = [BoundEvidence.from_bytes(blob) for blob in record.samples]
+    if revocations is not None:
+        if isinstance(
+            revocations, (BoundEvidenceRevocation, ContextRevocation, bytes)
+        ):
+            raise ValueError(
+                "revocations must be an iterable of BoundEvidenceRevocation"
+                " or ContextRevocation instances or their canonical bytes"
+            )
+        try:
+            raw_revocations = list(revocations)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise ValueError(
+                "revocations must be an iterable of BoundEvidenceRevocation"
+                " or ContextRevocation instances or their canonical bytes"
+            ) from error
+        targets = {
+            (bound.evidence.round_index, bound.evidence.nonce): bound
+            for bound in bounds
+        }
+        contexts = {bound.context for bound in bounds}
+        seen: set[tuple] = set()
+        for entry in raw_revocations:
+            if isinstance(entry, bytes):
+                try:
+                    entry = _decode_revocation_entry(entry)
+                except ValueError as error:
+                    raise ValueError(
+                        "revocations bytes must be the canonical"
+                        " BoundEvidenceRevocation or ContextRevocation"
+                        " encoding"
+                    ) from error
+            if isinstance(entry, BoundEvidenceRevocation):
+                identity = ("round", entry.round_index, entry.nonce)
+                expected = _bound_revocation_mac(
+                    key, _bound_revocation_payload(entry)  # type: ignore[arg-type]
+                )
+                duplicate = (
+                    "revocations contain a duplicate (round_index, nonce) pair"
+                )
+                kind = "bound evidence revocation"
+                target = targets.get((entry.round_index, entry.nonce))
+                hit_ends = (
+                    () if target is None else (target.evidence.end,)
+                )
+            elif isinstance(entry, ContextRevocation):
+                identity = ("context", entry.context)
+                expected = _context_revocation_mac(
+                    key, _context_revocation_payload(entry)  # type: ignore[arg-type]
+                )
+                duplicate = "revocations contain a duplicate context"
+                kind = "context revocation"
+                # A context hit matches every carried sample, since the
+                # baseline review proved they all share one context.
+                hit_ends = (
+                    tuple(bound.evidence.end for bound in bounds)
+                    if entry.context in contexts
+                    else ()
+                )
+            else:
+                raise ValueError(
+                    "revocations must contain only BoundEvidenceRevocation"
+                    " or ContextRevocation instances or their canonical bytes"
+                )
+            if identity in seen:
+                raise ValueError(duplicate)
+            seen.add(identity)
+            if not hmac.compare_digest(expected, entry.mac):
+                raise ValueError(f"{kind} mac does not match")
+            revoked_at = float(entry.revoked_at)
+            if revoked_at > current:
+                raise ValueError(f"{kind} is dated in the future")
+            # A hit voids the whole series; the sample is never dropped
+            # and the statistics are never rerun without it.
+            if any(end <= revoked_at for end in hit_ends):
+                raise ValueError(
+                    "bound series carries a sample completed no later than"
+                    " its revocation"
+                )
+    if check_age:
+        # Every carried round counts, outliers included: one future-dated
+        # or over-age sample rejects the whole series.
+        for bound in bounds:
+            age = current - bound.evidence.end
+            if not 0.0 <= age <= age_limit:
+                raise ValueError(
+                    "bound series evidence is outside the allowed age"
+                )
     return decision
 
 
