@@ -237,6 +237,7 @@ __all__ = [
     "WeightedCrlProofAuditor",
     "assess",
     "assess_confidence",
+    "assess_geofence",
     "assess_reliability",
     "attest_observation",
     "attest_observation_for_point",
@@ -28607,6 +28608,236 @@ def locate_weighted_region(
         bounds=(unscale(min_x), unscale(min_y), unscale(max_x), unscale(max_y)),
         witness=(unscale(wx), unscale(wy)),
     )
+
+
+def _exact_frame_point_in_rect(
+    frame: tuple[Fraction, Fraction, Fraction, Fraction, Fraction, int],
+    rect: tuple[Fraction, Fraction, Fraction, Fraction],
+) -> bool:
+    """Whether the parametrized point lies in the closed rectangle.
+
+    The point is ``(mx, my) + sign * sqrt(radicand) * (qx, qy)`` on exact
+    rationals and ``rect`` is ``(min_x, min_y, max_x, max_y)``; each of the
+    four comparisons is decided exactly by
+    :func:`_exact_sqrt_combo_nonpositive`, so boundary points count as
+    inside without any slack.
+    """
+    mx, my, qx, qy, radicand, sign = frame
+    min_x, min_y, max_x, max_y = rect
+    coeff_x = sign * qx
+    coeff_y = sign * qy
+    return (
+        _exact_sqrt_combo_nonpositive(min_x - mx, -coeff_x, radicand)
+        and _exact_sqrt_combo_nonpositive(mx - max_x, coeff_x, radicand)
+        and _exact_sqrt_combo_nonpositive(min_y - my, -coeff_y, radicand)
+        and _exact_sqrt_combo_nonpositive(my - max_y, coeff_y, radicand)
+    )
+
+
+def _exact_frame_point_cover_weight(
+    frame: tuple[Fraction, Fraction, Fraction, Fraction, Fraction, int],
+    disks: list[tuple[Fraction, Fraction, Fraction]],
+    disk_weights: list[int],
+) -> int:
+    """The summed weight of the closed disks covering the parametrized point.
+
+    The point is ``(mx, my) + sign * sqrt(radicand) * (qx, qy)`` on exact
+    rationals; each containment test is decided through one exact squaring
+    step (the root is never evaluated), exactly as in
+    :func:`reconcile_region`.
+    """
+    mx, my, qx, qy, radicand, sign = frame
+    q2 = qx * qx + qy * qy
+    total = 0
+    for (ox, oy, radius), weight in zip(disks, disk_weights):
+        ux = mx - ox
+        uy = my - oy
+        base = ux * ux + uy * uy + radicand * q2 - radius * radius
+        coeff = 2 * sign * (ux * qx + uy * qy)
+        if _exact_sqrt_combo_nonpositive(base, coeff, radicand):
+            total += weight
+    return total
+
+
+def assess_geofence(
+    observations: object,
+    policy: object,
+    bounds: object,
+    *,
+    tolerance: object = 0.0,
+) -> str:
+    """Classify the weighted feasible region against a rectangular fence.
+
+    Like :func:`locate_weighted`, each :class:`Observation` contributes the
+    closed disk centered at ``(x, y)`` with radius
+    ``decision.upper_bound + tolerance`` (boundary points count as covered
+    and the decision's ``accepted`` flag and ``sample_count`` are ignored),
+    and each observation carries the positive integer weight that ``policy``
+    declares for its id. The feasible set is the set of points whose summed
+    covering weight reaches ``policy.threshold`` — no candidate point is
+    required from the caller. ``bounds`` is the closed axis-aligned
+    rectangle ``(min_x, min_y, max_x, max_y)``; it may degenerate to a line
+    segment or a single point. The whole feasible set is classified against
+    the fence — never a single candidate point, and never the region's
+    bounding box, whose gaps are not feasible positions. The result is the
+    string ``"empty"`` when no point reaches the threshold, ``"inside"``
+    when the feasible set is non-empty and lies entirely in the fence,
+    ``"outside"`` when it is non-empty and shares no point with the fence,
+    and ``"mixed"`` when feasible points exist both inside and outside.
+    The fence includes its boundary, so a feasible point exactly on the
+    rectangle edge counts as inside and the exterior is the strict
+    complement: two separated feasible regions with the fence falling in
+    the gap between them report ``"outside"``, while one region inside the
+    fence and another outside report ``"mixed"``.
+
+    ``observations`` must be a non-empty iterable (a one-shot iterator is
+    fine, and one or two observations are allowed) of :class:`Observation`
+    with unique non-empty string ids, finite non-bool ``x``/``y``
+    coordinates and a :class:`RangeDecision` whose ``upper_bound`` is
+    finite and non-negative; ``policy`` must be a :class:`ConsensusPolicy`
+    whose weight ids match the observation ids exactly; ``bounds`` must be
+    a tuple of exactly four finite non-bool numbers with
+    ``min_x <= max_x`` and ``min_y <= max_y``; ``tolerance`` must be a
+    finite non-bool non-negative number. Every contract violation raises
+    :class:`ValueError`, and every input is fully validated before any
+    geometry is computed, so an invalid trailing observation is rejected
+    even when the earlier observations already determine the
+    classification.
+
+    The classification is computed with exact rational arithmetic on the
+    represented values (circle meeting points are compared through one
+    exact squaring step, never evaluated), so ``tolerance`` only enlarges
+    the disks — it never blurs the fence boundary — and huge or tiny
+    finite inputs cannot be misclassified through intermediate overflow or
+    underflow. The result is independent of input order (of both the
+    observations and the weight mapping), the function does not mutate its
+    inputs, reads no clock and keeps no state.
+    """
+    slack = _slack_from_tolerance(tolerance)
+
+    if not isinstance(policy, ConsensusPolicy):
+        raise ValueError("policy must be a ConsensusPolicy")
+
+    raw_observations = _materialize_observations(observations)
+
+    if not raw_observations:
+        raise ValueError("need at least 1 observation, got 0")
+
+    exact_slack = Fraction(slack)
+    ids: list[str] = []
+    disks: list[tuple[Fraction, Fraction, Fraction]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        ids.append(ident)
+        disks.append((Fraction(ox), Fraction(oy), Fraction(bound) + exact_slack))
+
+    weights = policy.weights
+    if set(ids) != set(weights):
+        raise ValueError("policy weight ids must match the observation ids")
+
+    if not isinstance(bounds, tuple) or len(bounds) != 4:
+        raise ValueError("bounds must be a tuple of exactly four finite numbers")
+    min_x, min_y, max_x, max_y = (_finite_non_bool(value) for value in bounds)
+    if min_x > max_x or min_y > max_y:
+        raise ValueError("bounds must satisfy min_x <= max_x and min_y <= max_y")
+
+    disk_weights = [weights[ident] for ident in ids]
+    threshold = policy.threshold
+    zero = Fraction(0)
+    one = Fraction(1)
+    rect = (
+        Fraction(min_x),
+        Fraction(min_y),
+        Fraction(max_x),
+        Fraction(max_y),
+    )
+
+    # The feasible set is classified through candidate points parametrized
+    # as exact frames ``(mx, my) + sign * sqrt(radicand) * (qx, qy)``. When
+    # some feasible point lies in the closed fence, one is attained among
+    # the fence vertices, the disk axis-extreme points, the meeting points
+    # of two boundary circles, and the meeting points of a boundary circle
+    # with a fence edge line: the rightmost point of the non-empty compact
+    # convex intersection of the covering disks with the fence is always
+    # such a point. When some feasible point lies in the open exterior, one
+    # is attained among the disk axis-extreme points and the circle
+    # meeting points: the extreme point of the covering-disk intersection
+    # in the outward direction is always one of those. Collecting both
+    # kinds of candidates therefore suffices, and every membership and
+    # coverage test on them is exact.
+    inside_frames: list[tuple[Fraction, Fraction, Fraction, Fraction, Fraction, int]] = []
+    outside_frames: list[tuple[Fraction, Fraction, Fraction, Fraction, Fraction, int]] = []
+    for vertex_x in (rect[0], rect[2]):
+        for vertex_y in (rect[1], rect[3]):
+            inside_frames.append((vertex_x, vertex_y, zero, zero, zero, 1))
+    for cx, cy, radius in disks:
+        for px, py in (
+            (cx - radius, cy),
+            (cx + radius, cy),
+            (cx, cy - radius),
+            (cx, cy + radius),
+        ):
+            frame = (px, py, zero, zero, zero, 1)
+            inside_frames.append(frame)
+            outside_frames.append(frame)
+    count = len(disks)
+    for first in range(count):
+        for second in range(first + 1, count):
+            meeting = _exact_circle_meeting_frame(disks[first], disks[second])
+            if meeting is None:
+                continue
+            (mx, my), (qx, qy), radicand = meeting
+            for sign in (1, -1):
+                frame = (mx, my, qx, qy, radicand, sign)
+                inside_frames.append(frame)
+                outside_frames.append(frame)
+    for cx, cy, radius in disks:
+        r2 = radius * radius
+        for edge, vertical in (
+            (rect[0], True),
+            (rect[2], True),
+            (rect[1], False),
+            (rect[3], False),
+        ):
+            gap = edge - (cx if vertical else cy)
+            h2 = r2 - gap * gap
+            if h2 < 0:
+                continue
+            for sign in (1, -1):
+                if vertical:
+                    inside_frames.append((edge, cy, zero, one, h2, sign))
+                else:
+                    inside_frames.append((cx, edge, one, zero, h2, sign))
+
+    has_inside = any(
+        _exact_frame_point_cover_weight(frame, disks, disk_weights) >= threshold
+        and _exact_frame_point_in_rect(frame, rect)
+        for frame in inside_frames
+    )
+    has_outside = any(
+        _exact_frame_point_cover_weight(frame, disks, disk_weights) >= threshold
+        and not _exact_frame_point_in_rect(frame, rect)
+        for frame in outside_frames
+    )
+    if has_inside:
+        return "mixed" if has_outside else "inside"
+    return "outside" if has_outside else "empty"
 
 
 _ATTESTED_FIELDS = (
