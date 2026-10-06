@@ -237,6 +237,7 @@ __all__ = [
     "WeightedCrlProofAuditor",
     "assess",
     "assess_confidence",
+    "assess_geofence",
     "assess_reliability",
     "attest_observation",
     "attest_observation_for_point",
@@ -28607,6 +28608,254 @@ def locate_weighted_region(
         bounds=(unscale(min_x), unscale(min_y), unscale(max_x), unscale(max_y)),
         witness=(unscale(wx), unscale(wy)),
     )
+
+
+def assess_geofence(
+    observations: object,
+    policy: object,
+    bounds: object,
+    *,
+    tolerance: object = 0.0,
+) -> str:
+    """Classify the weighted feasible region against a rectangular fence.
+
+    Like :func:`locate_weighted_region`, each :class:`Observation`
+    contributes the closed disk centered at ``(x, y)`` with radius
+    ``decision.upper_bound + tolerance`` (boundary points count as
+    covered and the decision's ``accepted`` flag and ``sample_count``
+    are ignored), and each observation carries the positive integer
+    weight that ``policy`` declares for its id. The feasible set is the
+    set of points whose summed covering weight reaches
+    ``policy.threshold`` — no candidate point is required. The set may
+    be disconnected and is judged as a whole, never through a single
+    candidate point and never through its bounding box, so gaps inside
+    the box are not mistaken for feasible positions. ``bounds`` is the
+    closed axis-aligned rectangle ``(min_x, min_y, max_x, max_y)`` —
+    the boundary is part of the fence and the rectangle may degenerate
+    to a segment or a single point. The result is one of four strings:
+
+    - ``"empty"``: no point reaches the threshold;
+    - ``"inside"``: the feasible set is non-empty and lies entirely in
+      the fence (merely touching the boundary counts as inside);
+    - ``"outside"``: the feasible set is non-empty and shares no point
+      with the fence (the boundary already counts as inside, so every
+      feasible point lies strictly outside the rectangle);
+    - ``"mixed"``: feasible points exist both inside and outside the
+      fence.
+
+    ``observations`` must be a non-empty iterable (a one-shot iterator
+    is fine, and one or two observations are allowed) of
+    :class:`Observation` with unique non-empty string ids, finite
+    non-bool ``x``/``y`` coordinates and a :class:`RangeDecision` whose
+    ``upper_bound`` is finite and non-negative; ``policy`` must be a
+    :class:`ConsensusPolicy` whose weight ids match the observation ids
+    exactly; ``bounds`` must be a tuple of exactly four finite non-bool
+    numbers with ``min_x <= max_x`` and ``min_y <= max_y``;
+    ``tolerance`` must be a finite non-bool non-negative number. Every
+    contract violation raises :class:`ValueError`, and every input is
+    fully validated before any geometry is computed, so an invalid
+    trailing observation is rejected even when the earlier observations
+    would already settle the classification.
+
+    The classification is the exact geometric relation of the converted
+    values: it is computed with exact rational arithmetic (circle
+    meeting points are compared through one exact squaring step, never
+    evaluated), so ``tolerance`` only enlarges the disks — it does not
+    blur the fence boundary — and huge or tiny finite inputs cannot be
+    misclassified through intermediate overflow or underflow. The
+    result is independent of input order (of both the observations and
+    the weight mapping), the function does not mutate its inputs, reads
+    no clock and keeps no state.
+    """
+    slack = _slack_from_tolerance(tolerance)
+
+    if not isinstance(policy, ConsensusPolicy):
+        raise ValueError("policy must be a ConsensusPolicy")
+
+    if not isinstance(bounds, tuple) or len(bounds) != 4:
+        raise ValueError("bounds must be a tuple of exactly four finite numbers")
+    min_x = _finite_non_bool(bounds[0])
+    min_y = _finite_non_bool(bounds[1])
+    max_x = _finite_non_bool(bounds[2])
+    max_y = _finite_non_bool(bounds[3])
+    if min_x > max_x or min_y > max_y:
+        raise ValueError("bounds must satisfy min_x <= max_x and min_y <= max_y")
+
+    raw_observations = _materialize_observations(observations)
+
+    if not raw_observations:
+        raise ValueError("need at least 1 observation, got 0")
+
+    exact_slack = Fraction(slack)
+    ids: list[str] = []
+    disks: list[tuple[Fraction, Fraction, Fraction]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        ids.append(ident)
+        disks.append((Fraction(ox), Fraction(oy), Fraction(bound) + exact_slack))
+
+    weights = policy.weights
+    if set(ids) != set(weights):
+        raise ValueError("policy weight ids must match the observation ids")
+    disk_weights = [weights[ident] for ident in ids]
+    threshold = policy.threshold
+
+    edge_min_x = Fraction(min_x)
+    edge_min_y = Fraction(min_y)
+    edge_max_x = Fraction(max_x)
+    edge_max_y = Fraction(max_y)
+
+    has_inside = False
+    has_outside = False
+
+    def report(inside: bool, reaches: bool) -> None:
+        nonlocal has_inside, has_outside
+        if not reaches:
+            return
+        if inside:
+            has_inside = True
+        else:
+            has_outside = True
+
+    def rational_weight(px: Fraction, py: Fraction) -> int:
+        return sum(
+            disk_weight
+            for (ox, oy, radius), disk_weight in zip(disks, disk_weights)
+            if (px - ox) * (px - ox) + (py - oy) * (py - oy) <= radius * radius
+        )
+
+    # The feasible set is a union of cells of the arrangement of the
+    # disk boundary circles, and the fence is convex, so a feasible
+    # point inside the fence and a feasible point strictly outside it
+    # — when they exist — are always witnessed by a disk center, a disk
+    # axis-extreme point, a fence corner, a meeting point of two circle
+    # boundaries, or a meeting point of a circle boundary with a fence
+    # edge line. Scanning exactly those candidates decides both sides.
+    for ox, oy, radius in disks:
+        for px, py in (
+            (ox, oy),
+            (ox - radius, oy),
+            (ox + radius, oy),
+            (ox, oy - radius),
+            (ox, oy + radius),
+        ):
+            inside = (
+                edge_min_x <= px <= edge_max_x
+                and edge_min_y <= py <= edge_max_y
+            )
+            report(inside, rational_weight(px, py) >= threshold)
+    for corner_x in (edge_min_x, edge_max_x):
+        for corner_y in (edge_min_y, edge_max_y):
+            report(True, rational_weight(corner_x, corner_y) >= threshold)
+
+    for first in range(len(disks)):
+        for second in range(first + 1, len(disks)):
+            frame = _exact_circle_meeting_frame(disks[first], disks[second])
+            if frame is None:
+                continue
+            (mx, my), (qx, qy), radicand = frame
+            q2 = qx * qx + qy * qy
+            for sign in (1, -1):
+                # The meeting point is m + sign * sqrt(radicand) * q.
+                weight = 0
+                for (ox, oy, radius), disk_weight in zip(disks, disk_weights):
+                    ux = mx - ox
+                    uy = my - oy
+                    base = ux * ux + uy * uy + radicand * q2 - radius * radius
+                    coeff = 2 * sign * (ux * qx + uy * qy)
+                    if _exact_sqrt_combo_nonpositive(base, coeff, radicand):
+                        weight += disk_weight
+                inside = (
+                    _exact_sqrt_combo_nonpositive(
+                        edge_min_x - mx, -sign * qx, radicand
+                    )
+                    and _exact_sqrt_combo_nonpositive(
+                        mx - edge_max_x, sign * qx, radicand
+                    )
+                    and _exact_sqrt_combo_nonpositive(
+                        edge_min_y - my, -sign * qy, radicand
+                    )
+                    and _exact_sqrt_combo_nonpositive(
+                        my - edge_max_y, sign * qy, radicand
+                    )
+                )
+                report(inside, weight >= threshold)
+
+    for ox, oy, radius in disks:
+        for edge_x in (edge_min_x, edge_max_x):
+            gap = edge_x - ox
+            radicand = radius * radius - gap * gap
+            if radicand < 0:
+                continue
+            for sign in (1, -1):
+                # The meeting point is (edge_x, oy + sign * sqrt(radicand)).
+                weight = 0
+                for (cx, cy, cradius), disk_weight in zip(disks, disk_weights):
+                    dx = edge_x - cx
+                    dy = oy - cy
+                    base = dx * dx + dy * dy + radicand - cradius * cradius
+                    coeff = 2 * sign * dy
+                    if _exact_sqrt_combo_nonpositive(base, coeff, radicand):
+                        weight += disk_weight
+                inside = (
+                    edge_min_x <= edge_x <= edge_max_x
+                    and _exact_sqrt_combo_nonpositive(
+                        edge_min_y - oy, -sign, radicand
+                    )
+                    and _exact_sqrt_combo_nonpositive(
+                        oy - edge_max_y, sign, radicand
+                    )
+                )
+                report(inside, weight >= threshold)
+        for edge_y in (edge_min_y, edge_max_y):
+            gap = edge_y - oy
+            radicand = radius * radius - gap * gap
+            if radicand < 0:
+                continue
+            for sign in (1, -1):
+                # The meeting point is (ox + sign * sqrt(radicand), edge_y).
+                weight = 0
+                for (cx, cy, cradius), disk_weight in zip(disks, disk_weights):
+                    dx = ox - cx
+                    dy = edge_y - cy
+                    base = dx * dx + dy * dy + radicand - cradius * cradius
+                    coeff = 2 * sign * dx
+                    if _exact_sqrt_combo_nonpositive(base, coeff, radicand):
+                        weight += disk_weight
+                inside = (
+                    _exact_sqrt_combo_nonpositive(
+                        edge_min_x - ox, -sign, radicand
+                    )
+                    and _exact_sqrt_combo_nonpositive(
+                        ox - edge_max_x, sign, radicand
+                    )
+                    and edge_min_y <= edge_y <= edge_max_y
+                )
+                report(inside, weight >= threshold)
+
+    if has_inside and has_outside:
+        return "mixed"
+    if has_inside:
+        return "inside"
+    if has_outside:
+        return "outside"
+    return "empty"
 
 
 _ATTESTED_FIELDS = (
