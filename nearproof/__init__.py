@@ -302,6 +302,7 @@ __all__ = [
     "locate_cert_evidence",
     "locate_region",
     "locate_weighted",
+    "locate_weighted_attested_region",
     "locate_weighted_cert_evidence",
     "locate_weighted_region",
     "make_crl",
@@ -31089,6 +31090,105 @@ def locate_bound_attested(
     )
 
     return locate(verified, point, quorum=quorum, tolerance=tolerance)
+
+
+def locate_weighted_attested_region(
+    observations: object,
+    policy: object,
+    keys: object,
+    *,
+    tolerance: object = 0.0,
+    now: object = None,
+    max_age: object = None,
+    max_skew: object = None,
+    revocations: object = None,
+    revocation_list: object = None,
+    root: object = None,
+    min: object = 0,
+) -> "RegionDecision":
+    """Like :func:`locate_weighted_region`, but over MAC'd
+    :class:`AttestedObservation` records.
+
+    ``observations`` is an iterable (a one-shot iterator is fine) of
+    :class:`AttestedObservation` instances and/or their
+    :meth:`AttestedObservation.to_bytes` encodings (mixing is allowed).
+    ``keys`` must be a non-empty mapping of observation id to the non-empty
+    shared key bytes of that verifier, exactly as in
+    :func:`locate_attested`. ``policy`` must be a :class:`ConsensusPolicy`
+    whose weight ids match the observations' ids exactly — a single
+    verifier is allowed, since the policy weights bound the set. Every
+    record's MAC is recomputed with ``keys[id]`` and compared in constant
+    time; an id missing from ``keys``, a duplicated id, a wrong key, any
+    tampering, a non-canonical encoding, a record of the wrong type, a
+    policy whose weight ids do not match, or an invalid ``tolerance``
+    raises :class:`ValueError`. Every observation and every supplied
+    revocation record must pass authentication before any region
+    determination runs — invalid observations are never dropped and the
+    tally is never recomputed on a filtered batch.
+
+    ``tolerance``, ``now``, ``max_age``, ``max_skew``, ``revocations``,
+    ``revocation_list``, ``root`` and ``min`` follow the exact same rules
+    as in :func:`locate_attested`: the freshness check keeps the closed
+    interval ``0 <= now - issued_at <= max_age``; the ``max_skew`` batch
+    time-span check covers every record of the batch, including
+    observations whose disks end up not contributing to the region, and
+    never reads the clock; an observation must be issued strictly after
+    the ``revoked_at`` of every matching revocation from the per-call
+    ``revocations`` and the signed snapshot alike; a snapshot requires
+    non-empty ``root`` bytes (a non-bytes ``root`` raises
+    :class:`TypeError`, an empty value :class:`ValueError`) and an
+    explicit finite ``now`` (a missing ``now`` raises :class:`ValueError`)
+    and is authenticated wholesale with :func:`audit_observation_crl`.
+    The clock is read at most once per call, and only when ``max_age`` or
+    ``revocations`` actually needs it — enabling only ``max_skew`` never
+    reads the clock.
+
+    Verified records are then converted to plain :class:`Observation`
+    values and fed to :func:`locate_weighted_region` under its exact
+    rules (``tolerance`` included), and its frozen :class:`RegionDecision`
+    is returned unchanged: each disk has radius ``upper_bound +
+    tolerance`` with the boundary counting as covered and the decision's
+    ``accepted`` flag ignored; ``bounds`` is the smallest axis-aligned box
+    covering every point whose covering weight reaches
+    ``policy.threshold`` (the region may be disconnected, so points inside
+    the box are not guaranteed feasible); ``witness`` is the feasible
+    point with the smallest ``x``, ties broken toward the smallest ``y``;
+    when no point reaches the threshold ``feasible`` is ``False`` and both
+    ``bounds`` and ``witness`` are ``None``; and true bounds beyond the
+    finite float range raise :class:`ValueError`.
+
+    The result is independent of input order and of whether records are
+    passed as objects or bytes; the function does not mutate its inputs,
+    reads no verifier state and, aside from the default ``now`` clock
+    reading, has no side effects.
+    """
+    key_map = _require_attested_keys(keys)
+    check_age, age_limit = _attested_age_limit(max_age)
+    check_skew, skew_limit = _attested_skew_limit(max_skew)
+    if revocation_list is not None:
+        # A snapshot is authenticated under the root key and an explicit
+        # caller-supplied now; the clock is never read for it.
+        root = _require_root(root)
+    current = _attested_now(check_age, revocations, revocation_list, now)
+    revoked_at_by_id = _attested_revoked_at_by_id(
+        revocations, revocation_list, key_map, root, current, min
+    )
+    verified = _verify_attested_records(
+        observations,
+        AttestedObservation,
+        _attested_record_mac,
+        "attested observation",
+        key_map,
+        revoked_at_by_id,
+        check_age,
+        current,
+        age_limit,
+        None,
+        check_skew,
+        skew_limit,
+    )
+
+    return locate_weighted_region(verified, policy, tolerance=tolerance)
 
 
 def _trust_payload(trust: "VerifierTrust") -> dict:
