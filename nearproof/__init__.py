@@ -236,6 +236,7 @@ __all__ = [
     "WeightedCrlProof",
     "WeightedCrlProofAuditor",
     "assess",
+    "assess_attested_geofence",
     "assess_confidence",
     "assess_geofence",
     "assess_reliability",
@@ -31109,6 +31110,97 @@ def locate_weighted_attested_region(
     )
 
     return locate_weighted_region(verified, policy, tolerance=tolerance)
+
+
+def assess_attested_geofence(
+    observations: object,
+    policy: object,
+    bounds: object,
+    keys: object,
+    *,
+    tolerance: object = 0.0,
+    now: object = None,
+    max_age: object = None,
+    max_skew: object = None,
+    revocations: object = None,
+    revocation_list: object = None,
+    root: object = None,
+    min: object = 0,
+) -> str:
+    """Like :func:`assess_geofence`, but over MAC'd
+    :class:`AttestedObservation` records.
+
+    The signature, freshness and revocation checks are exactly those of
+    :func:`locate_attested` (and :func:`locate_weighted_attested_region`):
+
+    * ``observations`` is a one-shot-consumable non-empty iterable of
+      :class:`AttestedObservation` instances and/or their
+      :meth:`AttestedObservation.to_bytes` encodings (mixing is allowed; a
+      single observation is fine). Every record's MAC is recomputed with
+      ``keys[id]`` and compared in constant time; an id missing from
+      ``keys``, a duplicated id, a wrong key, any tampering, a
+      non-canonical encoding, or an item that is neither an attested
+      observation nor its canonical bytes raises :class:`ValueError`.
+    * ``policy`` must be a :class:`ConsensusPolicy` whose weight ids match
+      the authenticated observation ids exactly. ``tolerance`` follows the
+      :func:`assess_geofence` rule: a finite non-bool non-negative number
+      that only enlarges the ranging disks; the decision's ``accepted``
+      flag is ignored.
+    * ``now``/``max_age`` freshness, the ``max_skew`` whole-batch time
+      span (equality passes; signed timestamps only; the clock is never
+      read for it), the per-call ``revocations`` iterable and the
+      ``revocation_list`` snapshot (with ``root`` and ``min``) follow the
+      exact names, defaults and semantics of :func:`locate_attested`:
+      only observations issued strictly after every matching revocation
+      are kept, a snapshot requires non-empty ``bytes`` ``root`` (a
+      non-bytes value raises :class:`TypeError`, an empty value
+      :class:`ValueError`) and an explicit finite non-bool ``now`` (the
+      clock is never read for it), and every other path that needs the
+      current time reads it at most once.
+
+    Every observation and every revocation record must pass; invalid
+    records are never dropped and re-tallied, and trailing material is
+    fully reviewed even when the geometry is already determined. Once
+    authenticated, the records are projected to plain
+    :class:`Observation` values and classified by the exact
+    :func:`assess_geofence` geometry against ``bounds`` — a tuple of
+    exactly four finite non-bool numbers
+    ``(min_x, min_y, max_x, max_y)`` with ``min_x <= max_x`` and
+    ``min_y <= max_y`` (a degenerate line segment or point is allowed).
+    The result is one of the strings ``"empty"``, ``"inside"``,
+    ``"outside"`` or ``"mixed"``: ``tolerance`` never blurs the fence
+    boundary and the true feasible set, not its bounding box, is judged.
+    The result is independent of input order and of objects versus their
+    canonical bytes; the function writes nothing and mutates neither its
+    inputs nor any verifier state.
+    """
+    key_map = _require_attested_keys(keys)
+    check_age, age_limit = _attested_age_limit(max_age)
+    check_skew, skew_limit = _attested_skew_limit(max_skew)
+    if revocation_list is not None:
+        # A snapshot is authenticated under the root key and an explicit
+        # caller-supplied now; the clock is never read for it.
+        root = _require_root(root)
+    current = _attested_now(check_age, revocations, revocation_list, now)
+    revoked_at_by_id = _attested_revoked_at_by_id(
+        revocations, revocation_list, key_map, root, current, min
+    )
+    verified = _verify_attested_records(
+        observations,
+        AttestedObservation,
+        _attested_record_mac,
+        "attested observation",
+        key_map,
+        revoked_at_by_id,
+        check_age,
+        current,
+        age_limit,
+        None,
+        check_skew,
+        skew_limit,
+    )
+
+    return assess_geofence(verified, policy, bounds, tolerance=tolerance)
 
 
 def locate_bound_attested(
