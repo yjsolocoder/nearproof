@@ -239,6 +239,7 @@ __all__ = [
     "assess_attested_geofence",
     "assess_confidence",
     "assess_geofence",
+    "assess_polygon_geofence",
     "assess_reliability",
     "attest_observation",
     "attest_observation_for_point",
@@ -29217,6 +29218,318 @@ def assess_geofence(
     has_outside = any(
         _exact_frame_point_cover_weight(frame, disks, disk_weights) >= threshold
         and not _exact_frame_point_in_rect(frame, rect)
+        for frame in outside_frames
+    )
+    if has_inside:
+        return "mixed" if has_outside else "inside"
+    return "outside" if has_outside else "empty"
+
+
+def _exact_orient(
+    first: tuple[Fraction, Fraction],
+    second: tuple[Fraction, Fraction],
+    third: tuple[Fraction, Fraction],
+) -> Fraction:
+    """The exact signed turn of the triple ``first -> second -> third``."""
+    return (second[0] - first[0]) * (third[1] - first[1]) - (
+        second[1] - first[1]
+    ) * (third[0] - first[0])
+
+
+def _exact_segments_meet(
+    first_a: tuple[Fraction, Fraction],
+    first_b: tuple[Fraction, Fraction],
+    second_a: tuple[Fraction, Fraction],
+    second_b: tuple[Fraction, Fraction],
+) -> bool:
+    """Whether two closed segments share at least one point (exact)."""
+    orient_a = _exact_orient(first_a, first_b, second_a)
+    orient_b = _exact_orient(first_a, first_b, second_b)
+    orient_c = _exact_orient(second_a, second_b, first_a)
+    orient_d = _exact_orient(second_a, second_b, first_b)
+    if orient_a == 0 and orient_b == 0 and orient_c == 0 and orient_d == 0:
+        # Collinear segments: compare the projections on an axis the
+        # (non-degenerate) first segment actually spans.
+        if first_a[0] != first_b[0]:
+            first_lo, first_hi = sorted((first_a[0], first_b[0]))
+            second_lo, second_hi = sorted((second_a[0], second_b[0]))
+        else:
+            first_lo, first_hi = sorted((first_a[1], first_b[1]))
+            second_lo, second_hi = sorted((second_a[1], second_b[1]))
+        return max(first_lo, second_lo) <= min(first_hi, second_hi)
+    return orient_a * orient_b <= 0 and orient_c * orient_d <= 0
+
+
+def _exact_frame_point_in_polygon(
+    frame: tuple[Fraction, Fraction, Fraction, Fraction, Fraction, int],
+    edges: list[tuple[Fraction, Fraction, Fraction, Fraction]],
+    orientation: int,
+) -> bool:
+    """Whether the parametrized point lies in the closed convex polygon.
+
+    The point is ``(mx, my) + sign * sqrt(radicand) * (qx, qy)`` on exact
+    rationals and ``edges`` lists every edge as ``(ax, ay, ex, ey)`` with
+    ``(ex, ey)`` the edge vector; ``orientation`` is ``1`` for a
+    counterclockwise and ``-1`` for a clockwise boundary. The point is
+    inside exactly when every edge's signed turn keeps the polygon's
+    orientation, and each comparison is decided exactly by
+    :func:`_exact_sqrt_combo_nonpositive`, so boundary points count as
+    inside without any slack.
+    """
+    mx, my, qx, qy, radicand, sign = frame
+    for ax, ay, ex, ey in edges:
+        base = ex * (my - ay) - ey * (mx - ax)
+        coeff = sign * (ex * qy - ey * qx)
+        if not _exact_sqrt_combo_nonpositive(
+            -orientation * base, -orientation * coeff, radicand
+        ):
+            return False
+    return True
+
+
+def assess_polygon_geofence(
+    observations: object,
+    policy: object,
+    vertices: object,
+    *,
+    tolerance: object = 0.0,
+) -> str:
+    """Classify the weighted feasible region against a convex polygon fence.
+
+    Like :func:`locate_weighted`, each :class:`Observation` contributes the
+    closed disk centered at ``(x, y)`` with radius
+    ``decision.upper_bound + tolerance`` (boundary points count as covered
+    and the decision's ``accepted`` flag and ``sample_count`` are ignored),
+    and each observation carries the positive integer weight that ``policy``
+    declares for its id. The feasible set is the set of points whose summed
+    covering weight reaches ``policy.threshold`` — no candidate point is
+    required from the caller, and the feasible set is never approximated by
+    its bounding box. ``vertices`` describes the fence: at least three
+    pairwise distinct points, each a tuple of exactly two finite non-bool
+    numbers, given in boundary order (clockwise or counterclockwise, any
+    starting vertex, the first vertex not repeated at the end) and forming
+    a simple convex polygon of non-zero area with no three consecutive
+    collinear vertices. The fence includes its edges and vertices. The
+    result is the string ``"empty"`` when no point reaches the threshold,
+    ``"inside"`` when the feasible set is non-empty and lies entirely in
+    the fence, ``"outside"`` when it is non-empty and shares no point with
+    the fence, and ``"mixed"`` when feasible points exist both inside and
+    outside. A unique feasible point produced by tangent disks that lands
+    exactly on the fence boundary counts as inside, and a fence falling in
+    the gap between separated feasible regions without touching any of
+    them reports ``"outside"``.
+
+    ``observations`` must be a non-empty iterable (a one-shot iterator is
+    fine, and one or two observations are allowed) of :class:`Observation`
+    with unique non-empty string ids, finite non-bool ``x``/``y``
+    coordinates and a :class:`RangeDecision` whose ``upper_bound`` is
+    finite and non-negative; ``policy`` must be a :class:`ConsensusPolicy`
+    whose weight ids match the observation ids exactly; ``vertices`` must
+    be an iterable (a one-shot iterator is fine) satisfying the fence
+    contract above; ``tolerance`` must be a finite non-bool non-negative
+    number. Every contract violation — invalid members, duplicate ids,
+    empty input, policy mismatch, invalid tolerance, or malformed,
+    duplicated, self-intersecting, concave, collinear or degenerate
+    vertices — raises :class:`ValueError`, and every input is fully
+    validated before any geometry is computed, so an invalid trailing
+    observation or vertex is rejected even when the earlier data already
+    determine the classification.
+
+    The classification is computed with exact rational arithmetic on the
+    represented values (circle meeting points are compared through one
+    exact squaring step, never evaluated), so ``tolerance`` only enlarges
+    the disks — it never blurs the fence boundary — and huge or tiny
+    finite inputs cannot be misclassified through intermediate overflow,
+    underflow or hidden slack. The result is independent of input order
+    (of the observations, of the weight mapping, of the vertices' starting
+    position and of their winding direction), the function does not mutate
+    its inputs, reads no clock and keeps no state.
+    """
+    slack = _slack_from_tolerance(tolerance)
+
+    if not isinstance(policy, ConsensusPolicy):
+        raise ValueError("policy must be a ConsensusPolicy")
+
+    raw_observations = _materialize_observations(observations)
+
+    if not raw_observations:
+        raise ValueError("need at least 1 observation, got 0")
+
+    exact_slack = Fraction(slack)
+    ids: list[str] = []
+    disks: list[tuple[Fraction, Fraction, Fraction]] = []
+    seen_ids: set[str] = set()
+    for observation in raw_observations:
+        if not isinstance(observation, Observation):
+            raise ValueError("observations must contain only Observation instances")
+        ident = observation.id
+        if not isinstance(ident, str) or not ident:
+            raise ValueError("observation id must be a non-empty string")
+        if ident in seen_ids:
+            raise ValueError(f"duplicate observation id: {ident!r}")
+        seen_ids.add(ident)
+        ox = _finite_non_bool(observation.x)
+        oy = _finite_non_bool(observation.y)
+        decision = observation.decision
+        if not isinstance(decision, RangeDecision):
+            raise ValueError("observation decision must be a RangeDecision")
+        bound = _finite_non_bool(decision.upper_bound)
+        if bound < 0:
+            raise ValueError("decision upper_bound must be non-negative")
+        ids.append(ident)
+        disks.append((Fraction(ox), Fraction(oy), Fraction(bound) + exact_slack))
+
+    weights = policy.weights
+    if set(ids) != set(weights):
+        raise ValueError("policy weight ids must match the observation ids")
+
+    try:
+        raw_vertices = list(vertices)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("vertices must be an iterable of (x, y) tuples") from error
+    if len(raw_vertices) < 3:
+        raise ValueError(f"need at least 3 vertices, got {len(raw_vertices)}")
+    points: list[tuple[Fraction, Fraction]] = []
+    for vertex in raw_vertices:
+        if not isinstance(vertex, tuple) or len(vertex) != 2:
+            raise ValueError(
+                "each vertex must be a tuple of exactly two finite numbers"
+            )
+        points.append(
+            (
+                Fraction(_finite_non_bool(vertex[0])),
+                Fraction(_finite_non_bool(vertex[1])),
+            )
+        )
+    if len(set(points)) != len(points):
+        raise ValueError("vertices must be pairwise distinct")
+    vertex_count = len(points)
+    turns = [
+        _exact_orient(
+            points[index],
+            points[(index + 1) % vertex_count],
+            points[(index + 2) % vertex_count],
+        )
+        for index in range(vertex_count)
+    ]
+    if all(turn > 0 for turn in turns):
+        orientation = 1
+    elif all(turn < 0 for turn in turns):
+        orientation = -1
+    else:
+        raise ValueError(
+            "vertices must form a simple convex polygon with no three"
+            " consecutive collinear vertices"
+        )
+    # A closed polygonal chain whose turns all keep one strict direction
+    # can still self-intersect by winding more than once (a star polygon),
+    # so simplicity is checked directly: no two non-adjacent edges may
+    # share a point.
+    polygon_edges: list[
+        tuple[tuple[Fraction, Fraction], tuple[Fraction, Fraction]]
+    ] = [
+        (points[index], points[(index + 1) % vertex_count])
+        for index in range(vertex_count)
+    ]
+    for first in range(vertex_count):
+        for second in range(first + 2, vertex_count):
+            if first == 0 and second == vertex_count - 1:
+                continue
+            if _exact_segments_meet(
+                polygon_edges[first][0],
+                polygon_edges[first][1],
+                polygon_edges[second][0],
+                polygon_edges[second][1],
+            ):
+                raise ValueError("vertices must form a simple polygon")
+
+    disk_weights = [weights[ident] for ident in ids]
+    threshold = policy.threshold
+    zero = Fraction(0)
+    edges: list[tuple[Fraction, Fraction, Fraction, Fraction]] = [
+        (
+            start[0],
+            start[1],
+            end[0] - start[0],
+            end[1] - start[1],
+        )
+        for start, end in polygon_edges
+    ]
+
+    # The feasible set is classified through candidate points parametrized
+    # as exact frames ``(mx, my) + sign * sqrt(radicand) * (qx, qy)``. When
+    # some feasible point lies in the closed fence, one is attained among
+    # the fence vertices, the disk axis-extreme points, the meeting points
+    # of two boundary circles, and the meeting points of a boundary circle
+    # with a fence edge line: the rightmost point of the non-empty compact
+    # convex intersection of the covering disks with the fence is always
+    # such a point. When some feasible point lies in the open exterior, one
+    # is attained among the disk axis-extreme points, the circle meeting
+    # points, and each disk's extreme point in an edge's normal direction:
+    # the extreme point of the covering-disk intersection in the outward
+    # normal direction of a violated edge is always one of those.
+    # Collecting both kinds of candidates therefore suffices, and every
+    # membership and coverage test on them is exact.
+    inside_frames: list[tuple[Fraction, Fraction, Fraction, Fraction, Fraction, int]] = []
+    outside_frames: list[tuple[Fraction, Fraction, Fraction, Fraction, Fraction, int]] = []
+    for vertex_x, vertex_y in points:
+        inside_frames.append((vertex_x, vertex_y, zero, zero, zero, 1))
+    for cx, cy, radius in disks:
+        for px, py in (
+            (cx - radius, cy),
+            (cx + radius, cy),
+            (cx, cy - radius),
+            (cx, cy + radius),
+        ):
+            frame = (px, py, zero, zero, zero, 1)
+            inside_frames.append(frame)
+            outside_frames.append(frame)
+    count = len(disks)
+    for first in range(count):
+        for second in range(first + 1, count):
+            meeting = _exact_circle_meeting_frame(disks[first], disks[second])
+            if meeting is None:
+                continue
+            (mx, my), (qx, qy), radicand = meeting
+            for sign in (1, -1):
+                frame = (mx, my, qx, qy, radicand, sign)
+                inside_frames.append(frame)
+                outside_frames.append(frame)
+    for cx, cy, radius in disks:
+        r2 = radius * radius
+        for _ax, _ay, ex, ey in edges:
+            # Edge line: (ax, ay) + t * (ex, ey). Solving
+            # ``|point - center| = radius`` along it gives the meeting
+            # points ``midpoint +- sqrt(h2) / d2 * (ex, ey)`` with rational
+            # midpoint and h2; h2 < 0 means the line misses the circle.
+            fx = _ax - cx
+            fy = _ay - cy
+            d2 = ex * ex + ey * ey
+            fdot = fx * ex + fy * ey
+            h2 = fdot * fdot - d2 * (fx * fx + fy * fy - r2)
+            if h2 < 0:
+                continue
+            lam = -fdot / d2
+            mx = _ax + lam * ex
+            my = _ay + lam * ey
+            radicand = h2 / (d2 * d2)
+            for sign in (1, -1):
+                inside_frames.append((mx, my, ex, ey, radicand, sign))
+            # The disk's extreme points in the edge's normal direction
+            # ``(ey, -ex)`` witness feasibility outside the fence whenever
+            # the covering-disk intersection pokes past this edge.
+            normal_radicand = r2 / d2
+            for sign in (1, -1):
+                outside_frames.append((cx, cy, ey, -ex, normal_radicand, sign))
+
+    has_inside = any(
+        _exact_frame_point_cover_weight(frame, disks, disk_weights) >= threshold
+        and _exact_frame_point_in_polygon(frame, edges, orientation)
+        for frame in inside_frames
+    )
+    has_outside = any(
+        _exact_frame_point_cover_weight(frame, disks, disk_weights) >= threshold
+        and not _exact_frame_point_in_polygon(frame, edges, orientation)
         for frame in outside_frames
     )
     if has_inside:
